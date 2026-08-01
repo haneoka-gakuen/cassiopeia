@@ -1,34 +1,51 @@
-# `@haneoka/chart`
+# Cassiopeia
 
-Browser chart parser, simulator, input adapter, Three.js renderer, and Vue
-components for _BanG Dream! Our Notes_.
+**CASSIOPEIA** — **C**ross-platform **A**udio-**S**ynchronized **S**imulation
+**I**nfrastructure for **O**pen **P**layback, **E**ffects, **I**nterchange, and
+**A**daptation.
+
+Cassiopeia is an embeddable, multi-platform rhythm-game engine. It provides a
+web parser, simulation, input system, Three.js renderer, Vue components, and a
+portable Rust kernel for deterministic timing, judgement, chart validation,
+and replay.
+
+## Packages and entry points
+
+The npm package is `@haneoka/cassiopeia`:
+
+- `@haneoka/cassiopeia/parser` parses and normalizes source scores.
+- `@haneoka/cassiopeia/player` embeds the interactive Vue player.
+- `@haneoka/cassiopeia/overview` renders a virtualized chart overview.
+- `@haneoka/cassiopeia/assets` resolves host-provided runtime assets.
+- `haneoka-cassiopeia-core` is the platform-neutral Rust crate.
 
 ```ts
-import { buildChart, parseScore } from "@haneoka/chart";
+import { buildChart, parseScore } from "@haneoka/cassiopeia/parser";
 
 const chart = buildChart(parseScore(scorePayload));
 ```
 
-Public entries:
+The engine does not ship runtime media. A host supplies chart, music, texture,
+effect, and font resources through the public asset contracts.
 
-- `@haneoka/chart`
-- `@haneoka/chart/assets`
-- `@haneoka/chart/overview`
-- `@haneoka/chart/parser`
-- `@haneoka/chart/player`
+Cassiopeia Chart Format is canonical. SS, SUS, USC, Sonolus `LevelData`, and
+source-specific formats are adapters with explicit loss reports. See the
+[format contract](docs/CASSIOPEIA_CHART_FORMAT.md).
 
-`ChartPlayer` supports watch and play modes, audio synchronization, pointer
-input, seeking, scoring, effects, and runtime asset manifests. `ChartOverview`
-renders a virtualized full-chart view. Both require resources from the same
-generated release.
-
-Malformed score structures and unknown enum values are rejected. Renderer and
-media failures are emitted through the component `error` event.
+## Development
 
 ```sh
-pnpm --filter @haneoka/chart typecheck
-pnpm --filter @haneoka/chart build
+pnpm install --frozen-lockfile
+pnpm check
 ```
 
-The package is licensed under [MPL-2.0](LICENSE). Game resources and third-party
-dependencies are not included in that grant.
+The Rust kernel can also be checked independently:
+
+```sh
+cargo test --workspace
+```
+
+## License
+
+Cassiopeia-authored source is available under MPL-2.0. Third-party components
+retain their own licenses. Runtime media is supplied by applications.

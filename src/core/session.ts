@@ -599,10 +599,9 @@ export class ChartSession {
   }
 
   /**
-   * Mirrors the independent native event updaters without allocating on rAF.
-   * FeverEventUpdater.Update (0x4fc5b04) advances only one state per updater
-   * call, so a frame which jumps over both bounds emits Fever now and End on
-   * the following update instead of collapsing both transitions.
+   * Advances compatibility events without allocating on rAF. Fever handling
+   * emits at most one transition per section and update, so a frame that jumps
+   * over both bounds emits Fever now and End on the following update.
    */
   private advanceTimeline(): void {
     if (this.skillTimelineIsMonotonic) {

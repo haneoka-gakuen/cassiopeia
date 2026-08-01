@@ -2,9 +2,8 @@ import { TickConverter } from "./timing";
 import type { ChartCallChangeEvent, ChartFeverSection, ChartSkillEvent, ChartTimeline, SsRoot } from "./types";
 
 /**
- * Builds the three non-note timelines produced by SsMusicScoreConverter.
- * Evidence: libil2cpp.decrypted.so BuildFeverList 0x4fb8448,
- * BuildSkillList 0x4fb8804, and BuildCallList 0x4fb89cc.
+ * Builds normalized skill, fever, and call timelines. Skill order remains
+ * source-stable, while fever and call entries are ordered by their first tick.
  */
 export function buildChartTimeline(root: SsRoot, converter: TickConverter): ChartTimeline {
   const skills: ChartSkillEvent[] = root.skill.map((tick, index) => ({

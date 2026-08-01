@@ -1,7 +1,7 @@
 {
-  "name": "@haneoka/chart",
+  "name": "@haneoka/cassiopeia",
   "version": "0.1.0",
-  "description": "Browser chart parser, simulation engine, renderer, and Vue components for Haneoka",
+  "description": "Portable rhythm-game runtime with an Our Notes compatible web renderer",
   "keywords": [
     "rhythm-game",
     "chart",
@@ -11,13 +11,12 @@
   "license": "MPL-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/haneoka-gakuen/haneoka.git",
-    "directory": "packages/chart"
+    "url": "git+https://github.com/haneoka-gakuen/cassiopeia.git"
   },
   "bugs": {
-    "url": "https://github.com/haneoka-gakuen/haneoka/issues"
+    "url": "https://github.com/haneoka-gakuen/cassiopeia/issues"
   },
-  "homepage": "https://github.com/haneoka-gakuen/haneoka/tree/main/packages/chart#readme",
+  "homepage": "https://github.com/haneoka-gakuen/cassiopeia#readme",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -26,6 +25,8 @@
   "files": [
     "dist",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "docs/CASSIOPEIA_CHART_FORMAT.md",
     "README.md"
   ],
   "exports": {
@@ -59,7 +60,10 @@
   "scripts": {
     "build": "vite build && vue-tsc -p tsconfig.build.json",
     "typecheck": "vue-tsc -p tsconfig.json --noEmit",
-    "prepack": "pnpm run typecheck && pnpm run build"
+    "rust:check": "cargo check --workspace --all-targets",
+    "rust:test": "cargo test --workspace",
+    "check": "pnpm run typecheck && pnpm run build && pnpm run rust:check && pnpm run rust:test",
+    "prepack": "pnpm run check"
   },
   "publishConfig": {
     "access": "public",
@@ -68,6 +72,7 @@
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "pnpm@11.14.0",
   "peerDependencies": {
     "three": ">=0.184.0 <0.185.0",
     "vue": ">=3.5.0 <4"
