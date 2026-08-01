@@ -1,0 +1,15 @@
+[package]
+name = "haneoka-cassiopeia-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronous WebAssembly host boundary for the Cassiopeia gameplay kernel"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+haneoka-cassiopeia-core = { path = "../cassiopeia-core" }
+wasm-bindgen.workspace = true

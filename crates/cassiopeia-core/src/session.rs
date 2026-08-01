@@ -110,6 +110,28 @@ pub struct JudgementEvent {
     pub life: u32,
 }
 
+/// Copy-only state for low-allocation render and foreign-function boundaries.
+///
+/// Hosts receive judgement events separately, so this form deliberately omits
+/// the variable-width last-event payload retained by [`SessionSnapshot`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedSessionSnapshot {
+    pub mode: SessionMode,
+    pub assist_level: AssistLevel,
+    pub time: TimeMicros,
+    pub judgement_offset: TimeMicros,
+    pub combo: u32,
+    pub perfect_combo: bool,
+    pub all_perfect: bool,
+    pub full_combo: bool,
+    pub max_combo: u32,
+    pub score: u32,
+    pub life: u32,
+    pub processed: u32,
+    pub total: u32,
+    pub last_input_sequence: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionSnapshot {
@@ -555,7 +577,28 @@ impl GameplaySession {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
+        let fixed = self.fixed_snapshot();
         SessionSnapshot {
+            mode: fixed.mode,
+            assist_level: fixed.assist_level,
+            time: fixed.time,
+            judgement_offset: fixed.judgement_offset,
+            combo: fixed.combo,
+            perfect_combo: fixed.perfect_combo,
+            all_perfect: fixed.all_perfect,
+            full_combo: fixed.full_combo,
+            max_combo: fixed.max_combo,
+            score: fixed.score,
+            life: fixed.life,
+            processed: fixed.processed,
+            total: fixed.total,
+            last_judgement: self.last_judgement.clone(),
+            last_input_sequence: fixed.last_input_sequence,
+        }
+    }
+
+    pub fn fixed_snapshot(&self) -> FixedSessionSnapshot {
+        FixedSessionSnapshot {
             mode: self.mode,
             assist_level: self.assist_level,
             time: self.time,
@@ -569,7 +612,6 @@ impl GameplaySession {
             life: self.life,
             processed: self.processed_count,
             total: self.total,
-            last_judgement: self.last_judgement.clone(),
             last_input_sequence: self.last_input_sequence,
         }
     }

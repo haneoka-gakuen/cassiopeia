@@ -35,8 +35,8 @@ pub use scoring::{
     note_weight_milli, perfect_ceiling, preserves_combo,
 };
 pub use session::{
-    GameplayNote, GameplaySession, InputAction, InputEvent, InputVector, JudgementEvent,
-    RuntimeInputEvent, SessionError, SessionMode, SessionSnapshot,
+    FixedSessionSnapshot, GameplayNote, GameplaySession, InputAction, InputEvent, InputVector,
+    JudgementEvent, RuntimeInputEvent, SessionError, SessionMode, SessionSnapshot,
 };
 pub use timing::{
     RoundingProfile, TempoEvent, TempoMap, TempoMapError, Tick, TimeMicros, TimeMillis,
