@@ -139,6 +139,11 @@ export interface RenderTitleIntroduction {
   lyricist?: string;
   composer?: string;
   arranger?: string;
+  jacketUrl?: string;
+  difficulty?: string;
+  difficultyIconUrl?: string;
+  level?: string | number;
+  highScore?: number;
   /** Root CanvasGroup opacity sampled from the presentation timeline. */
   alpha: number;
   /** Root-composited opacity of the centered song detail group. */

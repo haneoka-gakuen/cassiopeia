@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { sampleJudgementPunchScale } from "../dist/index.js";
+import { resolveTitleIntroductionLayout, sampleJudgementPunchScale } from "../dist/index.js";
 
 const expectedAt60Fps = [
   1,
@@ -22,4 +22,15 @@ for (const [frame, expected] of expectedAt60Fps.entries()) {
 assert.equal(sampleJudgementPunchScale(-1), 1);
 assert.equal(sampleJudgementPunchScale(1), 1);
 
-console.log("HUD presentation: judgement punch curve checks passed");
+assert.deepEqual(resolveTitleIntroductionLayout(1920, 1080), {
+  ribbonCenterX: 960,
+  ribbonCenterY: 841,
+  jacketLeft: 739.8399963378906,
+  jacketTop: 232.83999633789062,
+  jacketSize: 440.32000732421875,
+  metadataTop: 687,
+  metadataRight: 1180,
+});
+assert.equal(resolveTitleIntroductionLayout(1920, 1440).ribbonCenterY, 1201);
+
+console.log("HUD presentation: judgement punch and title layout checks passed");

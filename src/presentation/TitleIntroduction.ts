@@ -11,6 +11,11 @@ export interface TitleIntroductionContent {
   lyricist?: string;
   composer?: string;
   arranger?: string;
+  jacketUrl?: string;
+  difficulty?: string;
+  difficultyIconUrl?: string;
+  level?: string | number;
+  highScore?: number;
 }
 
 export interface TitleIntroductionTiming {

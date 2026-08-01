@@ -92,6 +92,39 @@ interface HudStaticSignature {
   showPause: boolean | undefined;
 }
 
+export interface TitleIntroductionLayout {
+  readonly ribbonCenterX: number;
+  readonly ribbonCenterY: number;
+  readonly jacketLeft: number;
+  readonly jacketTop: number;
+  readonly jacketSize: number;
+  readonly metadataTop: number;
+  readonly metadataRight: number;
+}
+
+/** Resolves the authored bottom and centre anchors in CanvasScaler logical space. */
+export function resolveTitleIntroductionLayout(
+  logicalWidth: number,
+  logicalHeight: number,
+): TitleIntroductionLayout {
+  const contentCenterX = logicalWidth / 2;
+  const contentCenterY = logicalHeight / 2 - 10;
+  const simplePanelLeft = contentCenterX - 220;
+  const simplePanelTop = contentCenterY - 297;
+  const jacketSize = 512 * 0.8600000143051147;
+  return {
+    ribbonCenterX: contentCenterX,
+    // ContentArea has a 40 px lower inset. center_bottom is a zero-height
+    // transform anchored to that edge, and the ribbon is 199 px above it.
+    ribbonCenterY: logicalHeight - 40 - 199,
+    jacketLeft: simplePanelLeft + (440 - jacketSize) / 2,
+    jacketTop: simplePanelTop + 220 - jacketSize / 2,
+    jacketSize,
+    metadataTop: simplePanelTop + 454,
+    metadataRight: simplePanelLeft + 440,
+  };
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -211,6 +244,9 @@ export class HudLayer {
     Record<"just" | "perfect" | "great" | "good" | "bad" | "miss" | "fast" | "late", HTMLImageElement>
   > = {};
   private readonly hudImages = new Map<string, HTMLImageElement>();
+  private readonly titleImages = new Map<string, HTMLImageElement>();
+  private readonly pendingTitleImages = new Set<string>();
+  private readonly failedTitleImages = new Set<string>();
   private tmpSdfFont?: TmpSdfFont;
   private readonly staticSignature: HudStaticSignature = {
     score: undefined,
@@ -863,8 +899,9 @@ export class HudLayer {
     if (!introduction || introduction.alpha <= 0 || !introduction.title) return;
     const theme = { ...DEFAULT_TITLE_THEME, ...introduction.theme };
     const context = this.context;
-    const centerX = this.logicalWidth / 2;
-    const centerY = this.logicalHeight / 2 - 199;
+    const layout = resolveTitleIntroductionLayout(this.logicalWidth, this.logicalHeight);
+    const centerX = layout.ribbonCenterX;
+    const centerY = layout.ribbonCenterY;
     const panelWidth = 1366;
     const panelHeight = 192;
     const left = centerX - panelWidth / 2;
@@ -886,6 +923,14 @@ export class HudLayer {
     };
 
     context.save();
+    const detailAlpha = clamp(introduction.contentAlpha ?? introduction.alpha, 0, 1);
+    context.globalAlpha = detailAlpha;
+    const jacket = this.titleImage(introduction.jacketUrl);
+    if (jacket) {
+      context.drawImage(jacket, layout.jacketLeft, layout.jacketTop, layout.jacketSize, layout.jacketSize);
+    }
+    this.drawTitleMetadata(introduction, layout, fontFamily);
+
     context.globalAlpha = clamp(introduction.alpha, 0, 1);
     context.fillStyle = theme.panelBackground;
     context.fillRect(left, top, panelWidth, panelHeight);
@@ -894,7 +939,7 @@ export class HudLayer {
       context.lineWidth = theme.panelBorderWidthPx;
       context.strokeRect(left, top, panelWidth, panelHeight);
     }
-    context.globalAlpha = clamp(introduction.contentAlpha ?? introduction.alpha, 0, 1);
+    context.globalAlpha = detailAlpha;
     drawCanvasText(introduction.title, centerY - 48, 48, 700, theme.titleColor);
     drawCanvasText(introduction.artist ?? "", centerY + 8, 24, 700, theme.artistColor);
     const lyricist = introduction.lyricist ? `作詞: ${introduction.lyricist}` : "";
@@ -914,10 +959,82 @@ export class HudLayer {
     context.restore();
   }
 
+  private titleImage(url: string | undefined): HTMLImageElement | undefined {
+    if (!url || typeof Image === "undefined") return undefined;
+    const loaded = this.titleImages.get(url);
+    if (loaded || this.pendingTitleImages.has(url) || this.failedTitleImages.has(url)) return loaded;
+    this.pendingTitleImages.add(url);
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      this.pendingTitleImages.delete(url);
+      if (this.disposed) return;
+      this.titleImages.set(url, image);
+      this.forceRedraw = true;
+    };
+    image.onerror = () => {
+      this.pendingTitleImages.delete(url);
+      this.failedTitleImages.add(url);
+    };
+    image.src = url;
+    return undefined;
+  }
+
+  private drawTitleMetadata(
+    introduction: NonNullable<RenderHudState["titleIntroduction"]>,
+    layout: TitleIntroductionLayout,
+    fontFamily: string,
+  ): void {
+    const context = this.context;
+    const difficultyIcon = this.titleImage(introduction.difficultyIconUrl);
+    if (difficultyIcon) {
+      context.drawImage(
+        difficultyIcon,
+        layout.metadataRight - 440 - 1,
+        layout.metadataTop + 3,
+        120.8,
+        35.2,
+      );
+    } else if (introduction.difficulty) {
+      context.fillStyle = "rgba(236, 67, 92, 0.94)";
+      context.fillRect(layout.metadataRight - 441, layout.metadataTop + 3, 120.8, 35.2);
+      context.fillStyle = "#ffffff";
+      context.font = `700 18px ${fontFamily}`;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(
+        introduction.difficulty.toLocaleUpperCase(),
+        layout.metadataRight - 380.6,
+        layout.metadataTop + 20.6,
+      );
+    }
+    if (introduction.level !== undefined) {
+      context.fillStyle = "#ffffff";
+      context.font = `400 30px ${fontFamily}`;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(String(introduction.level), layout.metadataRight - 298, layout.metadataTop + 21.9);
+    }
+    if (introduction.highScore !== undefined && Number.isFinite(introduction.highScore)) {
+      const score = String(Math.max(0, Math.trunc(introduction.highScore)));
+      context.fillStyle = "#ffffff";
+      context.textBaseline = "middle";
+      context.font = `400 18px ${fontFamily}`;
+      context.textAlign = "left";
+      context.fillText("HIGH SCORE :", layout.metadataRight - 257, layout.metadataTop + 19);
+      context.font = `400 30px ${fontFamily}`;
+      context.textAlign = "right";
+      context.fillText(score, layout.metadataRight - 7, layout.metadataTop + 19);
+    }
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.hudImages.clear();
+    this.titleImages.clear();
+    this.pendingTitleImages.clear();
+    this.failedTitleImages.clear();
     this.tmpSdfFont?.dispose();
     this.tmpSdfFont = undefined;
     this.context.setTransform(1, 0, 0, 1, 0, 0);
