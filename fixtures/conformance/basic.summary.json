@@ -1,0 +1,54 @@
+{
+  "summaryFormat": "org.haneoka.cassiopeia.conformance-summary",
+  "summaryVersion": 1,
+  "validationScope": "ccfV1StructuralAndExactTiming",
+  "chart": {
+    "format": "org.haneoka.cassiopeia.chart",
+    "version": 1,
+    "title": "Conformance Fixture",
+    "ppq": 480,
+    "laneCount": 8,
+    "compatibilityProfile": null
+  },
+  "timing": {
+    "roundingProfile": "exactRational",
+    "tempoSegments": [
+      {
+        "tick": 0,
+        "microsPerQuarter": 500000,
+        "timeMicros": 0
+      },
+      {
+        "tick": 960,
+        "microsPerQuarter": 400000,
+        "timeMicros": 1000000
+      }
+    ],
+    "firstNote": {
+      "id": "tap-0",
+      "tick": 0,
+      "timeMicros": 0
+    },
+    "lastNote": {
+      "id": "flick-3",
+      "tick": 1920,
+      "timeMicros": 1800000
+    }
+  },
+  "events": {
+    "total": 4,
+    "tempo": 2,
+    "meter": 1,
+    "timeScale": 1
+  },
+  "notes": {
+    "total": 4,
+    "tap": 1,
+    "flick": 1,
+    "trace": 0,
+    "holdStart": 1,
+    "holdTick": 0,
+    "holdEnd": 1,
+    "guide": 0
+  }
+}

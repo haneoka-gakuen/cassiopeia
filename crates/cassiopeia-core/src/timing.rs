@@ -92,21 +92,29 @@ impl TempoMap {
 
         let mut segments = Vec::with_capacity(events.len());
         let mut current = TimeMicros(0);
-        for (index, event) in events.into_iter().enumerate() {
+        for event in events {
             if let Some(previous) = segments.last().copied() {
                 current = add_delta(previous, event.tick, ppq, profile)?;
-            } else if event.tick < Tick(0) {
-                let origin = TempoSegment {
-                    event,
-                    start: TimeMicros(0),
-                };
-                current = add_delta(origin, Tick(0), ppq, profile)?;
             }
             segments.push(TempoSegment {
                 event,
                 start: current,
             });
-            debug_assert_eq!(segments.len(), index + 1);
+        }
+
+        let origin_index = segments.partition_point(|segment| segment.event.tick <= Tick(0));
+        let origin_segment = segments[origin_index.saturating_sub(1)];
+        let origin_time = add_delta(origin_segment, Tick(0), ppq, profile)?;
+        if origin_time != TimeMicros(0) {
+            for segment in &mut segments {
+                segment.start = TimeMicros(
+                    segment
+                        .start
+                        .0
+                        .checked_sub(origin_time.0)
+                        .ok_or(TempoMapError::Overflow)?,
+                );
+            }
         }
         Ok(Self {
             ppq,
@@ -181,5 +189,21 @@ mod tests {
         .unwrap();
         assert_eq!(map.time_at_tick(Tick(480)).unwrap(), TimeMicros(500_000));
         assert_eq!(map.time_at_tick(Tick(960)).unwrap(), TimeMicros(1_500_000));
+    }
+
+    #[test]
+    fn tempo_before_zero_is_anchored_to_tick_zero() {
+        let map = TempoMap::new(
+            480,
+            vec![TempoEvent {
+                tick: Tick(-480),
+                micros_per_quarter: 500_000,
+            }],
+            RoundingProfile::ExactRational,
+        )
+        .unwrap();
+
+        assert_eq!(map.time_at_tick(Tick(-480)).unwrap(), TimeMicros(-500_000));
+        assert_eq!(map.time_at_tick(Tick(0)).unwrap(), TimeMicros(0));
     }
 }

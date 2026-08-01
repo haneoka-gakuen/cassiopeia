@@ -4,10 +4,10 @@
 **I**nfrastructure for **O**pen **P**layback, **E**ffects, **I**nterchange, and
 **A**daptation.
 
-Cassiopeia is an embeddable, multi-platform rhythm-game engine. It provides a
-web parser, simulation, input system, Three.js renderer, Vue components, and a
-portable Rust kernel for deterministic timing, judgement, chart validation,
-and replay.
+Cassiopeia is an early-stage, embeddable, multi-platform rhythm-game engine.
+It provides a web parser, simulation, input system, Three.js renderer, Vue
+components, and a portable Rust kernel for deterministic timing, judgement
+primitives, and chart validation.
 
 ## Packages and entry points
 
@@ -44,6 +44,16 @@ The Rust kernel can also be checked independently:
 ```sh
 cargo test --workspace
 ```
+
+From a source checkout, the conformance runner validates a CCF document and
+prints a versioned, deterministic timing summary:
+
+```sh
+cargo run -p haneoka-cassiopeia-cli -- conformance fixtures/conformance/basic.ccf.json
+```
+
+This command checks the chart and timing contract; it is not a full gameplay
+or replay verifier.
 
 ## License
 

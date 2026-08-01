@@ -4,7 +4,7 @@
 //!
 //! This crate intentionally owns no window, GPU, audio-device, filesystem, or
 //! network APIs. Hosts inject those capabilities and use the same timing,
-//! judgement, chart, and replay semantics on every platform.
+//! judgement primitives, and chart contracts on every platform.
 
 pub mod chart;
 pub mod judgement;

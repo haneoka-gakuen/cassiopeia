@@ -14,20 +14,23 @@ current draft.
 - Tempo uses integer microseconds per quarter note; no locale or binary float
   is needed for interchange.
 - Lanes and widths are integer units in the chart-declared lane basis.
-- Stable string IDs make hold/guide relationships independent of array order.
+- Events and notes are sorted by tick. Stable, unique note IDs make hold/guide
+  relationships independent of array order.
 - Rendering time scale is separate from judgement/audio time.
 - Source-only values live in a namespaced extension during import and must
   produce an explicit warning if an exporter cannot represent them.
-- Unknown root or note fields are rejected in version 1. A future extension
-  must use a new version or an agreed namespaced extension point.
+- Unknown root, header, event, or note fields are rejected in version 1. A
+  future extension must use a new version or an agreed namespaced extension
+  point.
 
 ## Compatibility profiles
 
 `header.compatibilityProfile` selects observable game-specific semantics
-without changing the neutral document model. `our-notes-2026` selects the
-versioned Our Notes timing, judgement, lane, slide, score, life, and effect
-behavior implemented by the runtime. A missing profile uses Cassiopeia's
-documented neutral defaults.
+without changing the neutral document model. `our-notes-2026` is reserved as
+an experimental compatibility identifier. Implementations must separately
+report their supported capabilities; its presence alone does not claim full
+gameplay or audiovisual parity. A missing profile uses Cassiopeia's documented
+neutral defaults.
 
 Sonolus `LevelData`, SS, SUS, and USC are adapters, not aliases of this schema.
 Round trips must report every dropped or approximated capability.

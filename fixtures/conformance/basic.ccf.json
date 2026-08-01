@@ -1,0 +1,67 @@
+{
+  "format": "org.haneoka.cassiopeia.chart",
+  "version": 1,
+  "header": {
+    "title": "Conformance Fixture",
+    "artist": "Cassiopeia",
+    "author": "Cassiopeia",
+    "ppq": 480,
+    "laneCount": 8
+  },
+  "events": [
+    {
+      "type": "tempo",
+      "tick": 0,
+      "microsPerQuarter": 500000
+    },
+    {
+      "type": "meter",
+      "tick": 0,
+      "numerator": 4,
+      "denominator": 4
+    },
+    {
+      "type": "tempo",
+      "tick": 960,
+      "microsPerQuarter": 400000
+    },
+    {
+      "type": "timeScale",
+      "tick": 1440,
+      "scaleMilli": 750
+    }
+  ],
+  "notes": [
+    {
+      "id": "tap-0",
+      "tick": 0,
+      "lane": 0,
+      "width": 1,
+      "kind": "tap"
+    },
+    {
+      "id": "hold-1-start",
+      "tick": 480,
+      "lane": 2,
+      "width": 2,
+      "kind": "holdStart",
+      "links": ["hold-1-end"]
+    },
+    {
+      "id": "hold-1-end",
+      "tick": 1440,
+      "lane": 3,
+      "width": 2,
+      "kind": "holdEnd",
+      "links": ["hold-1-start"]
+    },
+    {
+      "id": "flick-3",
+      "tick": 1920,
+      "lane": 7,
+      "width": 1,
+      "kind": "flick",
+      "critical": true
+    }
+  ]
+}

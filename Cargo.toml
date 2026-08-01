@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cassiopeia-core"]
+members = ["crates/cassiopeia-cli", "crates/cassiopeia-core"]
 resolver = "2"
 
 [workspace.package]
@@ -8,6 +8,10 @@ edition = "2024"
 rust-version = "1.88"
 license = "MPL-2.0"
 repository = "https://github.com/haneoka-gakuen/cassiopeia"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [profile.release]
 codegen-units = 1
