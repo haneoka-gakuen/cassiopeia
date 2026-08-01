@@ -60,7 +60,7 @@
   "scripts": {
     "build": "vite build && vue-tsc -p tsconfig.build.json",
     "benchmark": "pnpm run build && node benchmarks/runtime.mjs",
-    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs",
+    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs",
     "typecheck": "vue-tsc -p tsconfig.json --noEmit",
     "rust:check": "cargo check --workspace --all-targets",
     "rust:test": "cargo test --workspace",

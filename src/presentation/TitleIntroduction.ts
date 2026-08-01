@@ -16,7 +16,10 @@ export interface TitleIntroductionContent {
 export interface TitleIntroductionTiming {
   totalDurationMs: number;
   displayStartMs: number;
+  /** Root CanvasGroup reaches alpha 1 at this boundary. */
   holdStartMs: number;
+  /** Center title/artist/credit group reaches alpha 1 at this boundary. */
+  contentShowEndMs: number;
   showClipEndMs: number;
   hideEndMs: number;
 }
@@ -34,6 +37,7 @@ export interface TitleIntroductionSnapshot {
   enabled: boolean;
   state: TitleIntroductionState;
   alpha: number;
+  contentAlpha: number;
   elapsedMs: number;
   content: Readonly<TitleIntroductionContent>;
 }
@@ -45,15 +49,14 @@ export interface TitleIntroductionOptions {
   alphaSampler?: TitleIntroductionAlphaSampler;
 }
 
-const PRESENTATION_FRAME_MS = 16.6667;
-
-/** Stable clip boundaries. The short initial transition is intentionally replaceable. */
+/** Stable clip boundaries from the authored 60 Hz opening timeline. */
 export const DEFAULT_TITLE_INTRODUCTION_TIMING: Readonly<TitleIntroductionTiming> = Object.freeze({
-  totalDurationMs: 5916.6667,
-  displayStartMs: 1483.3333,
-  holdStartMs: 1483.3333 + PRESENTATION_FRAME_MS,
-  showClipEndMs: 3766.6667,
-  hideEndMs: 4433.3333,
+  totalDurationMs: 5916.666666666667,
+  displayStartMs: 1483.3333333333333,
+  holdStartMs: 1650.0000049670537,
+  contentShowEndMs: 1983.3333333333333,
+  showClipEndMs: 3766.6666666666665,
+  hideEndMs: 4433.333353201548,
 });
 
 const clampUnit = (value: number): number => {
@@ -71,8 +74,10 @@ export const sampleDefaultTitleIntroductionAlpha: TitleIntroductionAlphaSampler 
   phaseDurationMs,
 }) => {
   if (state === "holding") return 1;
-  if (state === "showing") return clampUnit(phaseElapsedMs / phaseDurationMs);
-  if (state === "hiding") return 1 - clampUnit(phaseElapsedMs / phaseDurationMs);
+  const progress = clampUnit(phaseElapsedMs / phaseDurationMs);
+  const smooth = progress * progress * (3 - 2 * progress);
+  if (state === "showing") return smooth;
+  if (state === "hiding") return 1 - smooth;
   return 0;
 };
 
@@ -81,6 +86,7 @@ function validateTiming(timing: TitleIntroductionTiming): TitleIntroductionTimin
     timing.totalDurationMs,
     timing.displayStartMs,
     timing.holdStartMs,
+    timing.contentShowEndMs,
     timing.showClipEndMs,
     timing.hideEndMs,
   ];
@@ -90,7 +96,8 @@ function validateTiming(timing: TitleIntroductionTiming): TitleIntroductionTimin
   if (
     timing.displayStartMs < 0 ||
     timing.displayStartMs >= timing.holdStartMs ||
-    timing.holdStartMs > timing.showClipEndMs ||
+    timing.holdStartMs >= timing.contentShowEndMs ||
+    timing.contentShowEndMs > timing.showClipEndMs ||
     timing.showClipEndMs >= timing.hideEndMs ||
     timing.hideEndMs > timing.totalDurationMs
   ) {
@@ -137,7 +144,7 @@ export function sampleTitleIntroduction(
     Math.max(0, finiteRealtime(elapsedMs, "elapsedMs")),
   );
   if (!enabled) {
-    return { enabled: false, state: "complete", alpha: 0, elapsedMs: checkedElapsed, content };
+    return { enabled: false, state: "complete", alpha: 0, contentAlpha: 0, elapsedMs: checkedElapsed, content };
   }
 
   const state = resolveState(checkedElapsed, checkedTiming);
@@ -150,7 +157,13 @@ export function sampleTitleIntroduction(
       phaseDurationMs: Math.max(Number.EPSILON, phaseEndMs - phaseStartMs),
     }),
   );
-  return { enabled: true, state, alpha, elapsedMs: checkedElapsed, content };
+  const contentProgress = clampUnit(
+    (checkedElapsed - checkedTiming.holdStartMs) /
+      Math.max(Number.EPSILON, checkedTiming.contentShowEndMs - checkedTiming.holdStartMs),
+  );
+  const contentSmooth = contentProgress * contentProgress * (3 - 2 * contentProgress);
+  const contentAlpha = checkedElapsed >= checkedTiming.hideEndMs ? 0 : clampUnit(alpha * contentSmooth);
+  return { enabled: true, state, alpha, contentAlpha, elapsedMs: checkedElapsed, content };
 }
 
 /** Realtime-driven title introduction with explicit reset and retry behavior. */
@@ -205,8 +218,9 @@ export class TitleIntroductionPresentation {
     return this.atElapsed(0);
   }
 
-  retry(startRealtimeMs?: number): TitleIntroductionSnapshot {
-    this.reset();
-    return startRealtimeMs === undefined ? this.atElapsed(0) : this.start(startRealtimeMs);
+  /** Retry bypasses the opening state and must not replay this presentation. */
+  retry(): TitleIntroductionSnapshot {
+    this.startRealtimeMs = undefined;
+    return this.atElapsed(this.timing.totalDurationMs);
   }
 }

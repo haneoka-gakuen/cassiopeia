@@ -139,8 +139,10 @@ export interface RenderTitleIntroduction {
   lyricist?: string;
   composer?: string;
   arranger?: string;
-  /** Canvas-group opacity sampled from the presentation timeline. */
+  /** Root CanvasGroup opacity sampled from the presentation timeline. */
   alpha: number;
+  /** Root-composited opacity of the centered song detail group. */
+  contentAlpha?: number;
   theme?: Partial<RenderTitleIntroductionTheme>;
 }
 

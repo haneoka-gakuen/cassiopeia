@@ -21,16 +21,24 @@ assert.deepEqual(at(0), {
   enabled: true,
   state: "hidden",
   alpha: 0,
+  contentAlpha: 0,
   elapsedMs: 0,
   content,
 });
 assert.equal(at(timing.displayStartMs - epsilon).state, "hidden");
 assert.equal(at(timing.displayStartMs).state, "showing");
 assert.equal(at(timing.displayStartMs).alpha, 0);
+assert.equal(
+  at((timing.displayStartMs + timing.holdStartMs) / 2).alpha,
+  0.5,
+);
 assert.equal(at(timing.holdStartMs - epsilon).state, "showing");
 assert.ok(at(timing.holdStartMs - epsilon).alpha > 0.99);
 assert.equal(at(timing.holdStartMs).state, "holding");
 assert.equal(at(timing.holdStartMs).alpha, 1);
+assert.equal(at(timing.holdStartMs).contentAlpha, 0);
+assert.equal(at((timing.holdStartMs + timing.contentShowEndMs) / 2).contentAlpha, 0.5);
+assert.equal(at(timing.contentShowEndMs).contentAlpha, 1);
 assert.equal(at(timing.showClipEndMs - epsilon).state, "holding");
 assert.equal(at(timing.showClipEndMs).state, "hiding");
 assert.equal(at(timing.showClipEndMs).alpha, 1);
@@ -44,6 +52,7 @@ assert.equal(at(timing.totalDurationMs + 1000).elapsedMs, timing.totalDurationMs
 const disabled = sampleTitleIntroduction(content, timing.displayStartMs, false);
 assert.equal(disabled.state, "complete");
 assert.equal(disabled.alpha, 0);
+assert.equal(disabled.contentAlpha, 0);
 
 const presentation = new TitleIntroductionPresentation({ content });
 assert.equal(presentation.update(500).state, "hidden");
@@ -51,8 +60,7 @@ presentation.start(10_000);
 assert.equal(presentation.update(10_000 + timing.showClipEndMs).state, "hiding");
 assert.equal(presentation.reset().state, "hidden");
 assert.equal(presentation.update(50_000).elapsedMs, 0);
-presentation.retry(20_000);
-assert.equal(presentation.update(20_000 + timing.holdStartMs).state, "holding");
+assert.equal(presentation.retry().state, "complete");
 assert.equal(presentation.setEnabled(false).state, "complete");
 assert.equal(presentation.update(20_000 + timing.holdStartMs).alpha, 0);
 assert.equal(presentation.setEnabled(true).state, "hidden");

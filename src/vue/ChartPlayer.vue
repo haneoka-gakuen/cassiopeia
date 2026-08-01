@@ -93,6 +93,11 @@ let noteSounds: NoteSoundPlayer | undefined;
 let titleIntroduction: TitleIntroductionPresentation | undefined;
 let titleIntroductionSnapshot: TitleIntroductionSnapshot | undefined;
 let titleIntroductionElapsedMs = 0;
+let titleIntroductionRunning = false;
+let titleIntroductionStartPending = false;
+let titleIntroductionMediaPrimed = false;
+let titleIntroductionUnlock: Promise<void> | undefined;
+let suppressInternalMediaEvents = false;
 let input: OurNotesInput | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let animationFrame = 0;
@@ -115,8 +120,11 @@ const externalClockControlled = computed(() => props.externalTimeMs !== undefine
 const presentationTimeMs = () =>
   externalClockControlled.value ? normalizeExternalTimeMs(props.externalTimeMs) : (clock?.timeMs ?? 0);
 const chartTimeMs = () => presentationTimeMs() - props.bgmOffsetMs;
-const playerIsPlaying = () =>
+const titleIntroductionInFlight = () => titleIntroductionRunning || titleIntroductionStartPending;
+const gameplayIsPlaying = () =>
   externalClockControlled.value ? props.externalPlaying === true : clock?.playing === true;
+const playerIsPlaying = () =>
+  externalClockControlled.value ? props.externalPlaying === true : gameplayIsPlaying() || titleIntroductionInFlight();
 const presentationDurationMs = () => Math.max(clock?.durationMs ?? 0, props.chart.durationMs + props.bgmOffsetMs, 0);
 const playbackRate = () => clock?.rate ?? normalizePlaybackRate(props.rate);
 
@@ -257,6 +265,10 @@ function attachSession(): void {
 
 function attachTitleIntroduction(): void {
   const content = props.titleIntroduction;
+  titleIntroductionRunning = false;
+  titleIntroductionStartPending = false;
+  titleIntroductionMediaPrimed = false;
+  titleIntroductionUnlock = undefined;
   titleIntroductionElapsedMs = 0;
   if (!content?.title) {
     titleIntroduction = undefined;
@@ -273,25 +285,39 @@ function attachTitleIntroduction(): void {
 function resumeTitleIntroduction(): void {
   if (!titleIntroduction || titleIntroductionSnapshot?.state === "complete") return;
   titleIntroductionSnapshot = titleIntroduction.start(performance.now() - titleIntroductionElapsedMs);
+  titleIntroductionRunning = true;
 }
 
 function pauseTitleIntroduction(): void {
-  if (!titleIntroduction || titleIntroductionSnapshot?.state === "complete") return;
+  if (!titleIntroductionRunning || !titleIntroduction || titleIntroductionSnapshot?.state === "complete") return;
   titleIntroductionSnapshot = titleIntroduction.update(performance.now());
   titleIntroductionElapsedMs = titleIntroductionSnapshot.elapsedMs;
+  titleIntroductionRunning = false;
 }
 
-function resetTitleIntroduction(chartTime: number): void {
+function skipTitleIntroduction(): void {
   if (!titleIntroduction) return;
-  titleIntroductionElapsedMs = chartTime <= 0 ? 0 : titleIntroduction.timing.totalDurationMs;
+  titleIntroductionRunning = false;
+  titleIntroductionStartPending = false;
+  titleIntroductionElapsedMs = titleIntroduction.timing.totalDurationMs;
   titleIntroductionSnapshot = titleIntroduction.atElapsed(titleIntroductionElapsedMs);
+}
+
+function shouldPlayTitleIntroduction(): boolean {
+  return (
+    !externalClockControlled.value &&
+    Boolean(titleIntroduction) &&
+    titleIntroductionSnapshot?.enabled === true &&
+    titleIntroductionSnapshot.state !== "complete" &&
+    chartTimeMs() <= 0
+  );
 }
 
 function applyTitleIntroduction(frame: RenderFrame, realtimeMs: number): RenderFrame {
   const presentation = titleIntroduction;
   const hud = frame.hud;
   if (!presentation || !hud) return frame;
-  if (playerIsPlaying()) {
+  if (titleIntroductionRunning) {
     titleIntroductionSnapshot = presentation.update(realtimeMs);
     titleIntroductionElapsedMs = titleIntroductionSnapshot.elapsedMs;
   }
@@ -301,6 +327,7 @@ function applyTitleIntroduction(frame: RenderFrame, realtimeMs: number): RenderF
       ? {
           ...snapshot.content,
           alpha: snapshot.alpha,
+          contentAlpha: snapshot.contentAlpha,
           theme: props.titleIntroductionTheme,
         }
       : undefined;
@@ -329,7 +356,7 @@ function attachInput(): void {
   if (!root.value || !renderer) return;
   input?.destroy();
   activePointerIds.clear();
-  const canJudge = () => props.mode === "play" && playerIsPlaying();
+  const canJudge = () => props.mode === "play" && gameplayIsPlaying();
   input = new OurNotesInput(
     root.value,
     {
@@ -400,7 +427,7 @@ function renderFrame(): void {
   // A playing media element can report the same clock value for several rAFs
   // while buffering or while the platform audio clock advances at a lower
   // cadence. No simulator or visual state changes in those duplicate ticks.
-  if (!dirty && timeMs === lastRenderedTimeMs) return;
+  if (!dirty && timeMs === lastRenderedTimeMs && !titleIntroductionRunning) return;
   const frameStarted = perfProbe ? performance.now() : 0;
   const sessionStarted = frameStarted;
   if (props.mode === "play" && playing && activePointerIds.size > 0) {
@@ -450,7 +477,18 @@ function renderFrame(): void {
 function animate(): void {
   animationFrame = 0;
   renderFrame();
-  if (clock?.playing) requestFrame();
+  if (titleIntroductionRunning && titleIntroductionSnapshot?.state === "complete") {
+    titleIntroductionRunning = false;
+    titleIntroductionStartPending = true;
+    requestFrame();
+    return;
+  }
+  if (titleIntroductionStartPending) {
+    titleIntroductionStartPending = false;
+    void startMediaPlayback(false);
+    return;
+  }
+  if (clock?.playing || titleIntroductionRunning) requestFrame();
 }
 
 function requestFrame(): void {
@@ -478,7 +516,7 @@ function resetTimeline(timeMs: number): void {
   noteSounds?.clearQueue();
   noteSounds?.stopLongLine();
   timelineFinished = false;
-  resetTitleIntroduction(timeMs);
+  if (timeMs > 0) skipTitleIntroduction();
   try {
     frameBuilder.reset();
     session.reset(timeMs);
@@ -506,26 +544,76 @@ function finishTimeline(timeMs = chartTimeMs()): void {
   requestFrame();
 }
 
-async function play(): Promise<void> {
+async function primeMediaForTitleIntroduction(): Promise<void> {
+  const target = clock;
+  if (!target?.source) return;
+  const resumeAtMs = target.timeMs;
+  const previousMuted = target.audio.muted;
+  suppressInternalMediaEvents = true;
+  target.audio.muted = true;
+  try {
+    // Start inside the originating click so a delayed post-introduction play
+    // remains authorized on browsers with strict user-activation rules.
+    await target.play();
+    target.pause();
+    target.seek(resumeAtMs);
+  } finally {
+    target.audio.muted = previousMuted;
+    suppressInternalMediaEvents = false;
+  }
+}
+
+async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
   if (externalClockControlled.value) return;
   try {
-    // Invoke both media unlocks synchronously inside the originating click;
-    // awaiting cue fetch/decode first would consume Safari's user activation
-    // before HTMLMediaElement.play() is called.
-    const noteSoundUnlock = props.noteSoundEnabled ? noteSounds?.unlock() : undefined;
+    if (titleIntroductionUnlock) await titleIntroductionUnlock;
+    const noteSoundUnlock = unlockNoteSounds && props.noteSoundEnabled ? noteSounds?.unlock() : undefined;
     const musicPlay = clock?.play();
     syncBackgroundVideo(true);
-    const videoPlay = props.backgroundVideoUrl && failedBackgroundVideoUrl !== props.backgroundVideoUrl
-      ? backgroundVideo.value?.play().catch((reason) => renderer?.reportAssetError(reason))
-      : undefined;
+    const videoPlay =
+      props.backgroundVideoUrl && failedBackgroundVideoUrl !== props.backgroundVideoUrl
+        ? backgroundVideo.value?.play().catch((reason) => renderer?.reportAssetError(reason))
+        : undefined;
     await Promise.all([noteSoundUnlock, musicPlay, videoPlay]);
     requestFrame();
   } catch (reason) {
+    if (!destroyed) {
+      titleIntroductionRunning = false;
+      titleIntroductionStartPending = false;
+      emit("playing", false);
+      reportError(reason);
+    }
+  }
+}
+
+async function play(): Promise<void> {
+  if (externalClockControlled.value || titleIntroductionInFlight()) return;
+  if (!shouldPlayTitleIntroduction()) {
+    await startMediaPlayback();
+    return;
+  }
+
+  // Note-audio and media priming are both invoked synchronously from the
+  // click. The title clock then runs independently while chart/music time is 0.
+  const noteSoundUnlock = props.noteSoundEnabled ? noteSounds?.unlock() : undefined;
+  const mediaPrime = titleIntroductionMediaPrimed ? undefined : primeMediaForTitleIntroduction();
+  titleIntroductionMediaPrimed = true;
+  titleIntroductionUnlock = Promise.all([noteSoundUnlock, mediaPrime]).then(() => undefined);
+  resumeTitleIntroduction();
+  dirty = true;
+  requestFrame();
+  emit("playing", true);
+  try {
+    await titleIntroductionUnlock;
+  } catch (reason) {
+    titleIntroductionRunning = false;
+    emit("playing", false);
     if (!destroyed) reportError(reason);
   }
 }
 
 function pause(): void {
+  const introductionWasPlaying = titleIntroductionInFlight();
   if (activePointerIds.size > 0) {
     for (const point of input?.activePoints ?? []) session?.cancel(point.pointerId);
   }
@@ -535,14 +623,19 @@ function pause(): void {
   noteSounds?.clearQueue();
   noteSounds?.stopLongLine();
   pauseTitleIntroduction();
+  titleIntroductionStartPending = false;
   backgroundVideo.value?.pause();
   clock?.pause();
+  if (introductionWasPlaying && !clock?.playing) emit("playing", false);
 }
 
-function seek(seconds: number): void {
+function seek(seconds: number, skipIntroduction = true): void {
   if (externalClockControlled.value || !clock || !session || !frameBuilder) return;
+  const introductionWasPlaying = titleIntroductionInFlight();
+  if (skipIntroduction) skipTitleIntroduction();
   clock.seek(seconds * 1000);
   resetTimeline(chartTimeMs());
+  if (introductionWasPlaying) emit("playing", false);
 }
 
 function attachInternalAudio(): void {
@@ -557,15 +650,14 @@ function attachInternalAudio(): void {
   void noteSounds.load();
   const active = () => !destroyed && clock === candidate;
   candidate.audio.addEventListener("play", () => {
-    if (active()) {
+    if (active() && !suppressInternalMediaEvents && !titleIntroductionInFlight()) {
       if (candidate.timeMs + props.bgmOffsetMs < presentationDurationMs()) timelineFinished = false;
-      resumeTitleIntroduction();
       requestFrame();
       emit("playing", true);
     }
   });
   candidate.audio.addEventListener("pause", () => {
-    if (active()) {
+    if (active() && !suppressInternalMediaEvents && !titleIntroductionInFlight()) {
       pauseTitleIntroduction();
       dirty = true;
       requestFrame();
@@ -621,7 +713,10 @@ async function initialize(): Promise<void> {
     resizeObserver.observe(root.value);
     ready.value = true;
     resize();
-    if (externalClockControlled.value) resetTimeline(chartTimeMs());
+    if (externalClockControlled.value) {
+      skipTitleIntroduction();
+      resetTimeline(chartTimeMs());
+    }
     else requestFrame();
     if (externalClockControlled.value && props.externalPlaying && props.backgroundVideoUrl) {
       syncBackgroundVideo(true);
@@ -654,8 +749,11 @@ watch(
   (mode) => {
     session?.setMode(mode);
     pause();
-    if (externalClockControlled.value) resetTimeline(chartTimeMs());
-    else seek(0);
+    attachTitleIntroduction();
+    if (externalClockControlled.value) {
+      skipTitleIntroduction();
+      resetTimeline(chartTimeMs());
+    } else seek(0, false);
   },
 );
 watch(
@@ -663,17 +761,21 @@ watch(
   () => {
     pause();
     attachSession();
-    if (externalClockControlled.value) resetTimeline(chartTimeMs());
-    else seek(0);
+    if (externalClockControlled.value) {
+      skipTitleIntroduction();
+      resetTimeline(chartTimeMs());
+    } else seek(0, false);
     emit("duration", presentationDurationMs() / 1000);
   },
 );
 watch(
   [() => props.titleIntroduction, () => props.titleIntroductionEnabled],
   () => {
+    const introductionWasInFlight = titleIntroductionInFlight();
     attachTitleIntroduction();
-    resetTitleIntroduction(chartTimeMs());
-    if (playerIsPlaying()) resumeTitleIntroduction();
+    if (externalClockControlled.value || chartTimeMs() > 0 || gameplayIsPlaying()) skipTitleIntroduction();
+    else if (introductionWasInFlight && props.titleIntroductionEnabled) resumeTitleIntroduction();
+    else if (introductionWasInFlight) titleIntroductionStartPending = true;
     dirty = true;
     requestFrame();
   },
@@ -700,6 +802,7 @@ watch(externalClockControlled, (controlled) => {
   if (!renderer) return;
   if (controlled) detachInternalAudio();
   else attachInternalAudio();
+  if (controlled) skipTitleIntroduction();
   resetTimeline(chartTimeMs());
   emit("duration", presentationDurationMs() / 1000);
 });
@@ -730,7 +833,7 @@ watch(
     }
     else {
       timelineFinished = false;
-      resumeTitleIntroduction();
+      skipTitleIntroduction();
       if (props.backgroundVideoUrl) {
         syncBackgroundVideo(true);
         void backgroundVideo.value?.play().catch((reason) => renderer?.reportAssetError(reason));

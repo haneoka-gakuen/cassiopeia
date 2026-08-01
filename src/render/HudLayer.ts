@@ -26,10 +26,11 @@ const JUDGEMENT_POOL_CAPACITY = 8;
 const CHART_LANE_COUNT = 24;
 const JUDGEMENT_SHOW_DURATION = 0.30000001192092896;
 const JUDGEMENT_PUNCH_DURATION = 0.15000000596046448;
+const JUDGEMENT_PUNCH_RISE_DURATION = 0.05000000447034836;
 const JUDGEMENT_PUNCH_SCALE = 0.2;
 const JUDGEMENT_SUB_SCALE = 0.75;
 const DEFAULT_TITLE_THEME: RenderTitleIntroductionTheme = {
-  panelBackground: "rgba(92, 59, 190, 0.72)",
+  panelBackground: "rgba(92, 59, 190, 0.5)",
   panelBorderColor: "rgba(255, 255, 255, 0)",
   panelBorderWidthPx: 0,
   fontFamilies: ["Noto Sans", "Noto Sans JP", "Noto Sans SC", "system-ui", "sans-serif"],
@@ -100,12 +101,19 @@ function smoothstep01(value: number): number {
   return progress * progress * (3 - 2 * progress);
 }
 
-function judgementPunchScale(age: number): number {
+function outQuad(progress: number): number {
+  const remaining = 1 - clamp(progress, 0, 1);
+  return 1 - remaining * remaining;
+}
+
+/** DOTween Punch with one vibration: OutQuad rise, then OutQuad recovery. */
+export function sampleJudgementPunchScale(age: number): number {
   if (age <= 0 || age >= JUDGEMENT_PUNCH_DURATION) return 1;
-  const progress = age / JUDGEMENT_PUNCH_DURATION;
-  // One-vibration punch: grow during the first half, then return to the
-  // authored scale without a discontinuity before the 0.15 s hold.
-  return 1 + JUDGEMENT_PUNCH_SCALE * Math.sin(Math.PI * progress);
+  if (age <= JUDGEMENT_PUNCH_RISE_DURATION) {
+    return 1 + JUDGEMENT_PUNCH_SCALE * outQuad(age / JUDGEMENT_PUNCH_RISE_DURATION);
+  }
+  const recoveryDuration = JUDGEMENT_PUNCH_DURATION - JUDGEMENT_PUNCH_RISE_DURATION;
+  return 1 + JUDGEMENT_PUNCH_SCALE * (1 - outQuad((age - JUDGEMENT_PUNCH_RISE_DURATION) / recoveryDuration));
 }
 
 function rgba(red: number, green: number, blue: number, alpha: number): string {
@@ -821,7 +829,7 @@ export class HudLayer {
     const [width, height] = JUDGEMENT_NATIVE_SIZES[judgement];
     context.save();
     context.translate(x, y);
-    const scale = judgementPunchScale(Math.max(0, age));
+    const scale = sampleJudgementPunchScale(Math.max(0, age));
     context.scale(scale, scale);
     context.drawImage(image, -width / 2, -height / 2, width, height);
     const perfect = judgement === "perfect" || judgement === "just";
@@ -869,9 +877,12 @@ export class HudLayer {
       if (!text) return;
       context.fillStyle = color;
       context.font = `${weight} ${size}px ${fontFamily}`;
+      const measured = context.measureText(text).width;
+      const fittedSize = measured > 1000 ? Math.max(12, size * (1000 / measured)) : size;
+      context.font = `${weight} ${fittedSize}px ${fontFamily}`;
       context.textAlign = "center";
       context.textBaseline = "middle";
-      context.fillText(text, centerX, y, 1000);
+      context.fillText(text, centerX, y);
     };
 
     context.save();
@@ -883,16 +894,23 @@ export class HudLayer {
       context.lineWidth = theme.panelBorderWidthPx;
       context.strokeRect(left, top, panelWidth, panelHeight);
     }
+    context.globalAlpha = clamp(introduction.contentAlpha ?? introduction.alpha, 0, 1);
     drawCanvasText(introduction.title, centerY - 48, 48, 700, theme.titleColor);
     drawCanvasText(introduction.artist ?? "", centerY + 8, 24, 700, theme.artistColor);
-    const firstCredit = [
-      introduction.lyricist ? `作詞: ${introduction.lyricist}` : "",
-      introduction.composer ? `作曲: ${introduction.composer}` : "",
-    ]
-      .filter(Boolean)
-      .join("　");
-    drawCanvasText(firstCredit, centerY + 44, 22, 700, theme.creditsColor);
-    drawCanvasText(introduction.arranger ? `編曲: ${introduction.arranger}` : "", centerY + 68, 22, 700, theme.creditsColor);
+    const lyricist = introduction.lyricist ? `作詞: ${introduction.lyricist}` : "";
+    const composer = introduction.composer ? `作曲: ${introduction.composer}` : "";
+    const inlineCredits = [lyricist, composer].filter(Boolean).join("　");
+    context.font = `700 22px ${fontFamily}`;
+    const composerOverflows = Boolean(lyricist && composer && context.measureText(inlineCredits).width > 960);
+    drawCanvasText(composerOverflows ? lyricist : inlineCredits, centerY + 44, 22, 700, theme.creditsColor);
+    if (composerOverflows) drawCanvasText(composer, centerY + 68, 22, 700, theme.creditsColor);
+    drawCanvasText(
+      introduction.arranger ? `編曲: ${introduction.arranger}` : "",
+      centerY + (composerOverflows ? 92 : 68),
+      22,
+      700,
+      theme.creditsColor,
+    );
     context.restore();
   }
 
