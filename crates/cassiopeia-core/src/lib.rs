@@ -6,6 +6,7 @@
 //! network APIs. Hosts inject those capabilities and use the same timing,
 //! judgement primitives, and chart contracts on every platform.
 
+pub mod assist;
 pub mod chart;
 pub mod judgement;
 pub mod runtime;
@@ -13,16 +14,19 @@ pub mod scoring;
 pub mod session;
 pub mod timing;
 
+pub use assist::{ASSIST_LEVEL_COUNT, AssistLevel, TIMING_WINDOWS_PER_LEVEL};
 pub use chart::{CassiopeiaChart, ChartEvent, ChartHeader, ChartNote, NoteKind};
 pub use judgement::{
     JudgeResult, JudgeTiming, Judgement, JudgementProfile, JudgementWindow, NoteJudgementType,
-    is_within_window, judge, maximum_early_ms, maximum_late_ms,
+    is_within_window, is_within_window_with_assist, judge, judge_with_assist, judgement_windows,
+    maximum_early_ms, maximum_early_ms_with_assist, maximum_late_ms, maximum_late_ms_with_assist,
 };
 pub use runtime::{
-    JudgementAreaOffsetType, LANE_UNITS_PER_LANE, LanePosition, NoteDirection,
-    RUNTIME_CHART_FORMAT, RUNTIME_CHART_VERSION, RUNTIME_LANE_COUNT, RuntimeChartError,
-    RuntimeChartV1, RuntimeLineKind, RuntimeLineV1, RuntimeNoteV1, is_target_lane,
-    judgement_area_offset, notes_overlap,
+    AREA_OFFSETS, AREA_OFFSETS_PER_LEVEL, JudgementAreaOffsetType, LANE_UNITS_PER_LANE,
+    LanePosition, NoteDirection, RUNTIME_CHART_FORMAT, RUNTIME_CHART_VERSION, RUNTIME_LANE_COUNT,
+    RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1, RuntimeNoteV1, area_offset,
+    is_target_lane, is_target_lane_with_assist, judgement_area_offset,
+    judgement_area_offset_with_assist, notes_overlap,
 };
 pub use scoring::{
     ComboAction, LIFE_BASE, LIFE_DANGER, MAX_NORMALIZED_SCORE, NoteOperateType, ScoreError,

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::assist::AssistLevel;
 use crate::judgement::NoteJudgementType;
 use crate::scoring::NoteOperateType;
 use crate::timing::TimeMicros;
@@ -10,6 +11,7 @@ pub const RUNTIME_CHART_FORMAT: &str = "org.haneoka.cassiopeia.runtime";
 pub const RUNTIME_CHART_VERSION: u32 = 1;
 pub const RUNTIME_LANE_COUNT: u16 = 24;
 pub const LANE_UNITS_PER_LANE: i32 = 1_000_000;
+pub const AREA_OFFSETS_PER_LEVEL: usize = 9;
 
 /// Fixed-point lane coordinate. One lane is one million units.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct RuntimeChartV1 {
     pub format: String,
     pub version: u32,
     pub lane_count: u16,
+    #[serde(default)]
+    pub assist_level: AssistLevel,
     #[serde(default)]
     pub notes: Vec<RuntimeNoteV1>,
     #[serde(default)]
@@ -224,41 +228,132 @@ impl fmt::Display for RuntimeChartError {
 
 impl std::error::Error for RuntimeChartError {}
 
-/// Assist-level-zero judgement expansion in fixed lane units.
+pub const AREA_OFFSETS: [LanePosition; crate::assist::ASSIST_LEVEL_COUNT * AREA_OFFSETS_PER_LEVEL] = [
+    // Assist level 0.
+    LanePosition(1000000),
+    LanePosition(2000000),
+    LanePosition(3000000),
+    LanePosition(2000000),
+    LanePosition(1000000),
+    LanePosition(3000000),
+    LanePosition(2800000),
+    LanePosition(2800000),
+    LanePosition(2800000),
+    // Assist level 1.
+    LanePosition(1100000),
+    LanePosition(2100000),
+    LanePosition(3100000),
+    LanePosition(2100000),
+    LanePosition(1100000),
+    LanePosition(3100000),
+    LanePosition(2850000),
+    LanePosition(2850000),
+    LanePosition(2850000),
+    // Assist level 2.
+    LanePosition(1200000),
+    LanePosition(2200000),
+    LanePosition(3200000),
+    LanePosition(2200000),
+    LanePosition(1200000),
+    LanePosition(3200000),
+    LanePosition(2900000),
+    LanePosition(2900000),
+    LanePosition(2900000),
+    // Assist level 3.
+    LanePosition(1300000),
+    LanePosition(2300000),
+    LanePosition(3300000),
+    LanePosition(2300000),
+    LanePosition(1300000),
+    LanePosition(3300000),
+    LanePosition(2950000),
+    LanePosition(2950000),
+    LanePosition(2950000),
+    // Assist level 4.
+    LanePosition(1400000),
+    LanePosition(2400000),
+    LanePosition(3400000),
+    LanePosition(2400000),
+    LanePosition(1400000),
+    LanePosition(3400000),
+    LanePosition(3000000),
+    LanePosition(3000000),
+    LanePosition(3000000),
+    // Assist level 5.
+    LanePosition(1500000),
+    LanePosition(2500000),
+    LanePosition(3500000),
+    LanePosition(2500000),
+    LanePosition(1500000),
+    LanePosition(3500000),
+    LanePosition(3100000),
+    LanePosition(3100000),
+    LanePosition(3100000),
+];
+
+pub fn area_offset(
+    assist: AssistLevel,
+    area_type: JudgementAreaOffsetType,
+) -> Option<LanePosition> {
+    let offset = match area_type {
+        JudgementAreaOffsetType::Default => 0,
+        JudgementAreaOffsetType::SlideBegin => 1,
+        JudgementAreaOffsetType::SlideEnd => 2,
+        JudgementAreaOffsetType::SlideMin => 3,
+        JudgementAreaOffsetType::SlideMax => 4,
+        JudgementAreaOffsetType::Flick => 5,
+        JudgementAreaOffsetType::Trace => 6,
+        JudgementAreaOffsetType::EasyDefault => 7,
+        JudgementAreaOffsetType::EasySlideBegin => 8,
+        JudgementAreaOffsetType::Slide | JudgementAreaOffsetType::EnumMax => return None,
+    };
+    Some(AREA_OFFSETS[assist.index() * AREA_OFFSETS_PER_LEVEL + offset])
+}
+
 pub fn judgement_area_offset(
     area_type: JudgementAreaOffsetType,
     note_size: LanePosition,
 ) -> LanePosition {
-    let scale = LANE_UNITS_PER_LANE;
-    let value = match area_type {
+    judgement_area_offset_with_assist(AssistLevel::Level0, area_type, note_size)
+}
+
+pub fn judgement_area_offset_with_assist(
+    assist: AssistLevel,
+    area_type: JudgementAreaOffsetType,
+    note_size: LanePosition,
+) -> LanePosition {
+    match area_type {
         JudgementAreaOffsetType::Slide => {
-            let four = 4 * scale;
-            let five = 5 * scale;
-            if note_size.0 <= four {
-                2 * scale
-            } else if note_size.0 >= five {
-                scale
-            } else {
-                6 * scale - note_size.0
-            }
+            let minimum = area_offset(assist, JudgementAreaOffsetType::SlideMin)
+                .expect("every assist profile defines SlideMin");
+            let maximum = area_offset(assist, JudgementAreaOffsetType::SlideMax)
+                .expect("every assist profile defines SlideMax");
+            let scale = i64::from(LANE_UNITS_PER_LANE);
+            let progress = (i64::from(note_size.0) - 4 * scale).clamp(0, scale);
+            let decrease = i64::from(minimum.0 - maximum.0) * progress / scale;
+            LanePosition(minimum.0 - i32::try_from(decrease).expect("slide offset fits i32"))
         }
-        JudgementAreaOffsetType::SlideBegin | JudgementAreaOffsetType::SlideMin => 2 * scale,
-        JudgementAreaOffsetType::SlideEnd | JudgementAreaOffsetType::Flick => 3 * scale,
-        JudgementAreaOffsetType::Trace
-        | JudgementAreaOffsetType::EasyDefault
-        | JudgementAreaOffsetType::EasySlideBegin => 2_800_000,
-        JudgementAreaOffsetType::SlideMax
-        | JudgementAreaOffsetType::Default
-        | JudgementAreaOffsetType::EnumMax => scale,
-    };
-    LanePosition(value)
+        JudgementAreaOffsetType::EnumMax => area_offset(assist, JudgementAreaOffsetType::Default)
+            .expect("every assist profile defines Default"),
+        _ => area_offset(assist, area_type).expect("every direct area type has a profile row"),
+    }
 }
 
 pub fn is_target_lane(note: &RuntimeNoteV1, lane: LanePosition) -> bool {
+    is_target_lane_with_assist(AssistLevel::Level0, note, lane)
+}
+
+pub fn is_target_lane_with_assist(
+    assist: AssistLevel,
+    note: &RuntimeNoteV1,
+    lane: LanePosition,
+) -> bool {
     if lane.0 < 0 || lane.0 > (i32::from(RUNTIME_LANE_COUNT) - 1) * LANE_UNITS_PER_LANE {
         return false;
     }
-    let extra = i64::from(judgement_area_offset(note.judgement_area_offset_type, note.size).0);
+    let extra = i64::from(
+        judgement_area_offset_with_assist(assist, note.judgement_area_offset_type, note.size).0,
+    );
     let half_lane = i64::from(LanePosition::HALF_LANE.0);
     let lane = i64::from(lane.0);
     let start = i64::from(note.position.0) - extra - half_lane;
@@ -297,6 +392,7 @@ mod tests {
             format: RUNTIME_CHART_FORMAT.into(),
             version: RUNTIME_CHART_VERSION,
             lane_count: RUNTIME_LANE_COUNT,
+            assist_level: AssistLevel::Level0,
             notes: vec![note(0, 1_000, 8, 4), note(1, 2_000, 8, 4)],
             lines: vec![RuntimeLineV1 {
                 id: 0,
@@ -314,10 +410,21 @@ mod tests {
         assert_eq!(value["format"], RUNTIME_CHART_FORMAT);
         assert_eq!(value["version"], 1);
         assert_eq!(value["laneCount"], 24);
+        assert_eq!(value["assistLevel"], 0);
         assert_eq!(
             serde_json::from_value::<RuntimeChartV1>(value).unwrap(),
             chart
         );
+    }
+
+    #[test]
+    fn missing_assist_level_deserializes_as_level_zero() {
+        let chart = chart();
+        let mut value = serde_json::to_value(&chart).unwrap();
+        value.as_object_mut().unwrap().remove("assistLevel");
+        let decoded: RuntimeChartV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.assist_level, AssistLevel::Level0);
+        assert_eq!(decoded, chart);
     }
 
     #[test]
@@ -355,5 +462,127 @@ mod tests {
             judgement_area_offset(JudgementAreaOffsetType::Slide, LanePosition(5_000_000)),
             LanePosition(1_000_000)
         );
+        assert_eq!(
+            judgement_area_offset(JudgementAreaOffsetType::Slide, LanePosition(i32::MIN)),
+            LanePosition(2_000_000)
+        );
+        assert_eq!(
+            judgement_area_offset(JudgementAreaOffsetType::Slide, LanePosition(i32::MAX)),
+            LanePosition(1_000_000)
+        );
+    }
+
+    #[test]
+    fn every_assist_level_has_nine_unique_area_rows() {
+        let area_types = [
+            JudgementAreaOffsetType::Default,
+            JudgementAreaOffsetType::SlideBegin,
+            JudgementAreaOffsetType::SlideEnd,
+            JudgementAreaOffsetType::SlideMin,
+            JudgementAreaOffsetType::SlideMax,
+            JudgementAreaOffsetType::Flick,
+            JudgementAreaOffsetType::Trace,
+            JudgementAreaOffsetType::EasyDefault,
+            JudgementAreaOffsetType::EasySlideBegin,
+        ];
+        let mut keys = BTreeSet::new();
+        for assist in AssistLevel::ALL {
+            let mut count = 0;
+            for area_type in area_types {
+                assert!(area_offset(assist, area_type).is_some());
+                assert!(keys.insert((assist as u8, area_type as i8)));
+                count += 1;
+            }
+            assert_eq!(count, AREA_OFFSETS_PER_LEVEL);
+            assert!(area_offset(assist, JudgementAreaOffsetType::Slide).is_none());
+            assert!(area_offset(assist, JudgementAreaOffsetType::EnumMax).is_none());
+        }
+        assert_eq!(keys.len(), AREA_OFFSETS.len());
+        assert_eq!(AREA_OFFSETS.len(), 54);
+    }
+
+    #[test]
+    fn area_profiles_and_slide_interpolation_cover_every_level() {
+        let defaults = [
+            1_000_000, 1_100_000, 1_200_000, 1_300_000, 1_400_000, 1_500_000,
+        ];
+        let traces = [
+            2_800_000, 2_850_000, 2_900_000, 2_950_000, 3_000_000, 3_100_000,
+        ];
+        for ((assist, default), trace) in AssistLevel::ALL.into_iter().zip(defaults).zip(traces) {
+            assert_eq!(
+                area_offset(assist, JudgementAreaOffsetType::Default),
+                Some(LanePosition(default))
+            );
+            assert_eq!(
+                area_offset(assist, JudgementAreaOffsetType::Trace),
+                Some(LanePosition(trace))
+            );
+            assert_eq!(
+                judgement_area_offset_with_assist(
+                    assist,
+                    JudgementAreaOffsetType::Slide,
+                    LanePosition(4_000_000)
+                ),
+                area_offset(assist, JudgementAreaOffsetType::SlideMin).unwrap()
+            );
+            assert_eq!(
+                judgement_area_offset_with_assist(
+                    assist,
+                    JudgementAreaOffsetType::Slide,
+                    LanePosition(5_000_000)
+                ),
+                area_offset(assist, JudgementAreaOffsetType::SlideMax).unwrap()
+            );
+        }
+        assert_eq!(
+            judgement_area_offset_with_assist(
+                AssistLevel::Level5,
+                JudgementAreaOffsetType::Slide,
+                LanePosition(4_500_000)
+            ),
+            LanePosition(2_000_000)
+        );
+    }
+
+    #[test]
+    fn area_compatibility_wrappers_are_exactly_level_zero() {
+        let area_types = [
+            JudgementAreaOffsetType::Default,
+            JudgementAreaOffsetType::Slide,
+            JudgementAreaOffsetType::SlideBegin,
+            JudgementAreaOffsetType::SlideEnd,
+            JudgementAreaOffsetType::Flick,
+            JudgementAreaOffsetType::Trace,
+            JudgementAreaOffsetType::SlideMin,
+            JudgementAreaOffsetType::SlideMax,
+            JudgementAreaOffsetType::EasyDefault,
+            JudgementAreaOffsetType::EasySlideBegin,
+            JudgementAreaOffsetType::EnumMax,
+        ];
+        for area_type in area_types {
+            for size in [
+                LanePosition(i32::MIN),
+                LanePosition(4_500_000),
+                LanePosition(i32::MAX),
+            ] {
+                assert_eq!(
+                    judgement_area_offset(area_type, size),
+                    judgement_area_offset_with_assist(AssistLevel::Level0, area_type, size)
+                );
+            }
+        }
+
+        let runtime_note = note(0, 0, 8, 4);
+        for lane in [
+            LanePosition(6_499_999),
+            LanePosition(6_500_000),
+            LanePosition(12_500_000),
+        ] {
+            assert_eq!(
+                is_target_lane(&runtime_note, lane),
+                is_target_lane_with_assist(AssistLevel::Level0, &runtime_note, lane)
+            );
+        }
     }
 }

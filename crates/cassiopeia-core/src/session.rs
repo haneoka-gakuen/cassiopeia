@@ -2,13 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::assist::AssistLevel;
 use crate::judgement::{
-    JudgeResult, JudgeTiming, Judgement, NoteJudgementType, is_within_window, judge,
-    maximum_early_ms, maximum_late_ms,
+    JudgeResult, JudgeTiming, Judgement, NoteJudgementType, is_within_window_with_assist,
+    judge_with_assist, maximum_early_ms_with_assist, maximum_late_ms_with_assist,
 };
 use crate::runtime::{
     LanePosition, NoteDirection, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1,
-    RuntimeNoteV1, is_target_lane, notes_overlap,
+    RuntimeNoteV1, is_target_lane_with_assist, notes_overlap,
 };
 use crate::scoring::{
     ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
@@ -113,6 +114,8 @@ pub struct JudgementEvent {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionSnapshot {
     pub mode: SessionMode,
+    #[serde(default)]
+    pub assist_level: AssistLevel,
     pub time: TimeMicros,
     pub judgement_offset: TimeMicros,
     pub combo: u32,
@@ -225,7 +228,11 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(playable_notes: Vec<RuntimeNoteV1>, source_lines: &[RuntimeLineV1]) -> Self {
+    fn new(
+        playable_notes: Vec<RuntimeNoteV1>,
+        source_lines: &[RuntimeLineV1],
+        assist_level: AssistLevel,
+    ) -> Self {
         let note_index: BTreeMap<_, _> = playable_notes
             .iter()
             .enumerate()
@@ -276,12 +283,22 @@ impl RuntimeState {
         }
         let maximum_early_micros = notes
             .iter()
-            .map(|note| i64::from(maximum_early_ms(note.note.judgement_type)) * 1_000)
+            .map(|note| {
+                i64::from(maximum_early_ms_with_assist(
+                    assist_level,
+                    note.note.judgement_type,
+                )) * 1_000
+            })
             .max()
             .unwrap_or(0);
         let maximum_late_micros = notes
             .iter()
-            .map(|note| i64::from(maximum_late_ms(note.note.judgement_type)) * 1_000)
+            .map(|note| {
+                i64::from(maximum_late_ms_with_assist(
+                    assist_level,
+                    note.note.judgement_type,
+                )) * 1_000
+            })
             .max()
             .unwrap_or(0);
         let line_count = lines.len();
@@ -410,6 +427,7 @@ pub struct GameplaySession {
     ceiling: ScoreUnits,
     contribution_sum: ScoreUnits,
     mode: SessionMode,
+    assist_level: AssistLevel,
     judgement_offset: TimeMicros,
     time: TimeMicros,
     combo: u32,
@@ -428,6 +446,15 @@ impl GameplaySession {
         notes: Vec<GameplayNote>,
         mode: SessionMode,
         judgement_offset: TimeMicros,
+    ) -> Result<Self, SessionError> {
+        Self::new_with_assist(notes, mode, judgement_offset, AssistLevel::Level0)
+    }
+
+    pub fn new_with_assist(
+        notes: Vec<GameplayNote>,
+        mode: SessionMode,
+        judgement_offset: TimeMicros,
+        assist_level: AssistLevel,
     ) -> Result<Self, SessionError> {
         let total = u32::try_from(notes.len()).map_err(|_| SessionError::CounterOverflow)?;
         let mut note_index = BTreeMap::new();
@@ -454,6 +481,7 @@ impl GameplaySession {
             ceiling,
             contribution_sum: ScoreUnits::ZERO,
             mode,
+            assist_level,
             judgement_offset,
             time: TimeMicros(0),
             combo: 0,
@@ -474,6 +502,7 @@ impl GameplaySession {
         judgement_offset: TimeMicros,
     ) -> Result<Self, SessionError> {
         chart.validate()?;
+        let assist_level = chart.assist_level;
         let playable_notes: Vec<_> = chart
             .notes
             .iter()
@@ -489,14 +518,18 @@ impl GameplaySession {
                 operate_type: note.operate_type,
             })
             .collect();
-        let runtime = RuntimeState::new(playable_notes, &chart.lines);
-        let mut session = Self::new(notes, mode, judgement_offset)?;
+        let runtime = RuntimeState::new(playable_notes, &chart.lines, assist_level);
+        let mut session = Self::new_with_assist(notes, mode, judgement_offset, assist_level)?;
         session.runtime = Some(runtime);
         Ok(session)
     }
 
     pub fn mode(&self) -> SessionMode {
         self.mode
+    }
+
+    pub fn assist_level(&self) -> AssistLevel {
+        self.assist_level
     }
 
     pub fn set_mode(&mut self, mode: SessionMode) -> Result<SessionSnapshot, SessionError> {
@@ -524,6 +557,7 @@ impl GameplaySession {
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             mode: self.mode,
+            assist_level: self.assist_level,
             time: self.time,
             judgement_offset: self.judgement_offset,
             combo: self.combo,
@@ -591,7 +625,7 @@ impl GameplaySession {
                 .ok_or(SessionError::TimeOverflow)?;
             (
                 difference,
-                judge(note.judgement_type, difference),
+                judge_with_assist(self.assist_level, note.judgement_type, difference),
                 runtime.available_start_line(index, pointer),
                 is_line_end(note.operate_type),
             )
@@ -737,8 +771,12 @@ impl GameplaySession {
         let note = &runtime.notes[index].note;
         if self.processed[index]
             || action.is_some_and(|action| !accepts_runtime_input(note, action))
-            || !is_within_window(note.judgement_type, TimeMicros(difference))
-            || !is_target_lane(note, lane)
+            || !is_within_window_with_assist(
+                self.assist_level,
+                note.judgement_type,
+                TimeMicros(difference),
+            )
+            || !is_target_lane_with_assist(self.assist_level, note, lane)
             || !runtime.is_available_to_pointer(index, pointer)
         {
             return None;
@@ -783,11 +821,19 @@ impl GameplaySession {
             .checked_sub(self.notes[index].time.0)
             .map(TimeMicros)
             .ok_or(SessionError::TimeOverflow)?;
-        if !is_within_window(self.notes[index].judgement_type, difference) {
+        if !is_within_window_with_assist(
+            self.assist_level,
+            self.notes[index].judgement_type,
+            difference,
+        ) {
             self.last_input_sequence = Some(input.sequence);
             return Ok(None);
         }
-        let result = judge(self.notes[index].judgement_type, difference);
+        let result = judge_with_assist(
+            self.assist_level,
+            self.notes[index].judgement_type,
+            difference,
+        );
         let event =
             self.apply_judgement(index, result, difference, input.time, Some(input.sequence))?;
         self.last_input_sequence = Some(input.sequence);
@@ -839,7 +885,10 @@ impl GameplaySession {
                         self.update_cursor += 1;
                         continue;
                     }
-                    let late = i64::from(maximum_late_ms(self.notes[index].judgement_type)) * 1_000;
+                    let late = i64::from(maximum_late_ms_with_assist(
+                        self.assist_level,
+                        self.notes[index].judgement_type,
+                    )) * 1_000;
                     if i128::from(self.notes[index].time.0) + i128::from(late)
                         >= i128::from(adjusted_time.0)
                     {
@@ -916,8 +965,10 @@ impl GameplaySession {
                         .checked_add(self.judgement_offset.0)
                         .ok_or(SessionError::TimeOverflow)?;
                     for index in 0..self.notes.len() {
-                        let late =
-                            i64::from(maximum_late_ms(self.notes[index].judgement_type)) * 1_000;
+                        let late = i64::from(maximum_late_ms_with_assist(
+                            self.assist_level,
+                            self.notes[index].judgement_type,
+                        )) * 1_000;
                         if i128::from(self.notes[index].time.0) + i128::from(late)
                             >= i128::from(adjusted_time)
                         {
@@ -1157,6 +1208,7 @@ mod tests {
             format: RUNTIME_CHART_FORMAT.into(),
             version: RUNTIME_CHART_VERSION,
             lane_count: RUNTIME_LANE_COUNT,
+            assist_level: AssistLevel::Level0,
             notes,
             lines,
         }
@@ -1487,6 +1539,136 @@ mod tests {
                 received: 2
             })
         ));
+    }
+
+    #[test]
+    fn session_assist_level_defaults_and_snapshot_serde_are_compatible() {
+        let session = GameplaySession::new(Vec::new(), SessionMode::Play, TimeMicros(0)).unwrap();
+        assert_eq!(session.assist_level(), AssistLevel::Level0);
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.assist_level, AssistLevel::Level0);
+
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["assistLevel"], 0);
+        value.as_object_mut().unwrap().remove("assistLevel");
+        assert_eq!(
+            serde_json::from_value::<SessionSnapshot>(value).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn session_assist_profile_drives_timing_misses_and_resolved_input() {
+        let notes = vec![note(
+            "n",
+            1_000_000,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        )];
+        let mut default =
+            GameplaySession::new(notes.clone(), SessionMode::Play, TimeMicros(0)).unwrap();
+        assert!(
+            default
+                .apply_input(&input(1, "n", 1_140_000))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut assisted = GameplaySession::new_with_assist(
+            notes,
+            SessionMode::Play,
+            TimeMicros(0),
+            AssistLevel::Level5,
+        )
+        .unwrap();
+        let event = assisted
+            .apply_input(&input(1, "n", 1_140_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.judgement, Judgement::Bad);
+        assert_eq!(assisted.snapshot().assist_level, AssistLevel::Level5);
+
+        let notes = vec![note(
+            "late",
+            0,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        )];
+        let mut assisted = GameplaySession::new_with_assist(
+            notes,
+            SessionMode::Play,
+            TimeMicros(0),
+            AssistLevel::Level5,
+        )
+        .unwrap();
+        assert!(assisted.advance(TimeMicros(156_000)).unwrap().is_empty());
+        assert_eq!(assisted.advance(TimeMicros(156_001)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_candidate_uses_chart_assist_timing_and_area_profiles() {
+        let source = runtime_note(
+            7,
+            1_000_000,
+            8,
+            4,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        );
+
+        let mut timing_chart = runtime_chart(vec![source.clone()], vec![]);
+        timing_chart.assist_level = AssistLevel::Level5;
+        let mut timing =
+            GameplaySession::from_runtime_chart(timing_chart, SessionMode::Play, TimeMicros(0))
+                .unwrap();
+        let event = timing
+            .consume_runtime_input(&runtime_input(
+                1,
+                1_140_000,
+                10_000_000,
+                None,
+                InputAction::Tap,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.judgement, Judgement::Bad);
+        assert_eq!(timing.assist_level(), AssistLevel::Level5);
+
+        let mut area_chart = runtime_chart(vec![source.clone()], vec![]);
+        area_chart.assist_level = AssistLevel::Level5;
+        let mut area =
+            GameplaySession::from_runtime_chart(area_chart, SessionMode::Play, TimeMicros(0))
+                .unwrap();
+        assert!(
+            area.consume_runtime_input(&runtime_input(
+                1,
+                1_000_000,
+                6_250_000,
+                None,
+                InputAction::Tap,
+            ))
+            .unwrap()
+            .is_some()
+        );
+
+        let mut default = GameplaySession::from_runtime_chart(
+            runtime_chart(vec![source], vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        assert!(
+            default
+                .consume_runtime_input(&runtime_input(
+                    1,
+                    1_000_000,
+                    6_250_000,
+                    None,
+                    InputAction::Tap,
+                ))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

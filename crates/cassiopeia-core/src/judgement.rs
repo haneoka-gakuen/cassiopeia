@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::assist::{AssistLevel, timing_windows};
 use crate::timing::TimeMicros;
 
 /// Stable gameplay judgement values shared by browser and native hosts.
@@ -156,7 +157,12 @@ impl JudgementProfile {
     }
 
     pub fn for_note_type(note_type: NoteJudgementType) -> Option<Self> {
-        built_in_windows(note_type).map(|windows| Self {
+        Self::for_assist(AssistLevel::Level0, note_type)
+    }
+
+    pub fn for_assist(assist: AssistLevel, note_type: NoteJudgementType) -> Option<Self> {
+        let windows = timing_windows(assist, note_type);
+        (!windows.is_empty()).then(|| Self {
             windows: windows.to_vec(),
         })
     }
@@ -199,42 +205,68 @@ impl JudgementProfile {
 }
 
 pub fn judge(note_type: NoteJudgementType, difference: TimeMicros) -> JudgeResult {
-    built_in_windows(note_type).map_or(
-        JudgeResult {
+    judge_with_assist(AssistLevel::Level0, note_type, difference)
+}
+
+pub fn judge_with_assist(
+    assist: AssistLevel,
+    note_type: NoteJudgementType,
+    difference: TimeMicros,
+) -> JudgeResult {
+    let windows = timing_windows(assist, note_type);
+    if windows.is_empty() {
+        return JudgeResult {
             judgement: Judgement::Miss,
             timing: JudgeTiming::OutOfTime,
-        },
-        |windows| judge_windows(windows, difference),
-    )
+        };
+    }
+    judge_windows(windows, difference)
+}
+
+pub fn judgement_windows(
+    assist: AssistLevel,
+    note_type: NoteJudgementType,
+) -> &'static [JudgementWindow] {
+    timing_windows(assist, note_type)
 }
 
 pub fn maximum_early_ms(note_type: NoteJudgementType) -> i32 {
-    built_in_windows(note_type)
-        .and_then(|windows| windows.iter().map(|window| window.early_ms).max())
+    maximum_early_ms_with_assist(AssistLevel::Level0, note_type)
+}
+
+pub fn maximum_early_ms_with_assist(assist: AssistLevel, note_type: NoteJudgementType) -> i32 {
+    timing_windows(assist, note_type)
+        .iter()
+        .map(|window| window.early_ms)
+        .max()
         .unwrap_or(0)
 }
 
 pub fn maximum_late_ms(note_type: NoteJudgementType) -> i32 {
-    built_in_windows(note_type)
-        .and_then(|windows| windows.iter().map(|window| window.late_ms).max())
+    maximum_late_ms_with_assist(AssistLevel::Level0, note_type)
+}
+
+pub fn maximum_late_ms_with_assist(assist: AssistLevel, note_type: NoteJudgementType) -> i32 {
+    timing_windows(assist, note_type)
+        .iter()
+        .map(|window| window.late_ms)
+        .max()
         .unwrap_or(0)
 }
 
 pub fn is_within_window(note_type: NoteJudgementType, difference: TimeMicros) -> bool {
-    let early = i64::from(maximum_early_ms(note_type)) * 1_000;
-    let late = i64::from(maximum_late_ms(note_type)) * 1_000;
-    built_in_windows(note_type).is_some() && difference.0 >= -early && difference.0 <= late
+    is_within_window_with_assist(AssistLevel::Level0, note_type, difference)
 }
 
-fn built_in_windows(note_type: NoteJudgementType) -> Option<&'static [JudgementWindow]> {
-    match note_type {
-        NoteJudgementType::Normal | NoteJudgementType::SlideBegin => Some(&NORMAL),
-        NoteJudgementType::Flick | NoteJudgementType::SlideEndFlick => Some(&FLICK),
-        NoteJudgementType::SlideEnd => Some(&SLIDE_END),
-        NoteJudgementType::EasyNormal | NoteJudgementType::SlideBeginEasy => Some(&EASY),
-        NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace => Some(&TRACE),
-        NoteJudgementType::None => None,
-    }
+pub fn is_within_window_with_assist(
+    assist: AssistLevel,
+    note_type: NoteJudgementType,
+    difference: TimeMicros,
+) -> bool {
+    let windows = timing_windows(assist, note_type);
+    let early = i64::from(maximum_early_ms_with_assist(assist, note_type)) * 1_000;
+    let late = i64::from(maximum_late_ms_with_assist(assist, note_type)) * 1_000;
+    !windows.is_empty() && difference.0 >= -early && difference.0 <= late
 }
 
 fn judge_windows(windows: &[JudgementWindow], difference: TimeMicros) -> JudgeResult {
@@ -264,55 +296,6 @@ fn timing_for_difference(difference: TimeMicros) -> JudgeTiming {
         JudgeTiming::Late
     }
 }
-
-const fn symmetric(judgement: Judgement, milliseconds: i32) -> JudgementWindow {
-    asymmetric(judgement, milliseconds, milliseconds)
-}
-
-const fn asymmetric(judgement: Judgement, early_ms: i32, late_ms: i32) -> JudgementWindow {
-    JudgementWindow {
-        judgement,
-        early_ms,
-        late_ms,
-    }
-}
-
-const NORMAL: [JudgementWindow; 6] = [
-    symmetric(Judgement::Just, 1),
-    symmetric(Judgement::Perfect, 42),
-    symmetric(Judgement::Great, 83),
-    symmetric(Judgement::Good, 108),
-    symmetric(Judgement::Bad, 125),
-    symmetric(Judgement::Miss, 130),
-];
-
-const FLICK: [JudgementWindow; 6] = [
-    symmetric(Judgement::Just, 1),
-    asymmetric(Judgement::Perfect, 83, 58),
-    asymmetric(Judgement::Great, 0, 83),
-    asymmetric(Judgement::Good, 0, 108),
-    asymmetric(Judgement::Bad, 0, 125),
-    asymmetric(Judgement::Miss, 0, 130),
-];
-
-const SLIDE_END: [JudgementWindow; 5] = [
-    asymmetric(Judgement::Perfect, 42, 66),
-    asymmetric(Judgement::Great, 99, 166),
-    asymmetric(Judgement::Good, 124, 191),
-    asymmetric(Judgement::Bad, 141, 208),
-    symmetric(Judgement::Miss, 150),
-];
-
-const EASY: [JudgementWindow; 3] = [
-    symmetric(Judgement::Just, 1),
-    asymmetric(Judgement::Perfect, 58, 66),
-    asymmetric(Judgement::Miss, 58, 130),
-];
-
-const TRACE: [JudgementWindow; 2] = [
-    asymmetric(Judgement::Perfect, 58, 66),
-    asymmetric(Judgement::Miss, 58, 130),
-];
 
 #[cfg(test)]
 mod tests {
@@ -397,6 +380,92 @@ mod tests {
         );
         assert_eq!(maximum_early_ms(NoteJudgementType::Flick), 83);
         assert_eq!(maximum_late_ms(NoteJudgementType::SlideEnd), 208);
+    }
+
+    #[test]
+    fn every_assist_level_has_its_normal_late_boundary() {
+        let boundaries = [130, 133, 137, 143, 149, 156];
+        for (assist, boundary) in AssistLevel::ALL.into_iter().zip(boundaries) {
+            assert_eq!(
+                judge_with_assist(
+                    assist,
+                    NoteJudgementType::Normal,
+                    TimeMicros(i64::from(boundary) * 1_000)
+                )
+                .judgement,
+                Judgement::Miss
+            );
+            assert_eq!(
+                judge_with_assist(
+                    assist,
+                    NoteJudgementType::Normal,
+                    TimeMicros(i64::from(boundary) * 1_000 + 1)
+                )
+                .timing,
+                JudgeTiming::OutOfTime
+            );
+        }
+    }
+
+    #[test]
+    fn level_five_slide_begin_keeps_its_non_monotonic_profile() {
+        assert_eq!(
+            judge_with_assist(
+                AssistLevel::Level4,
+                NoteJudgementType::SlideBegin,
+                TimeMicros(109_000)
+            )
+            .judgement,
+            Judgement::Good
+        );
+        assert_eq!(
+            judge_with_assist(
+                AssistLevel::Level5,
+                NoteJudgementType::SlideBegin,
+                TimeMicros(109_000)
+            )
+            .judgement,
+            Judgement::Bad
+        );
+        assert_eq!(
+            maximum_late_ms_with_assist(AssistLevel::Level5, NoteJudgementType::SlideBegin),
+            130
+        );
+    }
+
+    #[test]
+    fn compatibility_wrappers_are_exactly_level_zero() {
+        let note_types = [
+            NoteJudgementType::Normal,
+            NoteJudgementType::SlideBegin,
+            NoteJudgementType::SlideEnd,
+            NoteJudgementType::Flick,
+            NoteJudgementType::SlideEndFlick,
+            NoteJudgementType::Trace,
+            NoteJudgementType::SlideEndTrace,
+            NoteJudgementType::EasyNormal,
+            NoteJudgementType::SlideBeginEasy,
+        ];
+        for note_type in note_types {
+            assert_eq!(
+                JudgementProfile::for_note_type(note_type),
+                JudgementProfile::for_assist(AssistLevel::Level0, note_type)
+            );
+            assert_eq!(
+                maximum_early_ms(note_type),
+                maximum_early_ms_with_assist(AssistLevel::Level0, note_type)
+            );
+            assert_eq!(
+                maximum_late_ms(note_type),
+                maximum_late_ms_with_assist(AssistLevel::Level0, note_type)
+            );
+            for difference in [-250_000, -1_001, 0, 1_001, 250_000] {
+                assert_eq!(
+                    judge(note_type, TimeMicros(difference)),
+                    judge_with_assist(AssistLevel::Level0, note_type, TimeMicros(difference))
+                );
+            }
+        }
     }
 
     #[test]
