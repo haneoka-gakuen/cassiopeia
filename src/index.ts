@@ -1,4 +1,5 @@
 export * from "./core/enums";
+export * from "./core/assist";
 export * from "./core/types";
 export * from "./core/timing";
 export * from "./core/timeline";
@@ -9,7 +10,10 @@ export * from "./core/parser";
 export * from "./core/chart";
 export * from "./core/session";
 export * from "./audio/MediaClock";
+export * from "./audio/MusicTimeAnchor";
+export * from "./audio/playbackRate";
 export * from "./audio/NoteSoundPlayer";
+export * from "./presentation/TitleIntroduction";
 export * from "./input/OurNotesInput";
 export * from "./adapter/renderFrame";
 export * from "./assets";

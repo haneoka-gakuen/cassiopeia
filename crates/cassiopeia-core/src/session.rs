@@ -443,6 +443,7 @@ pub struct GameplaySession {
     notes: Vec<GameplayNote>,
     note_index: BTreeMap<String, usize>,
     processed: Vec<bool>,
+    pending_last_timing: Vec<bool>,
     processed_count: u32,
     total: u32,
     update_cursor: usize,
@@ -493,10 +494,12 @@ impl GameplaySession {
         }
         let ceiling = perfect_ceiling(notes.iter().map(|note| note.operate_type))?;
         let processed = vec![false; notes.len()];
+        let pending_last_timing = vec![false; notes.len()];
         Ok(Self {
             notes,
             note_index,
             processed,
+            pending_last_timing,
             processed_count: 0,
             total,
             update_cursor: 0,
@@ -812,6 +815,7 @@ impl GameplaySession {
     ) -> Option<i64> {
         let note = &runtime.notes[index].note;
         if self.processed[index]
+            || self.pending_last_timing[index]
             || action.is_some_and(|action| !accepts_runtime_input(note, action))
             || !is_within_window_with_assist(
                 self.assist_level,
@@ -848,7 +852,10 @@ impl GameplaySession {
             .note_index
             .get(note_id)
             .ok_or_else(|| SessionError::UnknownNoteId(note_id.into()))?;
-        if self.processed[index] || !accepts_input(&self.notes[index], input.action) {
+        if self.processed[index]
+            || self.pending_last_timing[index]
+            || !accepts_input(&self.notes[index], input.action)
+        {
             self.last_input_sequence = Some(input.sequence);
             return Ok(None);
         }
@@ -915,16 +922,40 @@ impl GameplaySession {
                 }
             }
             SessionMode::Play => {
+                for index in 0..self.notes.len() {
+                    if !self.pending_last_timing[index] {
+                        continue;
+                    }
+                    self.pending_last_timing[index] = false;
+                    if self.processed[index] {
+                        continue;
+                    }
+                    let event = self.apply_judgement(
+                        index,
+                        JudgeResult {
+                            judgement: Judgement::Miss,
+                            timing: JudgeTiming::LastTiming,
+                        },
+                        TimeMicros(2_147_483_647_000),
+                        self.time,
+                        None,
+                    )?;
+                    if let Some(runtime) = &mut self.runtime {
+                        runtime.unbind_ending_lines(index);
+                    }
+                    events.push(event);
+                }
                 let adjusted_time = self
                     .time
                     .0
                     .checked_add(self.judgement_offset.0)
                     .map(TimeMicros)
                     .ok_or(SessionError::TimeOverflow)?;
-                while self.update_cursor < self.notes.len() {
-                    let index = self.update_cursor;
-                    if self.processed[index] {
-                        self.update_cursor += 1;
+                for index in self.update_cursor..self.notes.len() {
+                    if self.notes[index].time >= adjusted_time {
+                        break;
+                    }
+                    if self.processed[index] || self.pending_last_timing[index] {
                         continue;
                     }
                     let late = i64::from(maximum_late_ms_with_assist(
@@ -934,30 +965,29 @@ impl GameplaySession {
                     if i128::from(self.notes[index].time.0) + i128::from(late)
                         >= i128::from(adjusted_time.0)
                     {
-                        break;
+                        continue;
                     }
-                    let difference = adjusted_time
-                        .0
-                        .checked_sub(self.notes[index].time.0)
-                        .map(TimeMicros)
-                        .ok_or(SessionError::TimeOverflow)?;
-                    let event = self.apply_judgement(
-                        index,
-                        JudgeResult {
-                            judgement: Judgement::Miss,
-                            timing: JudgeTiming::OutOfTime,
-                        },
-                        difference,
-                        self.time,
-                        None,
-                    )?;
-                    if let Some(runtime) = &mut self.runtime {
-                        runtime.unbind_ending_lines(index);
-                    }
-                    events.push(event);
+                    self.pending_last_timing[index] = true;
                 }
             }
             SessionMode::Chart => {}
+        }
+        Ok(events)
+    }
+
+    /// Settles exact-tail and post-music note states without skipping the
+    /// two-stage transition used by natural terminal judgements.
+    pub fn finish(&mut self, time: TimeMicros) -> Result<Vec<JudgementEvent>, SessionError> {
+        let terminal_time = time.0.saturating_add(1_000);
+        let last_note_time = self.notes.last().map_or(terminal_time, |note| note.time.0);
+        let settle_time = self
+            .time
+            .0
+            .max(terminal_time)
+            .max(last_note_time.saturating_add(2_000_000));
+        let mut events = self.advance(TimeMicros(settle_time))?;
+        if self.pending_last_timing.iter().any(|pending| *pending) {
+            events.extend(self.advance(TimeMicros(settle_time))?);
         }
         Ok(events)
     }
@@ -966,6 +996,7 @@ impl GameplaySession {
     /// emitting historical input events.
     pub fn reset(&mut self, time: TimeMicros) -> Result<SessionSnapshot, SessionError> {
         self.processed.fill(false);
+        self.pending_last_timing.fill(false);
         self.processed_count = 0;
         self.update_cursor = 0;
         self.contribution_sum = ScoreUnits::ZERO;
@@ -1104,6 +1135,7 @@ impl GameplaySession {
             life,
         };
 
+        self.pending_last_timing[index] = false;
         self.processed[index] = true;
         self.processed_count = self
             .processed_count
@@ -1466,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn play_miss_occurs_only_after_the_inclusive_late_boundary() {
+    fn play_terminal_miss_uses_two_updates_after_the_inclusive_late_boundary() {
         let notes = vec![note(
             "n",
             0,
@@ -1475,11 +1507,39 @@ mod tests {
         )];
         let mut session = GameplaySession::new(notes, SessionMode::Play, TimeMicros(0)).unwrap();
         assert!(session.advance(TimeMicros(130_000)).unwrap().is_empty());
+        assert!(session.advance(TimeMicros(130_001)).unwrap().is_empty());
+        assert_eq!(session.snapshot().processed, 0);
         let events = session.advance(TimeMicros(130_001)).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].judgement, Judgement::Miss);
-        assert_eq!(events[0].timing, JudgeTiming::OutOfTime);
+        assert_eq!(events[0].timing, JudgeTiming::LastTiming);
+        assert_eq!(events[0].difference, TimeMicros(2_147_483_647_000));
         assert_eq!(events[0].life, 900);
+    }
+
+    #[test]
+    fn finish_includes_exact_tail_and_settles_playing_last() {
+        let notes = vec![note(
+            "tail",
+            1_000_000,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        )];
+        let mut watch =
+            GameplaySession::new(notes.clone(), SessionMode::Watch, TimeMicros(0)).unwrap();
+        assert!(watch.advance(TimeMicros(1_000_000)).unwrap().is_empty());
+        let events = watch.finish(TimeMicros(1_000_000)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].judgement, Judgement::Perfect);
+        assert_eq!(events[0].timing, JudgeTiming::Auto);
+
+        let mut play = GameplaySession::new(notes, SessionMode::Play, TimeMicros(0)).unwrap();
+        assert!(play.advance(TimeMicros(1_000_000)).unwrap().is_empty());
+        let events = play.finish(TimeMicros(1_000_000)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].judgement, Judgement::Miss);
+        assert_eq!(events[0].timing, JudgeTiming::LastTiming);
+        assert_eq!(play.snapshot().processed, 1);
     }
 
     #[test]
@@ -1644,6 +1704,7 @@ mod tests {
         )
         .unwrap();
         assert!(assisted.advance(TimeMicros(156_000)).unwrap().is_empty());
+        assert!(assisted.advance(TimeMicros(156_001)).unwrap().is_empty());
         assert_eq!(assisted.advance(TimeMicros(156_001)).unwrap().len(), 1);
     }
 

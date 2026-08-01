@@ -111,6 +111,39 @@ export interface RenderParticleEffect {
 
 export type RenderJudgement = "just" | "perfect" | "great" | "good" | "bad" | "miss";
 
+export interface RenderJudgementInstance {
+  id: number;
+  judgement: RenderJudgement;
+  /** Seconds since this result replaced or acquired a HUD slot. */
+  age: number;
+  /** Chart-lane centre in the 0..24 edge coordinate system. */
+  laneCenter: number;
+  width: number;
+  fastSlow: "FAST" | "SLOW" | null;
+  differenceMs: number;
+}
+
+export interface RenderTitleIntroductionTheme {
+  panelBackground: string;
+  panelBorderColor: string;
+  panelBorderWidthPx: number;
+  fontFamilies: ReadonlyArray<string>;
+  titleColor: string;
+  artistColor: string;
+  creditsColor: string;
+}
+
+export interface RenderTitleIntroduction {
+  title: string;
+  artist?: string;
+  lyricist?: string;
+  composer?: string;
+  arranger?: string;
+  /** Canvas-group opacity sampled from the presentation timeline. */
+  alpha: number;
+  theme?: Partial<RenderTitleIntroductionTheme>;
+}
+
 export interface RenderSkillBanner {
   id: string | number;
   text: string;
@@ -136,6 +169,16 @@ export interface RenderHudState {
   judgement?: RenderJudgement;
   judgementAge?: number;
   fastSlow?: "FAST" | "SLOW" | null;
+  /** Active result views. Lane mode can display several simultaneous notes. */
+  judgements?: ReadonlyArray<RenderJudgementInstance>;
+  judgementPosition?: "center" | "lane" | "none";
+  noteOverlapLaneBuffer?: number;
+  showFastSlow?: boolean;
+  showPerfectFastSlow?: boolean;
+  showJudgeOffsetMs?: boolean;
+  alwaysShowFastSlow?: boolean;
+  /** Opening song-title presentation, composited above the gameplay HUD. */
+  titleIntroduction?: RenderTitleIntroduction;
   skills?: ReadonlyArray<RenderSkillBanner>;
   showPause?: boolean;
 }

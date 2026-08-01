@@ -375,12 +375,18 @@ export class ScreenLaneBackdrop {
     if (this.backgroundShadowMesh.visible !== visible) this.backgroundShadowMesh.visible = visible;
   }
 
+  refreshBackgroundLayout(): void {
+    this.updateBackgroundCover();
+  }
+
   private updateBackgroundCover(): void {
     const texture = this.backgroundTexture;
     if (!texture) return;
-    const image = texture.image as { width?: number; height?: number } | undefined;
-    const imageWidth = Number(image?.width);
-    const imageHeight = Number(image?.height);
+    const image = texture.image as
+      | { width?: number; height?: number; videoWidth?: number; videoHeight?: number }
+      | undefined;
+    const imageWidth = Number(image?.videoWidth || image?.width);
+    const imageHeight = Number(image?.videoHeight || image?.height);
     if (!(imageWidth > 0) || !(imageHeight > 0)) return;
     const cover = backgroundCoverUv(imageWidth, imageHeight, this.logicalWidth, this.logicalHeight);
     texture.offset.set(cover.offsetX, cover.offsetY);

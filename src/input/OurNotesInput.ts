@@ -23,6 +23,8 @@ export interface OurNotesInputHandlers {
 
 export interface OurNotesInputOptions {
   now?: () => number;
+  /** Map the pointer event's occurrence timestamp into chart time. */
+  eventTime?: (event: PointerEvent) => number;
   laneAtClientPoint: (clientX: number, clientY: number) => number;
   screenDpi?: number;
   flickDistanceCm?: number;
@@ -42,6 +44,7 @@ interface PointerState extends InputPoint {
 export class OurNotesInput {
   private readonly pointers = new Map<number, PointerState>();
   private readonly now: () => number;
+  private readonly eventTime: (event: PointerEvent) => number;
   private readonly dpi: number;
   private readonly flickDistanceCm: number;
   private readonly previousTouchAction: string;
@@ -52,6 +55,7 @@ export class OurNotesInput {
     private readonly options: OurNotesInputOptions,
   ) {
     this.now = options.now ?? (() => performance.now());
+    this.eventTime = options.eventTime ?? (() => this.now());
     this.dpi = options.screenDpi ?? 96;
     this.flickDistanceCm = options.flickDistanceCm ?? 0.1;
     this.previousTouchAction = element.style.touchAction;
@@ -120,7 +124,7 @@ export class OurNotesInput {
   private readonly onPointerDown = (event: PointerEvent): void => {
     this.preventPointerDefault(event);
     if (this.pointers.size >= 4 || this.pointers.has(event.pointerId)) return;
-    const point = this.point(event, this.now());
+    const point = this.point(event, this.eventTime(event));
     this.element.setPointerCapture?.(event.pointerId);
     this.pointers.set(event.pointerId, {
       ...point,
@@ -134,9 +138,13 @@ export class OurNotesInput {
 
   private readonly onPointerMove = (event: PointerEvent): void => {
     this.preventPointerDefault(event);
+    this.samplePointerMovement(event, true);
+  };
+
+  private samplePointerMovement(event: PointerEvent, emitPress: boolean): void {
     const state = this.pointers.get(event.pointerId);
     if (!state) return;
-    const point = this.point(event, this.now());
+    const point = this.point(event, this.eventTime(event));
     const rawDx = point.x - state.previousX;
     const rawDy = point.y - state.previousY;
     const deltaSeconds = Math.max(0, point.timeMs - state.previousFrameTimeMs) / 1000;
@@ -154,7 +162,7 @@ export class OurNotesInput {
         dy: rawDy,
       });
     }
-    this.handlers.move?.(point);
+    if (emitPress) this.handlers.move?.(point);
     state.previousX = point.x;
     state.previousY = point.y;
     state.previousLane = point.lane;
@@ -163,24 +171,29 @@ export class OurNotesInput {
     state.y = point.y;
     state.lane = point.lane;
     state.timeMs = point.timeMs;
-  };
+  }
 
   private readonly onPointerUp = (event: PointerEvent): void => {
-    this.preventPointerDefault(event);
-    const state = this.pointers.get(event.pointerId);
-    if (!state) return;
-    const point = this.point(event, this.now());
-    // Ended participates in flick detection in the original input manager.
-    this.onPointerMove(event);
-    this.handlers.release?.(point);
-    this.pointers.delete(event.pointerId);
+    this.finishPointer(event, true);
   };
 
   private readonly onPointerCancel = (event: PointerEvent): void => {
-    this.preventPointerDefault(event);
-    if (!this.pointers.delete(event.pointerId)) return;
-    // Browser/system cancellation is not Unity's Ended phase: clear the
-    // claim without creating a flick or accepting a slide-end judgment.
-    this.handlers.cancel?.(event.pointerId);
+    this.finishPointer(event, false);
   };
+
+  private finishPointer(event: PointerEvent, sampleMovement: boolean): void {
+    this.preventPointerDefault(event);
+    const state = this.pointers.get(event.pointerId);
+    if (!state) return;
+    const eventTimeMs = this.eventTime(event);
+    // Both Ended and Canceled become PressExit. Only Ended also participates
+    // in the final movement/flick sample.
+    if (sampleMovement) this.samplePointerMovement(event, false);
+    const latest = this.pointers.get(event.pointerId) ?? state;
+    const point = sampleMovement
+      ? { pointerId: latest.pointerId, x: latest.x, y: latest.y, lane: latest.lane, timeMs: latest.timeMs }
+      : { pointerId: state.pointerId, x: state.x, y: state.y, lane: state.lane, timeMs: eventTimeMs };
+    this.handlers.release?.(point);
+    this.pointers.delete(event.pointerId);
+  }
 }

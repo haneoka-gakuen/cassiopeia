@@ -1,3 +1,6 @@
+import { MusicSyncTimeCache } from "./MusicTimeAnchor";
+import { normalizePlaybackRate } from "./playbackRate";
+
 export interface MediaClockOptions {
   volume?: number;
   playbackRate?: number;
@@ -7,6 +10,7 @@ export interface MediaClockOptions {
 /** Audio-element backed clock. Rendering always reads the media clock, never frame deltas. */
 export class MediaClock extends EventTarget {
   readonly audio: HTMLAudioElement;
+  private readonly syncTime = new MusicSyncTimeCache();
 
   constructor(source?: string, options: MediaClockOptions = {}) {
     super();
@@ -14,26 +18,39 @@ export class MediaClock extends EventTarget {
     this.audio.preload = "auto";
     this.audio.crossOrigin = "anonymous";
     this.audio.volume = options.volume ?? 0.8;
-    this.audio.playbackRate = options.playbackRate ?? 1;
+    this.audio.playbackRate = normalizePlaybackRate(options.playbackRate ?? 1);
     this.audio.loop = options.loop ?? false;
     if (source) this.source = source;
     for (const type of ["play", "pause", "ended", "timeupdate", "durationchange", "error"] as const) {
-      this.audio.addEventListener(type, () => this.dispatchEvent(new Event(type)));
+      this.audio.addEventListener(type, () => {
+        if ((type === "pause" || type === "ended" || type === "timeupdate") && Number.isFinite(this.audio.currentTime)) {
+          this.syncTime.read(true, this.audio.currentTime * 1000);
+        }
+        this.dispatchEvent(new Event(type));
+      });
     }
   }
 
   get source(): string {
-    return this.audio.src;
+    return this.audio.getAttribute("src") ?? "";
   }
 
   set source(value: string) {
     if (this.audio.getAttribute("src") === value) return;
-    this.audio.src = value;
+    if (value) this.audio.src = value;
+    else this.audio.removeAttribute("src");
+    this.syncTime.setSoundInfo(Boolean(value));
     this.audio.load();
   }
 
   get timeMs(): number {
-    return Number.isFinite(this.audio.currentTime) ? this.audio.currentTime * 1000 : 0;
+    const playbackUsable =
+      !this.audio.paused &&
+      !this.audio.ended &&
+      !this.audio.seeking &&
+      this.audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      Number.isFinite(this.audio.currentTime);
+    return this.syncTime.read(playbackUsable, this.audio.currentTime * 1000);
   }
 
   get durationMs(): number {
@@ -57,7 +74,7 @@ export class MediaClock extends EventTarget {
   }
 
   set rate(value: number) {
-    this.audio.playbackRate = Math.max(0.25, Math.min(4, value));
+    this.audio.playbackRate = normalizePlaybackRate(value, this.audio.playbackRate);
   }
 
   get loop(): boolean {
@@ -77,13 +94,17 @@ export class MediaClock extends EventTarget {
   }
 
   seek(timeMs: number): void {
+    if (!this.source) return;
     const maximum = this.durationMs || Number.POSITIVE_INFINITY;
-    this.audio.currentTime = Math.max(0, Math.min(maximum, timeMs)) / 1000;
+    const target = Math.max(0, Math.min(maximum, timeMs));
+    this.audio.currentTime = target / 1000;
+    this.syncTime.seek(target);
   }
 
   destroy(): void {
     this.audio.pause();
     this.audio.removeAttribute("src");
+    this.syncTime.setSoundInfo(false);
     this.audio.load();
   }
 }

@@ -1,6 +1,6 @@
 import type { OurNotesAssetManifest } from "../assets/manifest";
 import { TmpSdfFont } from "./TmpSdfFont";
-import type { RenderHudState } from "./types";
+import type { RenderHudState, RenderJudgementInstance, RenderTitleIntroductionTheme } from "./types";
 
 const EMPTY_HUD_STATE: Readonly<RenderHudState> = Object.freeze({});
 const DEFAULT_RANK_LABELS = ["C", "B", "A", "S", "SS"] as const;
@@ -22,6 +22,21 @@ const PAUSE_ICON_SPRITE_RECT = {
 } as const;
 const COMBO_ADD_PEAK_TIME = 0.13333334028720856;
 const COMBO_ADD_DURATION = 0.15000000596046448;
+const JUDGEMENT_POOL_CAPACITY = 8;
+const CHART_LANE_COUNT = 24;
+const JUDGEMENT_SHOW_DURATION = 0.30000001192092896;
+const JUDGEMENT_PUNCH_DURATION = 0.15000000596046448;
+const JUDGEMENT_PUNCH_SCALE = 0.2;
+const JUDGEMENT_SUB_SCALE = 0.75;
+const DEFAULT_TITLE_THEME: RenderTitleIntroductionTheme = {
+  panelBackground: "rgba(92, 59, 190, 0.72)",
+  panelBorderColor: "rgba(255, 255, 255, 0)",
+  panelBorderWidthPx: 0,
+  fontFamilies: ["Noto Sans", "Noto Sans JP", "Noto Sans SC", "system-ui", "sans-serif"],
+  titleColor: "#ffffff",
+  artistColor: "#ffffff",
+  creditsColor: "rgba(255, 255, 255, 0.92)",
+};
 
 // UILiveNoteJudgeEffectView.Initialize assigns each Sprite and immediately
 // invokes Image.SetNativeSize(). The prefab's common 276x66 RectTransform is
@@ -83,6 +98,14 @@ function clamp(value: number, min: number, max: number): number {
 function smoothstep01(value: number): number {
   const progress = clamp(value, 0, 1);
   return progress * progress * (3 - 2 * progress);
+}
+
+function judgementPunchScale(age: number): number {
+  if (age <= 0 || age >= JUDGEMENT_PUNCH_DURATION) return 1;
+  const progress = age / JUDGEMENT_PUNCH_DURATION;
+  // One-vibration punch: grow during the first half, then return to the
+  // authored scale without a discontinuity before the 0.15 s hold.
+  return 1 + JUDGEMENT_PUNCH_SCALE * Math.sin(Math.PI * progress);
 }
 
 function rgba(red: number, green: number, blue: number, alpha: number): string {
@@ -174,6 +197,8 @@ export class HudLayer {
   private pixelRatio = 1;
   private logicalWidth = 1920;
   private logicalHeight = 1080;
+  private laneProjectionLeftNdcX = -1;
+  private laneProjectionRightNdcX = 1;
   private readonly judgementImages: Partial<
     Record<"just" | "perfect" | "great" | "good" | "bad" | "miss" | "fast" | "late", HTMLImageElement>
   > = {};
@@ -195,6 +220,7 @@ export class HudLayer {
   private renderedVisible = false;
   private judgementWasAnimating = false;
   private comboWasAnimating = false;
+  private titleIntroductionWasAnimating = false;
   private disposed = false;
 
   constructor(canvas: HTMLCanvasElement, assets: OurNotesAssetManifest) {
@@ -220,6 +246,13 @@ export class HudLayer {
     this.canvas.height = Math.max(1, Math.round(this.height * this.pixelRatio));
     this.canvas.style.width = `${this.width}px`;
     this.canvas.style.height = `${this.height}px`;
+    this.forceRedraw = true;
+  }
+
+  setLaneProjection(leftNdcX: number, rightNdcX: number): void {
+    if (!Number.isFinite(leftNdcX) || !Number.isFinite(rightNdcX)) return;
+    this.laneProjectionLeftNdcX = Math.min(leftNdcX, rightNdcX);
+    this.laneProjectionRightNdcX = Math.max(leftNdcX, rightNdcX);
     this.forceRedraw = true;
   }
 
@@ -299,12 +332,17 @@ export class HudLayer {
       this.renderedVisible = false;
       this.judgementWasAnimating = false;
       this.comboWasAnimating = false;
+      this.titleIntroductionWasAnimating = false;
       this.forceRedraw = false;
       return;
     }
 
-    const judgementAnimating = Boolean(next.judgement && (next.judgementAge ?? 0) < 0.3);
+    const judgementAnimating = Boolean(
+      next.judgements?.some((judgement) => judgement.age < JUDGEMENT_SHOW_DURATION) ||
+        (next.judgement && (next.judgementAge ?? 0) < JUDGEMENT_SHOW_DURATION),
+    );
     const comboAnimating = Boolean(next.combo && next.combo >= 2 && (next.comboAge ?? Infinity) < COMBO_ADD_DURATION);
+    const titleIntroductionAnimating = Boolean(next.titleIntroduction && next.titleIntroduction.alpha > 0);
     if (
       !this.forceRedraw &&
       this.renderedVisible &&
@@ -312,7 +350,9 @@ export class HudLayer {
       !judgementAnimating &&
       !this.judgementWasAnimating &&
       !comboAnimating &&
-      !this.comboWasAnimating
+      !this.comboWasAnimating &&
+      !titleIntroductionAnimating &&
+      !this.titleIntroductionWasAnimating
     ) {
       return;
     }
@@ -331,6 +371,7 @@ export class HudLayer {
     this.drawLife(next);
     this.drawCombo(next);
     this.drawJudgement(next);
+    this.drawTitleIntroduction(next);
     // Live skill cells use a separate prefab/atlas. They intentionally remain
     // absent until those source assets can be rendered; generic panels would
     // be visibly unrelated to the original UI.
@@ -338,6 +379,7 @@ export class HudLayer {
     this.renderedVisible = true;
     this.judgementWasAnimating = judgementAnimating;
     this.comboWasAnimating = comboAnimating;
+    this.titleIntroductionWasAnimating = titleIntroductionAnimating;
     this.forceRedraw = false;
   }
 
@@ -715,23 +757,142 @@ export class HudLayer {
   }
 
   private drawJudgement(state: RenderHudState): void {
-    if (!state.judgement || (state.judgementAge ?? 0) >= 0.3) return;
-    const image = this.judgementImages[state.judgement];
+    if (state.judgementPosition === "none") return;
+    const active = this.resolveJudgementViews(state);
+    if (active.length) {
+      for (const result of active) {
+        const x = state.judgementPosition === "lane" ? this.laneHudX(result.laneCenter) : this.logicalWidth / 2;
+        this.drawJudgementInstance(state, result, x);
+      }
+      return;
+    }
+    if (!state.judgement || (state.judgementAge ?? 0) >= JUDGEMENT_SHOW_DURATION) return;
+    this.drawJudgementSprite(
+      state.judgement,
+      state.fastSlow ?? null,
+      0,
+      this.logicalWidth / 2,
+      state,
+      state.judgementAge ?? 0,
+    );
+  }
+
+  private resolveJudgementViews(state: RenderHudState): RenderJudgementInstance[] {
+    const source = state.judgements;
+    if (!source?.length) return [];
+    if (state.judgementPosition !== "lane") return [source[source.length - 1]!];
+    const slots: RenderJudgementInstance[] = [];
+    const overlap = Math.max(0, Math.floor(state.noteOverlapLaneBuffer ?? 0));
+    for (const result of source) {
+      const existing = slots.findIndex((slot) => Math.abs(slot.laneCenter - result.laneCenter) <= overlap);
+      if (existing >= 0) slots[existing] = result;
+      else if (slots.length < JUDGEMENT_POOL_CAPACITY) slots.push(result);
+      else slots[0] = result;
+    }
+    return slots;
+  }
+
+  private laneHudX(laneCenter: number): number {
+    const progress = clamp(laneCenter / CHART_LANE_COUNT, 0, 1);
+    const ndcX = this.laneProjectionLeftNdcX + (this.laneProjectionRightNdcX - this.laneProjectionLeftNdcX) * progress;
+    return (ndcX * 0.5 + 0.5) * this.logicalWidth;
+  }
+
+  private drawJudgementInstance(state: RenderHudState, result: RenderJudgementInstance, x: number): void {
+    this.drawJudgementSprite(result.judgement, result.fastSlow, result.differenceMs, x, state, result.age);
+  }
+
+  private drawJudgementSprite(
+    judgement: RenderJudgementInstance["judgement"],
+    fastSlow: RenderJudgementInstance["fastSlow"],
+    differenceMs: number,
+    x: number,
+    state: RenderHudState,
+    age: number,
+  ): void {
+    if (age >= JUDGEMENT_SHOW_DURATION) return;
+    const image = this.judgementImages[judgement];
     if (!image) return;
     const context = this.context;
-    const x = this.logicalWidth / 2;
     // Live.prefab: UILiveJudgement y=-109; its effect_root/main_judge child
     // places the judgement center another 16 px below that root. Initialize
     // replaces the common editor placeholder with Image.SetNativeSize().
-    const y = this.logicalHeight / 2 + 125;
-    const [width, height] = JUDGEMENT_NATIVE_SIZES[state.judgement];
+    const y = this.logicalHeight / 2 + 66;
+    const [width, height] = JUDGEMENT_NATIVE_SIZES[judgement];
     context.save();
-    context.drawImage(image, x - width / 2, y - height / 2, width, height);
-    const timingImage = state.fastSlow ? this.judgementImages[state.fastSlow === "FAST" ? "fast" : "late"] : undefined;
-    if (timingImage) {
-      // timing_offset shares main_judge's center in UILiveNoteJudgeEffectView.
-      context.drawImage(timingImage, x - 307 / 2, y - 31 / 2, 307, 31);
+    context.translate(x, y);
+    const scale = judgementPunchScale(Math.max(0, age));
+    context.scale(scale, scale);
+    context.drawImage(image, -width / 2, -height / 2, width, height);
+    const perfect = judgement === "perfect" || judgement === "just";
+    const good = judgement === "good";
+    const ordinaryFastSlow = judgement === "bad" || good || judgement === "great";
+    const perfectFastSlow = good || perfect;
+    const showTiming =
+      fastSlow &&
+      (state.alwaysShowFastSlow === true ||
+        (state.showFastSlow !== false && ordinaryFastSlow) ||
+        (state.showPerfectFastSlow !== false && perfectFastSlow));
+    if (showTiming) {
+      this.tmpSdfFont?.drawText(context, fastSlow, 0, 0, {
+        align: "center",
+        fontSize: 44 * JUDGEMENT_SUB_SCALE,
+        color: fastSlow === "FAST" ? "rgb(92.62, 194.0, 255)" : "rgb(204.48, 76.2, 76.2)",
+      });
     }
+    if (state.showJudgeOffsetMs && Number.isFinite(differenceMs)) {
+      this.tmpSdfFont?.drawText(context, `${differenceMs > 0 ? "+" : ""}${Math.round(differenceMs)} ms`, 0, 72, {
+        align: "center",
+        fontSize: 44,
+        color: "rgba(255, 255, 255, 0.92)",
+      });
+    }
+    context.restore();
+  }
+
+  private drawTitleIntroduction(state: RenderHudState): void {
+    const introduction = state.titleIntroduction;
+    if (!introduction || introduction.alpha <= 0 || !introduction.title) return;
+    const theme = { ...DEFAULT_TITLE_THEME, ...introduction.theme };
+    const context = this.context;
+    const centerX = this.logicalWidth / 2;
+    const centerY = this.logicalHeight / 2 - 199;
+    const panelWidth = 1366;
+    const panelHeight = 192;
+    const left = centerX - panelWidth / 2;
+    const top = centerY - panelHeight / 2;
+    const genericFamilies = new Set(["serif", "sans-serif", "monospace", "system-ui"]);
+    const fontFamily = theme.fontFamilies
+      .map((family) => (genericFamilies.has(family) ? family : JSON.stringify(family)))
+      .join(", ");
+    const drawCanvasText = (text: string, y: number, size: number, weight: number, color: string): void => {
+      if (!text) return;
+      context.fillStyle = color;
+      context.font = `${weight} ${size}px ${fontFamily}`;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(text, centerX, y, 1000);
+    };
+
+    context.save();
+    context.globalAlpha = clamp(introduction.alpha, 0, 1);
+    context.fillStyle = theme.panelBackground;
+    context.fillRect(left, top, panelWidth, panelHeight);
+    if (theme.panelBorderWidthPx > 0) {
+      context.strokeStyle = theme.panelBorderColor;
+      context.lineWidth = theme.panelBorderWidthPx;
+      context.strokeRect(left, top, panelWidth, panelHeight);
+    }
+    drawCanvasText(introduction.title, centerY - 48, 48, 700, theme.titleColor);
+    drawCanvasText(introduction.artist ?? "", centerY + 8, 24, 700, theme.artistColor);
+    const firstCredit = [
+      introduction.lyricist ? `作詞: ${introduction.lyricist}` : "",
+      introduction.composer ? `作曲: ${introduction.composer}` : "",
+    ]
+      .filter(Boolean)
+      .join("　");
+    drawCanvasText(firstCredit, centerY + 44, 22, 700, theme.creditsColor);
+    drawCanvasText(introduction.arranger ? `編曲: ${introduction.arranger}` : "", centerY + 68, 22, 700, theme.creditsColor);
     context.restore();
   }
 

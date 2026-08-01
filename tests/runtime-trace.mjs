@@ -4,12 +4,21 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  ASSIST_AREA_OFFSET_TABLES,
+  ASSIST_TIMING_TABLES,
   ChartSession,
+  judge,
+  JudgeTiming,
+  JudgementAreaOffsetType,
   MusicTimeAnchor,
   MusicSyncTimeCache,
+  nativeJudgementAreaOffsetX,
   normalizeEventRealtimeMs,
+  normalizePlaybackRate,
+  NoteJudgementType,
   NoteSimulateJudgement,
   OurNotesInput,
+  RenderFrameBuilder,
 } from "../dist/index.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -32,6 +41,41 @@ assert.deepStrictEqual(
   { None: -1, Wait: 0, Miss: 1, Bad: 2, Good: 3, Great: 4, Perfect: 5, Just: 6, Pass: 7 },
   "NoteSimulateJudgement numeric contract changed",
 );
+
+assert.deepStrictEqual(
+  ASSIST_TIMING_TABLES.map((table) => Object.values(table).reduce((count, windows) => count + windows.length, 0)),
+  [39, 39, 39, 39, 39, 39],
+  "Assist timing profile is incomplete",
+);
+assert.deepStrictEqual(
+  ASSIST_AREA_OFFSET_TABLES.map((table) => Object.keys(table).length),
+  [9, 9, 9, 9, 9, 9],
+  "Assist hit-area profile is incomplete",
+);
+assert.deepStrictEqual(judge(NoteJudgementType.Normal, 130, 0), {
+  judgement: NoteSimulateJudgement.Miss,
+  timing: JudgeTiming.Late,
+});
+assert.deepStrictEqual(judge(NoteJudgementType.Normal, 130, 5), {
+  judgement: NoteSimulateJudgement.Bad,
+  timing: JudgeTiming.Late,
+});
+assert.deepStrictEqual(
+  judge(NoteJudgementType.SlideBegin, 130, 5),
+  judge(NoteJudgementType.SlideBegin, 130, 0),
+  "Level-five SlideBegin keeps its dedicated fallback profile",
+);
+assert.equal(nativeJudgementAreaOffsetX(JudgementAreaOffsetType.Default, 4, 0), 1);
+assert.equal(nativeJudgementAreaOffsetX(JudgementAreaOffsetType.Default, 4, 5), 1.5);
+
+const rateAnchor = new MusicTimeAnchor();
+rateAnchor.sample(-0.001, 100.999, 2);
+assert.equal(rateAnchor.timeAt(99.999, 0), -3, "Negative pre-roll uses floor quantization at 2x");
+assert.equal(rateAnchor.timeAt(101.001, 0), 1, "Realtime deltas follow the active playback rate");
+assert.equal(normalizePlaybackRate(Number.NaN), 1);
+assert.equal(normalizePlaybackRate(0), 1);
+assert.equal(normalizePlaybackRate(0.1), 0.25);
+assert.equal(normalizePlaybackRate(8), 4);
 
 function normalizeJudgement(event) {
   return {
@@ -70,7 +114,7 @@ function normalizeSnapshot(snapshot) {
   };
 }
 
-function canceledPointerEvents() {
+function pointerExitEvents(type) {
   const listeners = new Map();
   const callbacks = [];
   const element = {
@@ -101,13 +145,14 @@ function canceledPointerEvents() {
       {
         tap: (point) => callbacks.push({ type: "tap", timeMs: point.timeMs }),
         move: (point) => callbacks.push({ type: "move", timeMs: point.timeMs }),
-        release: (point) => callbacks.push({ type: "release", timeMs: point.timeMs }),
+        release: (point) =>
+          callbacks.push({ type: "release", timeMs: point.timeMs, x: point.x, lane: point.lane }),
         flick: (point) => callbacks.push({ type: "flick", timeMs: point.timeMs }),
         cancel: (pointerId) => callbacks.push({ type: "cancel", pointerId }),
       },
       {
         eventTime: (event) => event.timeStamp,
-        laneAtClientPoint: () => 12,
+        laneAtClientPoint: (clientX) => clientX / 10,
         screenDpi: 96,
         flickDistanceCm: 0.1,
       },
@@ -125,9 +170,9 @@ function canceledPointerEvents() {
       });
     };
     dispatch("pointerdown", 0, 10);
-    // This displacement exceeds the flick threshold. Cancellation still must
-    // release without taking a final movement sample.
-    dispatch("pointercancel", 100, 11);
+    // This displacement exceeds the flick threshold, separating Ended's final
+    // flick sample from Canceled's release-only path.
+    dispatch(type, 100, 11);
   } finally {
     input?.destroy();
     if (hadWindow) globalThis.window = previousWindow;
@@ -164,6 +209,9 @@ function perform(session, action, trace) {
     case "update":
       session.update(action.timeMs);
       break;
+    case "finish":
+      session.finish(action.timeMs);
+      break;
     case "tap":
       session.tap(action.lane, action.timeMs, action.pointerId);
       break;
@@ -192,7 +240,7 @@ function perform(session, action, trace) {
       break;
     }
     case "clockSample":
-      trace.clock.sample(action.musicTimeMs, action.realtimeMs);
+      trace.clock.sample(action.musicTimeMs, action.realtimeMs, action.playbackRate);
       break;
     case "clockTime":
       trace.events.push({
@@ -207,7 +255,10 @@ function perform(session, action, trace) {
       });
       break;
     case "cancelInput":
-      trace.events.push(...canceledPointerEvents().map((event) => ({ type: "input", ...event })));
+      trace.events.push(...pointerExitEvents("pointercancel").map((event) => ({ type: "input", ...event })));
+      break;
+    case "endInput":
+      trace.events.push(...pointerExitEvents("pointerup").map((event) => ({ type: "input", ...event })));
       break;
     case "syncSoundInfo":
       trace.syncTime.setSoundInfo(action.available);
@@ -259,6 +310,36 @@ async function fixturePaths() {
     .sort()
     .map((name) => join(fixtureDirectory, name));
 }
+
+async function verifyConcurrentHudResults() {
+  const fixture = JSON.parse(await readFile(join(fixtureDirectory, "session-boundaries.runtime-trace.json"), "utf8"));
+  const chart = structuredClone(fixture.cases[0].chart);
+  chart.notes = chart.notes.slice(0, 2);
+  chart.notes[0].timeMs = 1000;
+  chart.notes[0].pos = 0;
+  chart.notes[0].size = 4;
+  chart.notes[1].timeMs = 1000;
+  chart.notes[1].pos = 20;
+  chart.notes[1].size = 4;
+  chart.durationMs = 2000;
+  const session = new ChartSession(chart, { mode: "play" });
+  const builder = new RenderFrameBuilder(chart, { particleSeed: 1 });
+  session.on("judgement", (event) => builder.addJudgement(event, 1000));
+  assert.ok(session.tap(2, 1000, 1));
+  assert.ok(session.tap(22, 1000, 2));
+  const frame = builder.build(1000, session.snapshot(), { judgeResultPosition: "lane" });
+  assert.deepStrictEqual(
+    frame.hud?.judgements?.map(({ id, laneCenter, judgement }) => ({ id, laneCenter, judgement })),
+    [
+      { id: 0, laneCenter: 2, judgement: "just" },
+      { id: 1, laneCenter: 22, judgement: "just" },
+    ],
+    "A simultaneous chord must retain one HUD result per lane slot",
+  );
+  assert.equal(builder.build(1300, session.snapshot()).hud?.judgements?.length, 0);
+}
+
+await verifyConcurrentHudResults();
 
 let caseCount = 0;
 let stepCount = 0;

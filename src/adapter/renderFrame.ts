@@ -8,6 +8,7 @@ import type {
   RenderFrame,
   RenderHold,
   RenderJudgement,
+  RenderJudgementInstance,
   RenderLaneEffectKind,
   RenderNote,
   RenderNoteKind,
@@ -36,6 +37,12 @@ export interface RenderSettings {
   /** Native SimultaneousLineDisplay (OptionItemType 108). */
   showSimultaneousLine: boolean;
   backgroundBrightness: number;
+  judgeResultPosition: "center" | "lane" | "none";
+  noteOverlapLaneBuffer: number;
+  showFastSlow: boolean;
+  showPerfectFastSlow: boolean;
+  showJudgeOffsetMs: boolean;
+  alwaysShowFastSlow: boolean;
   /** MasterLiveScoreRank required scores for C/B/A/S/SS. */
   scoreRankScores?: ReadonlyArray<number>;
 }
@@ -64,7 +71,18 @@ export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
   // MasterOptionDefault stores TRUE for option 108 in every preset.
   showSimultaneousLine: true,
   backgroundBrightness: 0.7,
+  judgeResultPosition: "center",
+  noteOverlapLaneBuffer: 0,
+  showFastSlow: true,
+  showPerfectFastSlow: true,
+  showJudgeOffsetMs: false,
+  alwaysShowFastSlow: false,
 };
+
+export interface RenderFrameBuilderOptions {
+  /** Stable seed for replay capture; live sessions use platform entropy. */
+  particleSeed?: number;
+}
 
 /**
  * effect001 ParticleSystems use `autoRandomSeed=true`. Unity gives a newly
@@ -179,6 +197,8 @@ interface ReusableFrameBuffers {
   readonly holdPool: PooledRenderHold[];
   readonly particles: RenderParticleEffect[];
   readonly particlePool: RenderParticleEffect[];
+  readonly hudJudgements: RenderJudgementInstance[];
+  readonly hudJudgementPool: RenderJudgementInstance[];
   readonly rank: MutableRankResult;
 }
 
@@ -495,22 +515,33 @@ interface QueuedLaneInputEffect {
   lifetime: number;
 }
 
+interface QueuedHudJudgement {
+  event: JudgementEvent;
+  spawnedAtMs: number;
+  id: number;
+}
+
+const HUD_JUDGEMENT_LIFETIME_SECONDS = 0.3;
+
 export class RenderFrameBuilder {
   private readonly visualTimeMap: VisualTimeMap;
   private readonly renderableNotes: ReadonlyArray<ChartNote>;
   private readonly preparedSimultaneousLines: ReadonlyArray<PreparedSimultaneousLine>;
   private readonly preparedLines: ReadonlyArray<PreparedLine>;
   private readonly effects: QueuedJudgementEffect[] = [];
+  private readonly hudJudgements: QueuedHudJudgement[] = [];
   private readonly latestLaneEffects = new Map<string, QueuedJudgementEffect>();
   /** Raw input feedback is never inserted into the judgement/score pipeline. */
   private readonly laneInputEffects: QueuedLaneInputEffect[] = [];
   private readonly latestLaneInputEffects = new Map<number, QueuedLaneInputEffect>();
   private readonly sampleStart: PreparedHoldPoint = { timeMs: 0, pos: 0, size: 0 };
   private readonly sampleEnd: PreparedHoldPoint = { timeMs: 0, pos: 0, size: 0 };
-  private readonly particleSeedEntropy = automaticParticleSeedEntropy();
+  private readonly particleSeedEntropy: number;
   private effectHead = 0;
+  private hudJudgementHead = 0;
   private laneInputEffectHead = 0;
   private nextLaneInputEffectId = 0;
+  private nextHudJudgementId = 0;
   /** Deliberately survives a timeline reset: the next Play gets a new seed. */
   private nextParticleEffectActivation = 0;
   private firstVisibleNoteCursor = 0;
@@ -520,7 +551,12 @@ export class RenderFrameBuilder {
   private reusable?: ReusableFrameBuffers;
   private lastTimeMs = 0;
 
-  constructor(private readonly chart: ChartDocument) {
+  constructor(
+    private readonly chart: ChartDocument,
+    options: RenderFrameBuilderOptions = {},
+  ) {
+    this.particleSeedEntropy =
+      options.particleSeed === undefined ? automaticParticleSeedEntropy() : mixParticleSeed(options.particleSeed);
     this.visualTimeMap = new VisualTimeMap(chart.timeScaleChanges);
     const sourceNoteById = new Map(chart.notes.map((note) => [note.id, note]));
     const visualNoteById = new Map(
@@ -602,6 +638,14 @@ export class RenderFrameBuilder {
       this.effects.length -= this.effectHead;
       this.effectHead = 0;
     }
+    if (this.hudJudgementHead > 64 && this.hudJudgementHead * 2 >= this.hudJudgements.length) {
+      this.hudJudgements.copyWithin(0, this.hudJudgementHead);
+      this.hudJudgements.length -= this.hudJudgementHead;
+      this.hudJudgementHead = 0;
+    }
+    if (judgementName(event.judgement)) {
+      this.hudJudgements.push({ event, spawnedAtMs: timeMs, id: this.nextHudJudgementId++ });
+    }
     const kind = nativeParticleEffectKind(event.note);
     if (kind) {
       const lifetime = nativeParticleEffectLifetime(kind, event.judgement);
@@ -647,6 +691,8 @@ export class RenderFrameBuilder {
   reset(): void {
     this.effects.length = 0;
     this.effectHead = 0;
+    this.hudJudgements.length = 0;
+    this.hudJudgementHead = 0;
     this.latestLaneEffects.clear();
     this.laneInputEffects.length = 0;
     this.latestLaneInputEffects.clear();
@@ -854,6 +900,16 @@ export class RenderFrameBuilder {
       this.effectHead = 0;
     }
     while (
+      this.hudJudgementHead < this.hudJudgements.length &&
+      timeMs - this.hudJudgements[this.hudJudgementHead]!.spawnedAtMs >= HUD_JUDGEMENT_LIFETIME_SECONDS * 1000
+    ) {
+      this.hudJudgementHead++;
+    }
+    if (this.hudJudgementHead === this.hudJudgements.length && this.hudJudgementHead > 0) {
+      this.hudJudgements.length = 0;
+      this.hudJudgementHead = 0;
+    }
+    while (
       this.laneInputEffectHead < this.laneInputEffects.length &&
       timeMs - this.laneInputEffects[this.laneInputEffectHead]!.event.timeMs >
         this.laneInputEffects[this.laneInputEffectHead]!.lifetime * 1000
@@ -1047,6 +1103,43 @@ export class RenderFrameBuilder {
       : nativeScoreRank(snapshot.score, settings.scoreRankScores);
     const last = snapshot.lastJudgement;
     const hud = buffers?.frame.hud ?? {};
+    const hudJudgements: RenderJudgementInstance[] = buffers?.hudJudgements ?? [];
+    hudJudgements.length = 0;
+    for (let index = this.hudJudgementHead; index < this.hudJudgements.length; index += 1) {
+      const queued = this.hudJudgements[index]!;
+      const judgement = judgementName(queued.event.judgement);
+      if (!judgement) continue;
+      const outputIndex = hudJudgements.length;
+      const output = buffers
+        ? (buffers.hudJudgementPool[outputIndex] ??= {
+            id: 0,
+            judgement,
+            age: 0,
+            laneCenter: 0,
+            width: 0,
+            fastSlow: null,
+            differenceMs: 0,
+          })
+        : ({
+            id: 0,
+            judgement,
+            age: 0,
+            laneCenter: 0,
+            width: 0,
+            fastSlow: null,
+            differenceMs: 0,
+          } satisfies RenderJudgementInstance);
+      output.id = queued.id;
+      output.judgement = judgement;
+      output.age = Math.max(0, (timeMs - queued.spawnedAtMs) / 1000);
+      output.laneCenter = mirror
+        ? LANE_COUNT - queued.event.note.pos - queued.event.note.size / 2
+        : queued.event.note.pos + queued.event.note.size / 2;
+      output.width = queued.event.note.size;
+      output.fastSlow = queued.event.timing === 1 ? "FAST" : queued.event.timing === 2 ? "SLOW" : null;
+      output.differenceMs = queued.event.diffMs;
+      hudJudgements.push(output);
+    }
     hud.score = snapshot.score;
     // UICountAdditionInfoElement positive/negative clips are both 0.45 s.
     hud.scoreDelta = last && timeMs - last.judgedAtMs < 450 ? last.scoreDelta : undefined;
@@ -1064,6 +1157,13 @@ export class RenderFrameBuilder {
     hud.judgement = last ? judgementName(last.judgement) : undefined;
     hud.judgementAge = last ? Math.max(0, (timeMs - last.judgedAtMs) / 1000) : undefined;
     hud.fastSlow = last?.timing === 1 ? "FAST" : last?.timing === 2 ? "SLOW" : null;
+    hud.judgements = hudJudgements;
+    hud.judgementPosition = settings.judgeResultPosition ?? DEFAULT_RENDER_SETTINGS.judgeResultPosition;
+    hud.noteOverlapLaneBuffer = settings.noteOverlapLaneBuffer ?? DEFAULT_RENDER_SETTINGS.noteOverlapLaneBuffer;
+    hud.showFastSlow = settings.showFastSlow ?? DEFAULT_RENDER_SETTINGS.showFastSlow;
+    hud.showPerfectFastSlow = settings.showPerfectFastSlow ?? DEFAULT_RENDER_SETTINGS.showPerfectFastSlow;
+    hud.showJudgeOffsetMs = settings.showJudgeOffsetMs ?? DEFAULT_RENDER_SETTINGS.showJudgeOffsetMs;
+    hud.alwaysShowFastSlow = settings.alwaysShowFastSlow ?? DEFAULT_RENDER_SETTINGS.alwaysShowFastSlow;
     hud.showPause = true;
 
     const stage = buffers?.frame.stage ?? {};
@@ -1107,6 +1207,7 @@ export class RenderFrameBuilder {
     const simultaneousLines: RenderSimultaneousLine[] = [];
     const holds: MutableRenderHold[] = [];
     const particles: RenderParticleEffect[] = [];
+    const hudJudgements: RenderJudgementInstance[] = [];
     this.reusable = {
       frame: { time: 0, deltaTime: 0, notes, simultaneousLines, holds, particles, hud: {}, stage: {} },
       notes,
@@ -1117,6 +1218,8 @@ export class RenderFrameBuilder {
       holdPool: [],
       particles,
       particlePool: [],
+      hudJudgements,
+      hudJudgementPool: [],
       rank: { rank: "D", progress: 0 },
     };
     return this.reusable;

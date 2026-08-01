@@ -207,6 +207,11 @@ export interface SessionSnapshot {
    */
   activeLongLine: boolean;
   combo: number;
+  /** True until the first Bad or Miss; ignored results do not change it. */
+  fullCombo: boolean;
+  /** Whole-run AP state. It is independent from whether a combo is visible. */
+  allPerfect: boolean;
+  /** HUD variant: a visible combo whose whole-run AP state is still intact. */
   perfectCombo: boolean;
   maxCombo: number;
   score: number;

@@ -96,6 +96,8 @@ export enum JudgeTiming {
   Late = 2,
   Auto = 3,
   OutOfTime = 4,
+  LastTiming = 5,
+  Force = 6,
 }
 
 /** FTLiveSimulator.FeverState. Zero is not a valid native state. */

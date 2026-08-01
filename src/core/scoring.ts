@@ -54,6 +54,21 @@ export function lifeDamage(judgement: NoteSimulateJudgement): number {
   return 0;
 }
 
+/** Judgements which consume a combo step. Wait and Pass leave the counter untouched. */
+export function incrementsCombo(judgement: NoteSimulateJudgement): boolean {
+  return judgement >= NoteSimulateJudgement.Good && judgement <= NoteSimulateJudgement.Just;
+}
+
+/** Only Bad and Miss break full combo and reset the visible counter. */
+export function breaksCombo(judgement: NoteSimulateJudgement): boolean {
+  return judgement === NoteSimulateJudgement.Bad || judgement === NoteSimulateJudgement.Miss;
+}
+
+/** Whether the current counter survives this result, including ignored results. */
 export function preservesCombo(judgement: NoteSimulateJudgement): boolean {
-  return judgement >= NoteSimulateJudgement.Great || judgement === NoteSimulateJudgement.Pass;
+  return (
+    judgement === NoteSimulateJudgement.Wait ||
+    judgement === NoteSimulateJudgement.Pass ||
+    incrementsCombo(judgement)
+  );
 }

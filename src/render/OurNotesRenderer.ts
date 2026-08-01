@@ -7,6 +7,7 @@ import {
   TextureLoader,
   Vector2,
   Vector3,
+  VideoTexture,
   WebGLRenderer,
 } from "three";
 import type { Texture } from "three";
@@ -403,6 +404,7 @@ export class OurNotesRenderer {
         ),
       )
       .project(this.camera).x;
+    this.hud?.setLaneProjection(this.laneProjectionLeftNdcX, this.laneProjectionRightNdcX);
   }
 
   async setBackgroundTexture(url?: string, loader = new TextureLoader()): Promise<void> {
@@ -428,6 +430,30 @@ export class OurNotesRenderer {
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
     previous?.dispose();
+  }
+
+  /** Bind a muted host-owned video as the lowest live-stage layer. */
+  setBackgroundVideo(video?: HTMLVideoElement): void {
+    if (this.disposed) return;
+    this.backgroundLoadRevision += 1;
+    const previous = this.backgroundTexture;
+    if (!video) {
+      this.backgroundTexture = undefined;
+      this.screenLane.setBackgroundTexture(undefined);
+      previous?.dispose();
+      return;
+    }
+    const texture = new VideoTexture(video);
+    texture.colorSpace = SRGBColorSpace;
+    texture.generateMipmaps = false;
+    this.backgroundTexture = texture;
+    this.screenLane.setBackgroundTexture(texture);
+    previous?.dispose();
+  }
+
+  refreshBackgroundLayout(): void {
+    if (this.disposed) return;
+    this.screenLane.refreshBackgroundLayout();
   }
 
   get stats(): OurNotesRendererStats {

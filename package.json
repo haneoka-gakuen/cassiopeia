@@ -59,10 +59,12 @@
   },
   "scripts": {
     "build": "vite build && vue-tsc -p tsconfig.build.json",
+    "benchmark": "pnpm run build && node benchmarks/runtime.mjs",
+    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs",
     "typecheck": "vue-tsc -p tsconfig.json --noEmit",
     "rust:check": "cargo check --workspace --all-targets",
     "rust:test": "cargo test --workspace",
-    "check": "pnpm run typecheck && pnpm run build && pnpm run rust:check && pnpm run rust:test",
+    "check": "pnpm run typecheck && pnpm run test:runtime && pnpm run rust:check && pnpm run rust:test",
     "prepack": "pnpm run check"
   },
   "publishConfig": {

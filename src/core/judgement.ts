@@ -1,4 +1,5 @@
 import { JudgeTiming, NoteDirection, NoteJudgementType, NoteSimulateJudgement } from "./enums";
+import { DEFAULT_ASSIST_LEVEL, getAssistTimingTable, type AssistLevel } from "./assist";
 
 export interface JudgeWindow {
   judgement: NoteSimulateJudgement;
@@ -6,16 +7,6 @@ export interface JudgeWindow {
   after: number;
 }
 
-const symmetric = (judgement: NoteSimulateJudgement, value: number): JudgeWindow => ({
-  judgement,
-  before: value,
-  after: value,
-});
-const window = (judgement: NoteSimulateJudgement, before: number, after: number): JudgeWindow => ({
-  judgement,
-  before,
-  after,
-});
 const J = NoteSimulateJudgement;
 
 /**
@@ -66,48 +57,13 @@ export function isTargetDirectionFlick(
   return dot >= threshold;
 }
 
-// MasterLiveJudgmentRangeParameter, assist level 0. Priority is strictest-first.
-const NORMAL = [
-  symmetric(J.Just, 1),
-  symmetric(J.Perfect, 42),
-  symmetric(J.Great, 83),
-  symmetric(J.Good, 108),
-  symmetric(J.Bad, 125),
-  symmetric(J.Miss, 130),
-];
-const FLICK = [
-  symmetric(J.Just, 1),
-  window(J.Perfect, 83, 58),
-  window(J.Great, 0, 83),
-  window(J.Good, 0, 108),
-  window(J.Bad, 0, 125),
-  window(J.Miss, 0, 130),
-];
-const SLIDE_END = [
-  window(J.Perfect, 42, 66),
-  window(J.Great, 99, 166),
-  window(J.Good, 124, 191),
-  window(J.Bad, 141, 208),
-  symmetric(J.Miss, 150),
-];
-const EASY = [symmetric(J.Just, 1), window(J.Perfect, 58, 66), window(J.Miss, 58, 130)];
-const TRACE = [window(J.Perfect, 58, 66), window(J.Miss, 58, 130)];
-
-export const JUDGE_WINDOWS: Readonly<Record<number, readonly JudgeWindow[]>> = {
-  [NoteJudgementType.Normal]: NORMAL,
-  [NoteJudgementType.SlideBegin]: NORMAL,
-  [NoteJudgementType.Flick]: FLICK,
-  [NoteJudgementType.SlideEndFlick]: FLICK,
-  [NoteJudgementType.SlideEnd]: SLIDE_END,
-  [NoteJudgementType.EasyNormal]: EASY,
-  [NoteJudgementType.SlideBeginEasy]: EASY,
-  [NoteJudgementType.Trace]: TRACE,
-  [NoteJudgementType.SlideEndTrace]: TRACE,
-};
+/** Level-zero compatibility view. Use the assist-aware helpers for new code. */
+export const JUDGE_WINDOWS: Readonly<Partial<Record<number, readonly JudgeWindow[]>>> =
+  getAssistTimingTable(DEFAULT_ASSIST_LEVEL);
 
 export const MAXIMUM_EARLY_WINDOW = Math.max(
   0,
-  ...Object.values(JUDGE_WINDOWS).flatMap((windows) => windows.map((item) => item.before)),
+  ...Object.values(JUDGE_WINDOWS).flatMap((windows) => (windows ?? []).map((item) => item.before)),
 );
 
 export interface JudgeResult {
@@ -115,8 +71,12 @@ export interface JudgeResult {
   timing: JudgeTiming;
 }
 
-export function judge(noteType: NoteJudgementType, diffMs: number): JudgeResult {
-  const windows = JUDGE_WINDOWS[noteType];
+export function judge(
+  noteType: NoteJudgementType,
+  diffMs: number,
+  assistLevel: AssistLevel = DEFAULT_ASSIST_LEVEL,
+): JudgeResult {
+  const windows = getAssistTimingTable(assistLevel)[noteType];
   if (!windows?.length) return { judgement: J.Miss, timing: JudgeTiming.OutOfTime };
   for (const item of windows) {
     if (diffMs < -item.before) continue;
@@ -128,10 +88,16 @@ export function judge(noteType: NoteJudgementType, diffMs: number): JudgeResult 
   return { judgement: J.Miss, timing: JudgeTiming.OutOfTime };
 }
 
-export function maximumLateWindow(noteType: NoteJudgementType): number {
-  return Math.max(0, ...(JUDGE_WINDOWS[noteType] ?? []).map((item) => item.after));
+export function maximumLateWindow(
+  noteType: NoteJudgementType,
+  assistLevel: AssistLevel = DEFAULT_ASSIST_LEVEL,
+): number {
+  return Math.max(0, ...(getAssistTimingTable(assistLevel)[noteType] ?? []).map((item) => item.after));
 }
 
-export function maximumEarlyWindow(noteType: NoteJudgementType): number {
-  return Math.max(0, ...(JUDGE_WINDOWS[noteType] ?? []).map((item) => item.before));
+export function maximumEarlyWindow(
+  noteType: NoteJudgementType,
+  assistLevel: AssistLevel = DEFAULT_ASSIST_LEVEL,
+): number {
+  return Math.max(0, ...(getAssistTimingTable(assistLevel)[noteType] ?? []).map((item) => item.before));
 }

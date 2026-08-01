@@ -379,26 +379,13 @@
           }
         },
         {
-          "label": "automatic miss after the late window",
+          "label": "late-window crossing enters the terminal state",
           "action": {
             "op": "update",
             "timeMs": 4131
           },
           "expect": {
             "events": [
-              {
-                "type": "judgement",
-                "noteId": 3,
-                "judgement": 1,
-                "timing": 4,
-                "diffMs": 131,
-                "judgedAtMs": 4131,
-                "combo": 0,
-                "maxCombo": 3,
-                "score": 460000,
-                "scoreDelta": 0,
-                "life": 900
-              },
               {
                 "type": "update"
               }
@@ -407,16 +394,16 @@
               "timeMs": 4131,
               "durationMs": 5000,
               "activeLongLine": false,
-              "combo": 0,
-              "fullCombo": false,
+              "combo": 3,
+              "fullCombo": true,
               "allPerfect": false,
               "perfectCombo": false,
               "maxCombo": 3,
               "score": 460000,
-              "life": 900,
-              "processed": 4,
+              "life": 1000,
+              "processed": 3,
               "total": 5,
-              "lastJudgementNoteId": 3,
+              "lastJudgementNoteId": 2,
               "lastSkillIndex": null,
               "callChangeIndex": null,
               "feverState": 1,
@@ -425,13 +412,26 @@
           }
         },
         {
-          "label": "advance after the break",
+          "label": "next update commits LastTiming",
           "action": {
             "op": "update",
             "timeMs": 5002
           },
           "expect": {
             "events": [
+              {
+                "type": "judgement",
+                "noteId": 3,
+                "judgement": 1,
+                "timing": 5,
+                "diffMs": 2147483647,
+                "judgedAtMs": 5002,
+                "combo": 0,
+                "maxCombo": 3,
+                "score": 460000,
+                "scoreDelta": 0,
+                "life": 900
+              },
               {
                 "type": "update"
               }
@@ -2437,7 +2437,52 @@
               },
               {
                 "type": "release",
+                "timeMs": 11,
+                "x": 0,
+                "lane": 0
+              }
+            ],
+            "snapshot": {
+              "timeMs": 0,
+              "durationMs": 0,
+              "activeLongLine": false,
+              "combo": 0,
+              "fullCombo": true,
+              "allPerfect": true,
+              "perfectCombo": false,
+              "maxCombo": 0,
+              "score": 0,
+              "life": 1000,
+              "processed": 0,
+              "total": 0,
+              "lastJudgementNoteId": null,
+              "lastSkillIndex": null,
+              "callChangeIndex": null,
+              "feverState": 1,
+              "feverSectionIndex": null
+            }
+          }
+        },
+        {
+          "label": "ended pointers flick then release without a stationary press",
+          "action": {
+            "op": "endInput"
+          },
+          "expect": {
+            "events": [
+              {
+                "type": "tap",
+                "timeMs": 10
+              },
+              {
+                "type": "flick",
                 "timeMs": 11
+              },
+              {
+                "type": "release",
+                "timeMs": 11,
+                "x": 100,
+                "lane": 10
               }
             ],
             "snapshot": {

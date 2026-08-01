@@ -7,15 +7,28 @@ import {
   NoteSimulateJudgement,
 } from "./enums";
 import type { ChartMode } from "./enums";
+import {
+  DEFAULT_ASSIST_LEVEL,
+  getAssistJudgementAreaOffset,
+  requireAssistLevel,
+  type AssistLevel,
+} from "./assist";
 import { isTargetLane, LANE_COUNT } from "./geometry";
 import {
   isTargetDirectionFlick,
   judge,
-  MAXIMUM_EARLY_WINDOW,
   maximumEarlyWindow as calculateMaximumEarlyWindow,
   maximumLateWindow as calculateMaximumLateWindow,
 } from "./judgement";
-import { contribution, LIFE_BASE, lifeDamage, normalizeScore, perfectCeiling, preservesCombo } from "./scoring";
+import {
+  breaksCombo,
+  contribution,
+  incrementsCombo,
+  LIFE_BASE,
+  lifeDamage,
+  normalizeScore,
+  perfectCeiling,
+} from "./scoring";
 import type {
   ChartCallChangeEvent,
   ChartDocument,
@@ -32,6 +45,7 @@ import type {
 export interface SessionOptions {
   mode?: ChartMode;
   judgementOffsetMs?: number;
+  assistLevel?: number;
 }
 
 export interface InputVector {
@@ -44,15 +58,25 @@ type PointerToken = number | typeof DEFAULT_POINTER;
 const DEFAULT_POINTER = Symbol("default-pointer");
 const EMPTY_LINE_IDS: readonly number[] = Object.freeze([]);
 
-const MAXIMUM_EARLY_BY_TYPE: number[] = [];
-const MAXIMUM_LATE_BY_TYPE: number[] = [];
-
-function maximumEarlyWindow(type: NoteJudgementType): number {
-  return (MAXIMUM_EARLY_BY_TYPE[type] ??= calculateMaximumEarlyWindow(type));
+function integerTimeMs(value: number): number {
+  return Number.isFinite(value) ? Math.floor(value) : 0;
 }
 
-function maximumLateWindow(type: NoteJudgementType): number {
-  return (MAXIMUM_LATE_BY_TYPE[type] ??= calculateMaximumLateWindow(type));
+function saturatingIncrement(value: number): number {
+  return value >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : value + 1;
+}
+
+const MAXIMUM_EARLY_BY_LEVEL_AND_TYPE: number[][] = [];
+const MAXIMUM_LATE_BY_LEVEL_AND_TYPE: number[][] = [];
+
+function maximumEarlyWindow(type: NoteJudgementType, assistLevel: AssistLevel): number {
+  const cache = (MAXIMUM_EARLY_BY_LEVEL_AND_TYPE[assistLevel] ??= []);
+  return (cache[type] ??= calculateMaximumEarlyWindow(type, assistLevel));
+}
+
+function maximumLateWindow(type: NoteJudgementType, assistLevel: AssistLevel): number {
+  const cache = (MAXIMUM_LATE_BY_LEVEL_AND_TYPE[assistLevel] ??= []);
+  return (cache[type] ??= calculateMaximumLateWindow(type, assistLevel));
 }
 
 export type ChartSessionEventMap = {
@@ -68,28 +92,13 @@ export type ChartSessionEventMap = {
  * LiveJudgementAreaOffsetSettings.GetJudgementAreaOffset using assist level 0
  * master data. Slide offsets interpolate by native note-lane width (4 -> 5).
  */
-export function nativeJudgementAreaOffsetX(type: JudgementAreaOffsetType, noteLaneWidth: number): number {
-  switch (type) {
-    case JudgementAreaOffsetType.Slide: {
-      const progress = Math.max(0, Math.min(1, (noteLaneWidth - 4) / (5 - 4)));
-      return 2 + (1 - 2) * progress;
-    }
-    case JudgementAreaOffsetType.SlideBegin:
-    case JudgementAreaOffsetType.SlideMin:
-      return 2;
-    case JudgementAreaOffsetType.SlideEnd:
-    case JudgementAreaOffsetType.Flick:
-      return 3;
-    case JudgementAreaOffsetType.Trace:
-    case JudgementAreaOffsetType.EasyDefault:
-    case JudgementAreaOffsetType.EasySlideBegin:
-      return 2.8;
-    case JudgementAreaOffsetType.SlideMax:
-    case JudgementAreaOffsetType.Default:
-    case JudgementAreaOffsetType.EnumMax:
-    default:
-      return 1;
-  }
+export function nativeJudgementAreaOffsetX(
+  type: JudgementAreaOffsetType,
+  noteLaneWidth: number,
+  assistLevel: AssistLevel = DEFAULT_ASSIST_LEVEL,
+): number {
+  if (type === JudgementAreaOffsetType.EnumMax) return getAssistJudgementAreaOffset(JudgementAreaOffsetType.Default, noteLaneWidth, assistLevel).x;
+  return getAssistJudgementAreaOffset(type, noteLaneWidth, assistLevel).x;
 }
 
 function isFlick(note: ChartNote): boolean {
@@ -133,6 +142,8 @@ export class ChartSession {
   mode: ChartMode;
   private readonly listeners = new Map<keyof ChartSessionEventMap, Set<(event: never) => void>>();
   private readonly processed = new Set<number>();
+  /** Notes that crossed the late boundary on the preceding simulator update. */
+  private readonly pendingLastTiming = new Map<number, ChartNote>();
   private readonly noteState: SessionNoteState = Object.freeze({
     isProcessed: (noteId: number): boolean => this.processed.has(noteId),
   });
@@ -145,6 +156,7 @@ export class ChartSession {
   private readonly longLineEndIdsByNoteId: ReadonlyMap<number, readonly number[]>;
   private readonly watchLongLineSpans: ReadonlyArray<{ startTimeMs: number; endTimeMs: number }>;
   private readonly longLineSpanById: ReadonlyMap<number, { startTimeMs: number; endTimeMs: number }>;
+  private readonly maximumEarlyMs: number;
   private readonly maximumLateMs: number;
   private readonly pointerLines = new Map<PointerToken, number>();
   private readonly linePointers = new Map<number, PointerToken>();
@@ -157,7 +169,8 @@ export class ChartSession {
   private contributionSum = 0;
   private score = 0;
   private combo = 0;
-  private perfectCombo = true;
+  private allPerfect = true;
+  private fullCombo = true;
   private maxCombo = 0;
   private life = LIFE_BASE;
   private lastJudgement: JudgementEvent | null = null;
@@ -171,13 +184,15 @@ export class ChartSession {
   private callChangeCursor = 0;
   /** First note which has not already been consumed; keeps rAF updates O(new notes). */
   private updateCursor = 0;
+  readonly assistLevel: AssistLevel;
 
   constructor(
     readonly chart: ChartDocument,
     options: SessionOptions = {},
   ) {
     this.mode = options.mode ?? "watch";
-    this.judgementOffsetMs = options.judgementOffsetMs ?? 0;
+    this.assistLevel = requireAssistLevel(options.assistLevel ?? DEFAULT_ASSIST_LEVEL);
+    this.judgementOffsetMs = integerTimeMs(options.judgementOffsetMs ?? 0);
     this.playableNotes = chart.notes.filter((note) => note.judged);
     const longLines = chart.lines.filter((line) => line.kind === "long");
     const memberships = new Map<number, number[]>();
@@ -222,8 +237,12 @@ export class ChartSession {
       else mergedSpans.push(span);
     }
     this.watchLongLineSpans = mergedSpans;
+    this.maximumEarlyMs = this.playableNotes.reduce(
+      (maximum, note) => Math.max(maximum, maximumEarlyWindow(note.judgementType, this.assistLevel)),
+      0,
+    );
     this.maximumLateMs = this.playableNotes.reduce(
-      (maximum, note) => Math.max(maximum, maximumLateWindow(note.judgementType)),
+      (maximum, note) => Math.max(maximum, maximumLateWindow(note.judgementType, this.assistLevel)),
       0,
     );
     this.ceiling = perfectCeiling(this.playableNotes.map((note) => note.operateType));
@@ -236,6 +255,8 @@ export class ChartSession {
       durationMs: chart.durationMs,
       activeLongLine: false,
       combo: 0,
+      fullCombo: true,
+      allPerfect: true,
       perfectCombo: false,
       maxCombo: 0,
       score: 0,
@@ -260,7 +281,7 @@ export class ChartSession {
   }
 
   setOffset(milliseconds: number): void {
-    this.judgementOffsetMs = milliseconds;
+    this.judgementOffsetMs = integerTimeMs(milliseconds);
   }
 
   setMode(mode: ChartMode): void {
@@ -287,8 +308,34 @@ export class ChartSession {
     return snapshot;
   }
 
+  /**
+   * Settles the score after media playback stops. Exact-duration notes remain
+   * eligible until this exclusive terminal update, and play mode preserves the
+   * two-update last-timing transition before every note becomes processed.
+   */
+  finish(timeMs = this.chart.durationMs): SessionSnapshot {
+    const terminalTimeMs = saturatingIncrement(integerTimeMs(timeMs));
+    if (this.mode === "watch") {
+      this.advance(Math.max(this.timeMs, terminalTimeMs));
+    } else if (this.mode === "play") {
+      const lastNoteTimeMs = this.playableNotes.at(-1)?.timeMs ?? terminalTimeMs;
+      const updateCeilingMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(terminalTimeMs, lastNoteTimeMs + 2_000),
+      );
+      const settleTimeMs = Math.max(this.timeMs, updateCeilingMs);
+      this.advance(settleTimeMs);
+      if (this.pendingLastTiming.size > 0) this.advance(settleTimeMs);
+    } else {
+      this.advance(Math.max(this.timeMs, terminalTimeMs));
+    }
+    const snapshot = this.snapshot();
+    this.emit("update", snapshot);
+    return snapshot;
+  }
+
   private advance(timeMs: number): void {
-    const nextTimeMs = Number.isFinite(timeMs) ? timeMs : 0;
+    const nextTimeMs = integerTimeMs(timeMs);
     if (nextTimeMs + 5 < this.timeMs) this.reset(nextTimeMs);
     // Positive BGM offsets create a real pre-roll before chart time zero.
     // Keeping that time negative prevents watch mode from consuming tick-zero
@@ -299,25 +346,35 @@ export class ChartSession {
     if (this.mode === "watch") {
       while (this.updateCursor < this.playableNotes.length) {
         const note = this.playableNotes[this.updateCursor]!;
-        if (note.timeMs > this.timeMs) break;
+        if (note.timeMs >= this.timeMs) break;
         if (this.processed.has(note.id)) this.updateCursor++;
         else this.apply(note, NoteSimulateJudgement.Perfect, JudgeTiming.Auto, 0, this.timeMs);
       }
     } else if (this.mode === "play") {
-      while (this.updateCursor < this.playableNotes.length) {
-        const note = this.playableNotes[this.updateCursor]!;
-        if (this.processed.has(note.id)) {
-          this.updateCursor++;
-          continue;
+      // Crossing the late boundary only enters PlayingLast. The next updater
+      // call commits the terminal result and makes the note Done.
+      for (const [noteId, note] of this.pendingLastTiming) {
+        this.pendingLastTiming.delete(noteId);
+        if (!this.processed.has(noteId)) {
+          this.apply(
+            note,
+            NoteSimulateJudgement.Miss,
+            JudgeTiming.LastTiming,
+            2_147_483_647,
+            this.timeMs,
+          );
         }
-        if (note.timeMs + maximumLateWindow(note.judgementType) >= this.timeMs + this.judgementOffsetMs) break;
-        this.apply(
-          note,
-          NoteSimulateJudgement.Miss,
-          JudgeTiming.OutOfTime,
-          this.timeMs + this.judgementOffsetMs - note.timeMs,
-          this.timeMs,
-        );
+      }
+
+      const adjustedTimeMs = this.timeMs + this.judgementOffsetMs;
+      for (let index = this.updateCursor; index < this.playableNotes.length; index++) {
+        const note = this.playableNotes[index]!;
+        if (note.timeMs >= adjustedTimeMs) break;
+        if (this.processed.has(note.id) || this.pendingLastTiming.has(note.id)) continue;
+        // Late-window widths vary by note type, so a still-live earlier note
+        // cannot terminate the scan for later notes with narrower windows.
+        if (note.timeMs + maximumLateWindow(note.judgementType, this.assistLevel) >= adjustedTimeMs) continue;
+        this.pendingLastTiming.set(note.id, note);
       }
     }
   }
@@ -352,7 +409,7 @@ export class ChartSession {
   hasInputCandidate(lane: number, inputTimeMs = this.timeMs, pointerId?: number): boolean {
     if (this.mode !== "play") return false;
     if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return false;
-    const adjustedTime = inputTimeMs + this.judgementOffsetMs;
+    const adjustedTime = integerTimeMs(inputTimeMs) + this.judgementOffsetMs;
     const pointer = this.pointerToken(pointerId);
     let low = 0;
     let high = this.playableNotes.length;
@@ -365,7 +422,7 @@ export class ChartSession {
     for (let index = low; index < this.playableNotes.length; index++) {
       const note = this.playableNotes[index]!;
       const diff = adjustedTime - note.timeMs;
-      if (diff < -MAXIMUM_EARLY_WINDOW) break;
+      if (diff < -this.maximumEarlyMs) break;
       if (this.candidateDistance(note, diff, lane, pointer, acceptsAnyInput) >= 0) return true;
     }
     return false;
@@ -377,10 +434,12 @@ export class ChartSession {
 
   reset(timeMs = 0): SessionSnapshot {
     this.processed.clear();
+    this.pendingLastTiming.clear();
     this.contributionSum = 0;
     this.score = 0;
     this.combo = 0;
-    this.perfectCombo = true;
+    this.allPerfect = true;
+    this.fullCombo = true;
     this.maxCombo = 0;
     this.life = LIFE_BASE;
     this.lastJudgement = null;
@@ -388,7 +447,7 @@ export class ChartSession {
     this.callChange = null;
     this.feverState = FeverState.Wait;
     this.feverSection = null;
-    const nextTimeMs = Number.isFinite(timeMs) ? timeMs : 0;
+    const nextTimeMs = integerTimeMs(timeMs);
     this.timeMs = nextTimeMs;
     this.updateCursor = 0;
     this.executedSkills.fill(0);
@@ -405,7 +464,7 @@ export class ChartSession {
       // of new player input events.
       while (this.updateCursor < this.playableNotes.length) {
         const note = this.playableNotes[this.updateCursor]!;
-        if (note.timeMs > this.timeMs) break;
+        if (note.timeMs >= this.timeMs) break;
         this.apply(note, NoteSimulateJudgement.Perfect, JudgeTiming.Auto, 0, this.timeMs, false);
       }
     } else if (this.mode === "play" && nextTimeMs > 0) {
@@ -414,7 +473,7 @@ export class ChartSession {
       // score, combo or judgment-event side effects.
       const adjustedTime = this.timeMs + this.judgementOffsetMs;
       for (const note of this.playableNotes) {
-        if (note.timeMs + maximumLateWindow(note.judgementType) >= adjustedTime) break;
+        if (note.timeMs + maximumLateWindow(note.judgementType, this.assistLevel) >= adjustedTime) break;
         this.processed.add(note.id);
       }
       // Seeking into the middle of a long note cannot recreate its original
@@ -446,7 +505,9 @@ export class ChartSession {
     target.durationMs = this.chart.durationMs;
     target.activeLongLine = this.hasActiveLongLine();
     target.combo = this.combo;
-    target.perfectCombo = this.combo > 0 && this.perfectCombo;
+    target.fullCombo = this.fullCombo;
+    target.allPerfect = this.allPerfect;
+    target.perfectCombo = this.combo > 0 && this.allPerfect;
     target.maxCombo = this.maxCombo;
     target.score = this.score;
     target.life = this.life;
@@ -471,7 +532,8 @@ export class ChartSession {
   ): JudgementEvent | null {
     if (this.mode !== "play") return null;
     if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return null;
-    const adjustedTime = inputTimeMs + this.judgementOffsetMs;
+    const judgedAtMs = integerTimeMs(inputTimeMs);
+    const adjustedTime = judgedAtMs + this.judgementOffsetMs;
     const pointer = this.pointerToken(pointerId);
     let low = 0;
     let high = this.playableNotes.length;
@@ -487,13 +549,13 @@ export class ChartSession {
     for (let index = low; index < this.playableNotes.length; index++) {
       const note = this.playableNotes[index]!;
       const diff = adjustedTime - note.timeMs;
-      if (diff < -MAXIMUM_EARLY_WINDOW) {
+      if (diff < -this.maximumEarlyMs) {
         end = index;
         break;
       }
       const distance = this.candidateDistance(note, diff, lane, pointer, predicate);
       if (distance < 0) continue;
-      if (distance < candidateDistance || (distance === candidateDistance && note.id < candidate!.id)) {
+      if (distance < candidateDistance) {
         candidate = note;
         candidateDistance = distance;
       }
@@ -512,14 +574,14 @@ export class ChartSession {
         if (this.candidateDistance(note, diff, lane, pointer, predicate) !== candidateDistance) continue;
         if (note.timeMs !== candidate.timeMs || !notesOverlap(note, candidate)) continue;
         if (!isTargetDirectionFlick(note.direction, flickVector)) continue;
-        if (!directional || note.id < directional.id) directional = note;
+        if (!directional) directional = note;
       }
       if (directional) candidate = directional;
     }
 
     const diffMs = adjustedTime - candidate.timeMs;
-    const result = judge(candidate.judgementType, diffMs);
-    const event = this.apply(candidate, result.judgement, result.timing, diffMs, inputTimeMs);
+    const result = judge(candidate.judgementType, diffMs, this.assistLevel);
+    const event = this.apply(candidate, result.judgement, result.timing, diffMs, judgedAtMs);
     const startLineId = this.availableStartLine(candidate, pointer);
     if (startLineId !== null && result.judgement !== NoteSimulateJudgement.Miss) {
       this.bindPointer(pointer, startLineId);
@@ -535,9 +597,20 @@ export class ChartSession {
     pointer: PointerToken,
     predicate: (note: ChartNote) => boolean,
   ): number {
-    if (this.processed.has(note.id) || !predicate(note)) return -1;
-    if (diff < -maximumEarlyWindow(note.judgementType) || diff > maximumLateWindow(note.judgementType)) return -1;
-    if (!isTargetLane(note, lane, nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size))) return -1;
+    if (this.processed.has(note.id) || this.pendingLastTiming.has(note.id) || !predicate(note)) return -1;
+    if (
+      diff < -maximumEarlyWindow(note.judgementType, this.assistLevel) ||
+      diff > maximumLateWindow(note.judgementType, this.assistLevel)
+    )
+      return -1;
+    if (
+      !isTargetLane(
+        note,
+        lane,
+        nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size, this.assistLevel),
+      )
+    )
+      return -1;
     if (!this.isAvailableToPointer(note, pointer)) return -1;
     return Math.abs(diff);
   }
@@ -551,18 +624,19 @@ export class ChartSession {
     notify = true,
   ): JudgementEvent {
     const previousScore = this.score;
+    this.pendingLastTiming.delete(note.id);
     this.processed.add(note.id);
     this.advanceUpdateCursor();
     if (isLineEnd(note)) this.unbindEndingLines(note);
-    if (preservesCombo(judgement)) {
-      if (this.combo === 0) this.perfectCombo = true;
-      this.perfectCombo =
-        this.perfectCombo && (judgement === NoteSimulateJudgement.Perfect || judgement === NoteSimulateJudgement.Just);
+    if (incrementsCombo(judgement)) {
+      this.allPerfect =
+        this.allPerfect && (judgement === NoteSimulateJudgement.Perfect || judgement === NoteSimulateJudgement.Just);
       this.combo++;
       this.maxCombo = Math.max(this.maxCombo, this.combo);
-    } else {
+    } else if (breaksCombo(judgement)) {
       this.combo = 0;
-      this.perfectCombo = true;
+      this.allPerfect = false;
+      this.fullCombo = false;
     }
     this.life = Math.max(0, this.life - lifeDamage(judgement));
     this.contributionSum += contribution(judgement, note.operateType, this.combo);

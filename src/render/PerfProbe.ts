@@ -8,6 +8,7 @@ export interface ChartPerfRange {
 
 export interface ChartPerfSummary {
   frameCount: number;
+  sessionMs: ChartPerfRange;
   buildMs: ChartPerfRange;
   renderMs: ChartPerfRange;
   totalMs: ChartPerfRange;
@@ -27,8 +28,10 @@ export interface ChartPerfSummary {
 export class ChartPerfProbe {
   private readonly capacity: number;
   private readonly intervalMs: number;
+  private readonly sessionSamples: Float64Array;
   private readonly buildSamples: Float64Array;
   private readonly renderSamples: Float64Array;
+  private readonly totalSamples: Float64Array;
   private readonly drawCallSamples: Float64Array;
   private readonly triangleSamples: Float64Array;
   private readonly noteSamples: Uint32Array;
@@ -43,8 +46,10 @@ export class ChartPerfProbe {
   constructor(capacity = 240, intervalMs = 500) {
     this.capacity = Math.max(1, Math.floor(capacity));
     this.intervalMs = Math.max(1, intervalMs);
+    this.sessionSamples = new Float64Array(this.capacity);
     this.buildSamples = new Float64Array(this.capacity);
     this.renderSamples = new Float64Array(this.capacity);
+    this.totalSamples = new Float64Array(this.capacity);
     this.drawCallSamples = new Float64Array(this.capacity);
     this.triangleSamples = new Float64Array(this.capacity);
     this.noteSamples = new Uint32Array(this.capacity);
@@ -54,10 +59,12 @@ export class ChartPerfProbe {
     this.scratch = new Float64Array(this.capacity);
   }
 
-  record(buildMs: number, renderMs: number, stats: OurNotesRendererStats): void {
+  record(sessionMs: number, buildMs: number, renderMs: number, totalMs: number, stats: OurNotesRendererStats): void {
     const index = this.cursor;
+    this.sessionSamples[index] = sessionMs;
     this.buildSamples[index] = buildMs;
     this.renderSamples[index] = renderMs;
+    this.totalSamples[index] = totalMs;
     this.drawCallSamples[index] = stats.drawCalls;
     this.triangleSamples[index] = stats.triangles;
     this.noteSamples[index] = stats.activeNoteVisuals;
@@ -88,9 +95,10 @@ export class ChartPerfProbe {
     }
     const summary = {
       frameCount: this.count,
+      sessionMs: this.range(this.sessionSamples),
       buildMs: this.range(this.buildSamples),
       renderMs: this.range(this.renderSamples),
-      totalMs: this.totalRange(),
+      totalMs: this.range(this.totalSamples),
       drawCalls: this.range(this.drawCallSamples),
       triangles: this.range(this.triangleSamples),
       maximumActiveNotes,
@@ -105,13 +113,6 @@ export class ChartPerfProbe {
 
   private range(samples: Float64Array): ChartPerfRange {
     for (let index = 0; index < this.count; index += 1) this.scratch[index] = samples[index]!;
-    return this.sortedRange();
-  }
-
-  private totalRange(): ChartPerfRange {
-    for (let index = 0; index < this.count; index += 1) {
-      this.scratch[index] = this.buildSamples[index]! + this.renderSamples[index]!;
-    }
     return this.sortedRange();
   }
 

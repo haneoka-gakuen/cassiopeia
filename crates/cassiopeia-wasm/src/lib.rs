@@ -94,6 +94,18 @@ impl WasmRuntime {
         self.event_count()
     }
 
+    /// Settles exact-tail and post-music note states after media playback ends.
+    pub fn finish(&mut self, time_micros: i64) -> Result<u32, JsError> {
+        self.event_words.clear();
+        let events = self
+            .session
+            .finish(TimeMicros(time_micros))
+            .map_err(js_error)?;
+        self.write_events(events.iter()).map_err(js_error)?;
+        self.refresh_snapshot().map_err(js_error)?;
+        self.event_count()
+    }
+
     pub fn reset(&mut self, time_micros: i64) -> Result<(), JsError> {
         self.event_words.clear();
         self.session
