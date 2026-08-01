@@ -44,29 +44,56 @@ impl TryFrom<i8> for Judgement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[repr(i8)]
+#[serde(try_from = "i8", into = "i8")]
 pub enum JudgeTiming {
-    None,
-    Fast,
-    Late,
-    Auto,
-    OutOfTime,
+    None = 0,
+    Fast = 1,
+    Late = 2,
+    Auto = 3,
+    OutOfTime = 4,
+    LastTiming = 5,
+    Force = 6,
+}
+
+impl From<JudgeTiming> for i8 {
+    fn from(timing: JudgeTiming) -> Self {
+        timing as Self
+    }
+}
+
+impl TryFrom<i8> for JudgeTiming {
+    type Error = String;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Fast),
+            2 => Ok(Self::Late),
+            3 => Ok(Self::Auto),
+            4 => Ok(Self::OutOfTime),
+            5 => Ok(Self::LastTiming),
+            6 => Ok(Self::Force),
+            _ => Err(format!("invalid judge timing value: {value}")),
+        }
+    }
 }
 
 /// Selects one of the built-in timing-window sets.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[repr(i16)]
 #[serde(rename_all = "camelCase")]
 pub enum NoteJudgementType {
-    None,
-    Normal,
-    EasyNormal,
-    Flick,
-    SlideBegin,
-    SlideEnd,
-    SlideEndFlick,
-    SlideBeginEasy,
-    Trace,
-    SlideEndTrace,
+    None = 0,
+    Normal = 1,
+    EasyNormal = 2,
+    Flick = 5,
+    SlideBegin = 10,
+    SlideEnd = 11,
+    SlideEndFlick = 12,
+    SlideBeginEasy = 15,
+    Trace = 21,
+    SlideEndTrace = 22,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,6 +419,22 @@ mod tests {
         }
         assert!(Judgement::try_from(8).is_err());
 
+        let timing_codes = [
+            (JudgeTiming::None, 0),
+            (JudgeTiming::Fast, 1),
+            (JudgeTiming::Late, 2),
+            (JudgeTiming::Auto, 3),
+            (JudgeTiming::OutOfTime, 4),
+            (JudgeTiming::LastTiming, 5),
+            (JudgeTiming::Force, 6),
+        ];
+        for (timing, code) in timing_codes {
+            assert_eq!(i8::from(timing), code);
+            assert_eq!(JudgeTiming::try_from(code).unwrap(), timing);
+            assert_eq!(serde_json::to_value(timing).unwrap(), code);
+        }
+        assert!(JudgeTiming::try_from(7).is_err());
+
         let result = JudgeResult {
             judgement: Judgement::Perfect,
             timing: JudgeTiming::OutOfTime,
@@ -400,7 +443,7 @@ mod tests {
             serde_json::to_value(result).unwrap(),
             serde_json::json!({
                 "judgement": 5,
-                "timing": "outOfTime"
+                "timing": 4
             })
         );
     }

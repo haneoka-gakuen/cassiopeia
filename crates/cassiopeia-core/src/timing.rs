@@ -14,6 +14,26 @@ pub struct Tick(pub i64);
 #[serde(transparent)]
 pub struct TimeMicros(pub i64);
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TimeMillis(pub i64);
+
+impl TimeMicros {
+    /// Host compatibility quantization using a strict floor to whole milliseconds.
+    pub const fn floor_to_millis(self) -> TimeMillis {
+        TimeMillis(self.0.div_euclid(1_000))
+    }
+}
+
+impl TimeMillis {
+    pub fn to_micros(self) -> Result<TimeMicros, TempoMapError> {
+        self.0
+            .checked_mul(1_000)
+            .map(TimeMicros)
+            .ok_or(TempoMapError::Overflow)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RoundingProfile {
@@ -210,5 +230,13 @@ mod tests {
 
         assert_eq!(map.time_at_tick(Tick(-480)).unwrap(), TimeMicros(-500_000));
         assert_eq!(map.time_at_tick(Tick(0)).unwrap(), TimeMicros(0));
+    }
+
+    #[test]
+    fn host_integer_millisecond_quantization_has_explicit_sub_millisecond_edges() {
+        assert_eq!(TimeMicros(999).floor_to_millis(), TimeMillis(0));
+        assert_eq!(TimeMicros(1_001).floor_to_millis(), TimeMillis(1));
+        assert_eq!(TimeMillis(0).to_micros().unwrap(), TimeMicros(0));
+        assert_eq!(TimeMillis(1).to_micros().unwrap(), TimeMicros(1_000));
     }
 }

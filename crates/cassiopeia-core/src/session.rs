@@ -4,7 +4,11 @@ use std::fmt;
 
 use crate::judgement::{
     JudgeResult, JudgeTiming, Judgement, NoteJudgementType, is_within_window, judge,
-    maximum_late_ms,
+    maximum_early_ms, maximum_late_ms,
+};
+use crate::runtime::{
+    LanePosition, NoteDirection, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1,
+    RuntimeNoteV1, is_target_lane, notes_overlap,
 };
 use crate::scoring::{
     ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
@@ -58,12 +62,12 @@ pub enum InputAction {
     Cancel,
 }
 
-/// Host-resolved gameplay input.
+/// Compatibility input carrying a host-resolved gameplay target.
 ///
 /// Browser hosts quantize their millisecond clock to signed integer
-/// microseconds exactly once before constructing this value. Candidate geometry
-/// remains a host concern until its floating-point compatibility profile is
-/// represented explicitly; `target_note_id` therefore names the selected note.
+/// microseconds exactly once before constructing this value. New integrations
+/// use [`RuntimeInputEvent`]; this form remains available for differential
+/// traces and staged host migration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InputEvent {
@@ -73,6 +77,18 @@ pub struct InputEvent {
     pub pointer_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_note_id: Option<String>,
+    pub action: InputAction,
+}
+
+/// Primary unresolved input consumed by the Rust candidate selector.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RuntimeInputEvent {
+    pub sequence: u64,
+    pub time: TimeMicros,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_id: Option<u32>,
+    pub lane: LanePosition,
     pub action: InputAction,
 }
 
@@ -100,8 +116,10 @@ pub struct SessionSnapshot {
     pub time: TimeMicros,
     pub judgement_offset: TimeMicros,
     pub combo: u32,
-    /// All-Perfect state for the entire run; it never recovers after loss.
+    /// Compatibility HUD state: active combo and an unbroken All-Perfect run.
     pub perfect_combo: bool,
+    /// All-Perfect state for the entire run, including before the first note.
+    pub all_perfect: bool,
     /// Full-Combo state for the entire run; only Bad or Miss clears it.
     pub full_combo: bool,
     pub max_combo: u32,
@@ -124,6 +142,8 @@ pub enum SessionError {
     NonMonotonicInput { previous: u64, received: u64 },
     TimeOverflow,
     CounterOverflow,
+    RuntimeUnavailable,
+    Runtime(RuntimeChartError),
     Score(ScoreError),
 }
 
@@ -142,6 +162,10 @@ impl fmt::Display for SessionError {
             ),
             Self::TimeOverflow => formatter.write_str("session time calculation overflowed"),
             Self::CounterOverflow => formatter.write_str("session counter overflowed"),
+            Self::RuntimeUnavailable => {
+                formatter.write_str("this session has no RuntimeChartV1 candidate state")
+            }
+            Self::Runtime(error) => error.fmt(formatter),
             Self::Score(error) => error.fmt(formatter),
         }
     }
@@ -152,6 +176,221 @@ impl std::error::Error for SessionError {}
 impl From<ScoreError> for SessionError {
     fn from(error: ScoreError) -> Self {
         Self::Score(error)
+    }
+}
+
+impl From<RuntimeChartError> for SessionError {
+    fn from(error: RuntimeChartError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerToken(u64);
+
+impl PointerToken {
+    const DEFAULT: Self = Self(u64::MAX);
+
+    const fn from_id(pointer_id: Option<u32>) -> Self {
+        match pointer_id {
+            Some(id) => Self(id as u64),
+            None => Self::DEFAULT,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeNoteState {
+    note: RuntimeNoteV1,
+    line_indices: Vec<usize>,
+    start_line_indices: Vec<usize>,
+    end_line_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeLineState {
+    id: u32,
+    member_note_indices: Vec<usize>,
+    start_note_index: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeState {
+    notes: Vec<RuntimeNoteState>,
+    lines: Vec<RuntimeLineState>,
+    line_owners: Vec<Option<PointerToken>>,
+    pointer_bindings: Vec<(PointerToken, usize)>,
+    maximum_early_micros: i64,
+    maximum_late_micros: i64,
+}
+
+impl RuntimeState {
+    fn new(playable_notes: Vec<RuntimeNoteV1>, source_lines: &[RuntimeLineV1]) -> Self {
+        let note_index: BTreeMap<_, _> = playable_notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| (note.id, index))
+            .collect();
+        let mut notes: Vec<_> = playable_notes
+            .into_iter()
+            .map(|note| RuntimeNoteState {
+                note,
+                line_indices: Vec::new(),
+                start_line_indices: Vec::new(),
+                end_line_indices: Vec::new(),
+            })
+            .collect();
+        let mut lines = Vec::new();
+        for source in source_lines
+            .iter()
+            .filter(|line| line.kind == RuntimeLineKind::Long)
+        {
+            let line_index = lines.len();
+            let member_note_indices: Vec<_> = source
+                .note_ids
+                .iter()
+                .filter_map(|note_id| note_index.get(note_id).copied())
+                .collect();
+            for note_index in &member_note_indices {
+                notes[*note_index].line_indices.push(line_index);
+            }
+            let start_note_index = source
+                .note_ids
+                .first()
+                .and_then(|note_id| note_index.get(note_id).copied());
+            if let Some(note_index) = start_note_index {
+                notes[note_index].start_line_indices.push(line_index);
+            }
+            if let Some(note_index) = source
+                .note_ids
+                .last()
+                .and_then(|note_id| note_index.get(note_id).copied())
+            {
+                notes[note_index].end_line_indices.push(line_index);
+            }
+            lines.push(RuntimeLineState {
+                id: source.id,
+                member_note_indices,
+                start_note_index,
+            });
+        }
+        let maximum_early_micros = notes
+            .iter()
+            .map(|note| i64::from(maximum_early_ms(note.note.judgement_type)) * 1_000)
+            .max()
+            .unwrap_or(0);
+        let maximum_late_micros = notes
+            .iter()
+            .map(|note| i64::from(maximum_late_ms(note.note.judgement_type)) * 1_000)
+            .max()
+            .unwrap_or(0);
+        let line_count = lines.len();
+        Self {
+            notes,
+            lines,
+            line_owners: vec![None; line_count],
+            pointer_bindings: Vec::with_capacity(line_count),
+            maximum_early_micros,
+            maximum_late_micros,
+        }
+    }
+
+    fn clear_ownership(&mut self) {
+        self.line_owners.fill(None);
+        self.pointer_bindings.clear();
+    }
+
+    fn pointer_line_index(&self, pointer: PointerToken) -> Option<usize> {
+        self.pointer_bindings
+            .iter()
+            .find_map(|(candidate, line_index)| (*candidate == pointer).then_some(*line_index))
+    }
+
+    fn is_available_to_pointer(&self, note_index: usize, pointer: PointerToken) -> bool {
+        let note = &self.notes[note_index];
+        if note.line_indices.is_empty() {
+            return true;
+        }
+        if !note.start_line_indices.is_empty() {
+            return self.available_start_line(note_index, pointer).is_some();
+        }
+        let Some(line_index) = self.pointer_line_index(pointer) else {
+            return false;
+        };
+        note.line_indices.contains(&line_index) && self.line_owners[line_index] == Some(pointer)
+    }
+
+    fn available_start_line(&self, note_index: usize, pointer: PointerToken) -> Option<usize> {
+        let starts = &self.notes[note_index].start_line_indices;
+        let current_line = self.pointer_line_index(pointer);
+        if let Some(line_index) = current_line
+            && starts.contains(&line_index)
+            && self.line_owners[line_index] == Some(pointer)
+        {
+            return Some(line_index);
+        }
+        if current_line.is_some() {
+            return None;
+        }
+        starts.iter().copied().find(|line_index| {
+            self.line_owners[*line_index].is_none()
+                || self.line_owners[*line_index] == Some(pointer)
+        })
+    }
+
+    fn bind_pointer(&mut self, pointer: PointerToken, line_index: usize) {
+        self.unbind_pointer(pointer);
+        self.unbind_line(line_index);
+        self.line_owners[line_index] = Some(pointer);
+        self.pointer_bindings.push((pointer, line_index));
+    }
+
+    fn unbind_pointer(&mut self, pointer: PointerToken) {
+        let Some(binding_index) = self
+            .pointer_bindings
+            .iter()
+            .position(|(candidate, _)| *candidate == pointer)
+        else {
+            return;
+        };
+        let (_, line_index) = self.pointer_bindings.swap_remove(binding_index);
+        if self.line_owners[line_index] == Some(pointer) {
+            self.line_owners[line_index] = None;
+        }
+    }
+
+    fn unbind_line(&mut self, line_index: usize) {
+        let Some(pointer) = self.line_owners[line_index].take() else {
+            return;
+        };
+        if let Some(binding_index) =
+            self.pointer_bindings
+                .iter()
+                .position(|(candidate, candidate_line)| {
+                    *candidate == pointer && *candidate_line == line_index
+                })
+        {
+            self.pointer_bindings.swap_remove(binding_index);
+        }
+    }
+
+    fn unbind_ending_lines(&mut self, note_index: usize) {
+        for index in 0..self.notes[note_index].end_line_indices.len() {
+            let line_index = self.notes[note_index].end_line_indices[index];
+            self.unbind_line(line_index);
+        }
+    }
+
+    fn line_is_owned(&self, line_id: u32) -> bool {
+        self.lines
+            .iter()
+            .position(|line| line.id == line_id)
+            .is_some_and(|index| self.line_owners[index].is_some())
+    }
+
+    fn pointer_line_id(&self, pointer: PointerToken) -> Option<u32> {
+        self.pointer_line_index(pointer)
+            .map(|line_index| self.lines[line_index].id)
     }
 }
 
@@ -174,13 +413,14 @@ pub struct GameplaySession {
     judgement_offset: TimeMicros,
     time: TimeMicros,
     combo: u32,
-    perfect_combo: bool,
+    all_perfect: bool,
     full_combo: bool,
     max_combo: u32,
     score: u32,
     life: u32,
     last_judgement: Option<JudgementEvent>,
     last_input_sequence: Option<u64>,
+    runtime: Option<RuntimeState>,
 }
 
 impl GameplaySession {
@@ -217,14 +457,42 @@ impl GameplaySession {
             judgement_offset,
             time: TimeMicros(0),
             combo: 0,
-            perfect_combo: true,
+            all_perfect: true,
             full_combo: true,
             max_combo: 0,
             score: 0,
             life: LIFE_BASE,
             last_judgement: None,
             last_input_sequence: None,
+            runtime: None,
         })
+    }
+
+    pub fn from_runtime_chart(
+        chart: RuntimeChartV1,
+        mode: SessionMode,
+        judgement_offset: TimeMicros,
+    ) -> Result<Self, SessionError> {
+        chart.validate()?;
+        let playable_notes: Vec<_> = chart
+            .notes
+            .iter()
+            .filter(|note| note.judged)
+            .cloned()
+            .collect();
+        let notes = playable_notes
+            .iter()
+            .map(|note| GameplayNote {
+                id: note.id.to_string(),
+                time: note.time,
+                judgement_type: note.judgement_type,
+                operate_type: note.operate_type,
+            })
+            .collect();
+        let runtime = RuntimeState::new(playable_notes, &chart.lines);
+        let mut session = Self::new(notes, mode, judgement_offset)?;
+        session.runtime = Some(runtime);
+        Ok(session)
     }
 
     pub fn mode(&self) -> SessionMode {
@@ -259,7 +527,8 @@ impl GameplaySession {
             time: self.time,
             judgement_offset: self.judgement_offset,
             combo: self.combo,
-            perfect_combo: self.combo > 0 && self.perfect_combo,
+            perfect_combo: self.combo > 0 && self.all_perfect,
+            all_perfect: self.all_perfect,
             full_combo: self.full_combo,
             max_combo: self.max_combo,
             score: self.score,
@@ -271,7 +540,213 @@ impl GameplaySession {
         }
     }
 
-    /// Applies a host-resolved input. A valid but non-matching input returns
+    /// Selects and consumes a candidate entirely inside the Rust kernel.
+    pub fn consume_runtime_input(
+        &mut self,
+        input: &RuntimeInputEvent,
+    ) -> Result<Option<JudgementEvent>, SessionError> {
+        if self.mode != SessionMode::Play {
+            return Ok(None);
+        }
+        self.validate_sequence(input.sequence)?;
+        if self.runtime.is_none() {
+            return Err(SessionError::RuntimeUnavailable);
+        }
+        let pointer = PointerToken::from_id(input.pointer_id);
+        if input.action == InputAction::Cancel {
+            self.runtime
+                .as_mut()
+                .expect("runtime presence was checked")
+                .unbind_pointer(pointer);
+            self.last_input_sequence = Some(input.sequence);
+            return Ok(None);
+        }
+
+        let adjusted_time = input
+            .time
+            .0
+            .checked_add(self.judgement_offset.0)
+            .map(TimeMicros)
+            .ok_or(SessionError::TimeOverflow)?;
+        let selection =
+            self.select_runtime_candidate(input.lane, adjusted_time, pointer, Some(input.action))?;
+        let Some(index) = selection else {
+            if input.action == InputAction::Release {
+                self.runtime
+                    .as_mut()
+                    .expect("runtime presence was checked")
+                    .unbind_pointer(pointer);
+            }
+            self.last_input_sequence = Some(input.sequence);
+            return Ok(None);
+        };
+
+        let (difference, result, start_line, line_end) = {
+            let runtime = self.runtime.as_ref().expect("runtime presence was checked");
+            let note = &runtime.notes[index].note;
+            let difference = adjusted_time
+                .0
+                .checked_sub(note.time.0)
+                .map(TimeMicros)
+                .ok_or(SessionError::TimeOverflow)?;
+            (
+                difference,
+                judge(note.judgement_type, difference),
+                runtime.available_start_line(index, pointer),
+                is_line_end(note.operate_type),
+            )
+        };
+        let event =
+            self.apply_judgement(index, result, difference, input.time, Some(input.sequence))?;
+        let runtime = self.runtime.as_mut().expect("runtime presence was checked");
+        if let Some(line_index) = start_line
+            && result.judgement != Judgement::Miss
+        {
+            runtime.bind_pointer(pointer, line_index);
+        }
+        if line_end {
+            runtime.unbind_ending_lines(index);
+        }
+        if input.action == InputAction::Release {
+            runtime.unbind_pointer(pointer);
+        }
+        self.last_input_sequence = Some(input.sequence);
+        Ok(Some(event))
+    }
+
+    /// Read-only candidate lookup used before gesture classification.
+    pub fn has_runtime_input_candidate(
+        &self,
+        lane: LanePosition,
+        input_time: TimeMicros,
+        pointer_id: Option<u32>,
+    ) -> Result<bool, SessionError> {
+        if self.mode != SessionMode::Play {
+            return Ok(false);
+        }
+        let adjusted_time = input_time
+            .0
+            .checked_add(self.judgement_offset.0)
+            .map(TimeMicros)
+            .ok_or(SessionError::TimeOverflow)?;
+        Ok(self
+            .select_runtime_candidate(lane, adjusted_time, PointerToken::from_id(pointer_id), None)?
+            .is_some())
+    }
+
+    pub fn runtime_pointer_line(&self, pointer_id: Option<u32>) -> Option<u32> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.pointer_line_id(PointerToken::from_id(pointer_id)))
+    }
+
+    pub fn runtime_line_is_owned(&self, line_id: u32) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.line_is_owned(line_id))
+    }
+
+    fn select_runtime_candidate(
+        &self,
+        lane: LanePosition,
+        adjusted_time: TimeMicros,
+        pointer: PointerToken,
+        action: Option<InputAction>,
+    ) -> Result<Option<usize>, SessionError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SessionError::RuntimeUnavailable)?;
+        let earliest_candidate = adjusted_time
+            .0
+            .checked_sub(runtime.maximum_late_micros)
+            .ok_or(SessionError::TimeOverflow)?;
+        let mut low = 0;
+        let mut high = runtime.notes.len();
+        while low < high {
+            let middle = (low + high) / 2;
+            if runtime.notes[middle].note.time.0 < earliest_candidate {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+
+        let mut end = runtime.notes.len();
+        let mut candidate = None;
+        let mut candidate_distance = i64::MAX;
+        for index in low..runtime.notes.len() {
+            let note = &runtime.notes[index].note;
+            let difference = adjusted_time
+                .0
+                .checked_sub(note.time.0)
+                .ok_or(SessionError::TimeOverflow)?;
+            if difference < -runtime.maximum_early_micros {
+                end = index;
+                break;
+            }
+            let Some(distance) =
+                self.runtime_candidate_distance(runtime, index, difference, lane, pointer, action)
+            else {
+                continue;
+            };
+            // Equal distance keeps the first item in stable chart traversal.
+            if distance < candidate_distance {
+                candidate = Some(index);
+                candidate_distance = distance;
+            }
+        }
+
+        let Some(fallback) = candidate else {
+            return Ok(None);
+        };
+        let Some(InputAction::Flick { movement }) = action else {
+            return Ok(Some(fallback));
+        };
+        for index in low..end {
+            let note = &runtime.notes[index].note;
+            let difference = adjusted_time
+                .0
+                .checked_sub(note.time.0)
+                .ok_or(SessionError::TimeOverflow)?;
+            if self.runtime_candidate_distance(runtime, index, difference, lane, pointer, action)
+                != Some(candidate_distance)
+            {
+                continue;
+            }
+            if note.time != runtime.notes[fallback].note.time
+                || !notes_overlap(note, &runtime.notes[fallback].note)
+                || !is_target_direction_flick(note.direction, movement)
+            {
+                continue;
+            }
+            return Ok(Some(index));
+        }
+        Ok(Some(fallback))
+    }
+
+    fn runtime_candidate_distance(
+        &self,
+        runtime: &RuntimeState,
+        index: usize,
+        difference: i64,
+        lane: LanePosition,
+        pointer: PointerToken,
+        action: Option<InputAction>,
+    ) -> Option<i64> {
+        let note = &runtime.notes[index].note;
+        if self.processed[index]
+            || action.is_some_and(|action| !accepts_runtime_input(note, action))
+            || !is_within_window(note.judgement_type, TimeMicros(difference))
+            || !is_target_lane(note, lane)
+            || !runtime.is_available_to_pointer(index, pointer)
+        {
+            return None;
+        }
+        Some(difference.abs())
+    }
+
+    /// Compatibility path for a host-resolved target. A valid but non-matching input returns
     /// `Ok(None)` and still advances the replay sequence.
     pub fn apply_input(
         &mut self,
@@ -375,7 +850,7 @@ impl GameplaySession {
                         .checked_sub(self.notes[index].time.0)
                         .map(TimeMicros)
                         .ok_or(SessionError::TimeOverflow)?;
-                    events.push(self.apply_judgement(
+                    let event = self.apply_judgement(
                         index,
                         JudgeResult {
                             judgement: Judgement::Miss,
@@ -384,7 +859,11 @@ impl GameplaySession {
                         difference,
                         self.time,
                         None,
-                    )?);
+                    )?;
+                    if let Some(runtime) = &mut self.runtime {
+                        runtime.unbind_ending_lines(index);
+                    }
+                    events.push(event);
                 }
             }
             SessionMode::Chart => {}
@@ -400,7 +879,7 @@ impl GameplaySession {
         self.update_cursor = 0;
         self.contribution_sum = ScoreUnits::ZERO;
         self.combo = 0;
-        self.perfect_combo = true;
+        self.all_perfect = true;
         self.full_combo = true;
         self.max_combo = 0;
         self.score = 0;
@@ -408,6 +887,9 @@ impl GameplaySession {
         self.last_judgement = None;
         self.last_input_sequence = None;
         self.time = time;
+        if let Some(runtime) = &mut self.runtime {
+            runtime.clear_ownership();
+        }
 
         if time.0 > 0 {
             match self.mode {
@@ -447,6 +929,25 @@ impl GameplaySession {
                             .checked_add(1)
                             .ok_or(SessionError::CounterOverflow)?;
                     }
+                    if let Some(runtime) = &self.runtime {
+                        for line in &runtime.lines {
+                            if line
+                                .start_note_index
+                                .is_some_and(|index| self.processed[index])
+                            {
+                                for note_index in &line.member_note_indices {
+                                    self.processed[*note_index] = true;
+                                }
+                            }
+                        }
+                        self.processed_count = u32::try_from(
+                            self.processed
+                                .iter()
+                                .filter(|processed| **processed)
+                                .count(),
+                        )
+                        .map_err(|_| SessionError::CounterOverflow)?;
+                    }
                     self.advance_update_cursor();
                 }
                 SessionMode::Chart => {}
@@ -475,16 +976,16 @@ impl GameplaySession {
         judged_at: TimeMicros,
         input_sequence: Option<u64>,
     ) -> Result<JudgementEvent, SessionError> {
-        let (combo, perfect_combo, full_combo) = match combo_action(result.judgement) {
-            ComboAction::Ignore => (self.combo, self.perfect_combo, self.full_combo),
+        let (combo, all_perfect, full_combo) = match combo_action(result.judgement) {
+            ComboAction::Ignore => (self.combo, self.all_perfect, self.full_combo),
             ComboAction::Increment => {
                 let combo = self
                     .combo
                     .checked_add(1)
                     .ok_or(SessionError::CounterOverflow)?;
-                let perfect_combo = self.perfect_combo
+                let all_perfect = self.all_perfect
                     && matches!(result.judgement, Judgement::Perfect | Judgement::Just);
-                (combo, perfect_combo, self.full_combo)
+                (combo, all_perfect, self.full_combo)
             }
             ComboAction::Break => (0, false, false),
         };
@@ -516,7 +1017,7 @@ impl GameplaySession {
             .checked_add(1)
             .ok_or(SessionError::CounterOverflow)?;
         self.combo = combo;
-        self.perfect_combo = perfect_combo;
+        self.all_perfect = all_perfect;
         self.full_combo = full_combo;
         self.max_combo = max_combo;
         self.life = life;
@@ -554,6 +1055,40 @@ fn accepts_input(note: &GameplayNote, action: InputAction) -> bool {
     }
 }
 
+fn accepts_runtime_input(note: &RuntimeNoteV1, action: InputAction) -> bool {
+    match action {
+        InputAction::Cancel => false,
+        InputAction::Flick { .. } => is_flick(note.operate_type),
+        InputAction::Release => note.operate_type == NoteOperateType::SlideEnd,
+        InputAction::Trace => matches!(
+            note.judgement_type,
+            NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
+        ),
+        InputAction::Tap => {
+            !is_flick(note.operate_type)
+                && note.operate_type != NoteOperateType::SlideEnd
+                && !matches!(
+                    note.judgement_type,
+                    NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
+                )
+        }
+    }
+}
+
+const fn is_line_end(note_type: NoteOperateType) -> bool {
+    matches!(
+        note_type,
+        NoteOperateType::SlideEnd | NoteOperateType::SlideEndFlick | NoteOperateType::SlideEndTrace
+    )
+}
+
+/// The current compatibility profile uses 180 degrees and compares the unit
+/// dot product against `atan(pi)`, which is greater than one. Directional
+/// candidates therefore cannot satisfy it; Normal remains unconditional.
+const fn is_target_direction_flick(direction: NoteDirection, _movement: InputVector) -> bool {
+    matches!(direction, NoteDirection::Normal)
+}
+
 const fn is_flick(note_type: NoteOperateType) -> bool {
     matches!(
         note_type,
@@ -567,6 +1102,10 @@ const fn is_flick(note_type: NoteOperateType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        JudgementAreaOffsetType, LANE_UNITS_PER_LANE, RUNTIME_CHART_FORMAT, RUNTIME_CHART_VERSION,
+        RUNTIME_LANE_COUNT,
+    };
 
     fn note(
         id: &str,
@@ -589,6 +1128,53 @@ mod tests {
             pointer_id: Some(0),
             target_note_id: Some(note_id.into()),
             action: InputAction::Tap,
+        }
+    }
+
+    fn runtime_note(
+        id: u32,
+        time_micros: i64,
+        position: i32,
+        size: i32,
+        judgement_type: NoteJudgementType,
+        operate_type: NoteOperateType,
+    ) -> RuntimeNoteV1 {
+        RuntimeNoteV1 {
+            id,
+            time: TimeMicros(time_micros),
+            position: LanePosition(position * LANE_UNITS_PER_LANE),
+            size: LanePosition(size * LANE_UNITS_PER_LANE),
+            operate_type,
+            judgement_type,
+            judgement_area_offset_type: JudgementAreaOffsetType::Default,
+            direction: NoteDirection::Normal,
+            judged: true,
+        }
+    }
+
+    fn runtime_chart(notes: Vec<RuntimeNoteV1>, lines: Vec<RuntimeLineV1>) -> RuntimeChartV1 {
+        RuntimeChartV1 {
+            format: RUNTIME_CHART_FORMAT.into(),
+            version: RUNTIME_CHART_VERSION,
+            lane_count: RUNTIME_LANE_COUNT,
+            notes,
+            lines,
+        }
+    }
+
+    fn runtime_input(
+        sequence: u64,
+        time_micros: i64,
+        lane_micros: i32,
+        pointer_id: Option<u32>,
+        action: InputAction,
+    ) -> RuntimeInputEvent {
+        RuntimeInputEvent {
+            sequence,
+            time: TimeMicros(time_micros),
+            pointer_id,
+            lane: LanePosition(lane_micros),
+            action,
         }
     }
 
@@ -658,6 +1244,10 @@ mod tests {
             ),
         ];
         let mut session = GameplaySession::new(notes, SessionMode::Play, TimeMicros(0)).unwrap();
+        let initial = session.snapshot();
+        assert!(!initial.perfect_combo);
+        assert!(initial.all_perfect);
+        assert!(initial.full_combo);
 
         let perfect = session
             .apply_input(&input(1, "perfect", 1_002_000))
@@ -666,6 +1256,7 @@ mod tests {
         assert_eq!(perfect.judgement, Judgement::Perfect);
         assert_eq!(perfect.combo, 1);
         assert!(session.snapshot().perfect_combo);
+        assert!(session.snapshot().all_perfect);
         assert!(session.snapshot().full_combo);
 
         let great = session
@@ -675,6 +1266,7 @@ mod tests {
         assert_eq!(great.judgement, Judgement::Great);
         assert_eq!(great.combo, 2);
         assert!(!session.snapshot().perfect_combo);
+        assert!(!session.snapshot().all_perfect);
         assert!(session.snapshot().full_combo);
 
         let good = session
@@ -703,6 +1295,7 @@ mod tests {
         assert_eq!(session.snapshot().processed, 5);
         assert_eq!(session.snapshot().max_combo, 3);
         assert!(!session.snapshot().perfect_combo);
+        assert!(!session.snapshot().all_perfect);
         assert!(!session.snapshot().full_combo);
     }
 
@@ -749,24 +1342,28 @@ mod tests {
                     assert_eq!(snapshot.combo, 1);
                     assert_eq!(snapshot.max_combo, 1);
                     assert!(snapshot.perfect_combo);
+                    assert!(snapshot.all_perfect);
                     assert!(snapshot.full_combo);
                 }
                 3 => {
                     assert_eq!(snapshot.combo, 2);
                     assert_eq!(snapshot.max_combo, 2);
                     assert!(!snapshot.perfect_combo);
+                    assert!(!snapshot.all_perfect);
                     assert!(snapshot.full_combo);
                 }
                 4 => {
                     assert_eq!(snapshot.combo, 0);
                     assert_eq!(snapshot.max_combo, 2);
                     assert!(!snapshot.perfect_combo);
+                    assert!(!snapshot.all_perfect);
                     assert!(!snapshot.full_combo);
                 }
                 5 => {
                     assert_eq!(snapshot.combo, 1);
                     assert_eq!(snapshot.max_combo, 2);
                     assert!(!snapshot.perfect_combo);
+                    assert!(!snapshot.all_perfect);
                     assert!(!snapshot.full_combo);
                 }
                 _ => unreachable!(),
@@ -890,6 +1487,367 @@ mod tests {
                 received: 2
             })
         ));
+    }
+
+    #[test]
+    fn runtime_candidate_hit_test_is_inclusive_and_equal_distance_keeps_traversal_order() {
+        let notes = vec![
+            runtime_note(
+                99,
+                1_000_000,
+                8,
+                4,
+                NoteJudgementType::Normal,
+                NoteOperateType::Normal,
+            ),
+            runtime_note(
+                1,
+                1_000_000,
+                8,
+                4,
+                NoteJudgementType::Normal,
+                NoteOperateType::Normal,
+            ),
+        ];
+        let mut session = GameplaySession::from_runtime_chart(
+            runtime_chart(notes, vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        let event = session
+            .consume_runtime_input(&runtime_input(
+                1,
+                1_000_000,
+                12_000_000,
+                None,
+                InputAction::Tap,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.note_id, "99");
+
+        let notes = vec![runtime_note(
+            7,
+            1_000_000,
+            8,
+            4,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        )];
+        let mut session = GameplaySession::from_runtime_chart(
+            runtime_chart(notes, vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    1,
+                    1_000_000,
+                    12_500_001,
+                    None,
+                    InputAction::Tap,
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    2,
+                    1_000_000,
+                    12_500_000,
+                    None,
+                    InputAction::Tap,
+                ))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_candidate_uses_nearest_time_from_the_sorted_window() {
+        let notes = vec![
+            runtime_note(
+                0,
+                1_000_000,
+                8,
+                4,
+                NoteJudgementType::Normal,
+                NoteOperateType::Normal,
+            ),
+            runtime_note(
+                1,
+                1_020_000,
+                8,
+                4,
+                NoteJudgementType::Normal,
+                NoteOperateType::Normal,
+            ),
+        ];
+        let mut session = GameplaySession::from_runtime_chart(
+            runtime_chart(notes, vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        let event = session
+            .consume_runtime_input(&runtime_input(
+                1,
+                1_015_000,
+                10_000_000,
+                Some(1),
+                InputAction::Tap,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.note_id, "1");
+        assert_eq!(event.difference, TimeMicros(-5_000));
+    }
+
+    #[test]
+    fn runtime_flick_direction_is_a_stable_tie_break_not_a_rejection() {
+        let mut left = runtime_note(
+            9,
+            1_000_000,
+            8,
+            4,
+            NoteJudgementType::Flick,
+            NoteOperateType::Flick,
+        );
+        left.direction = NoteDirection::Left;
+        let normal = runtime_note(
+            2,
+            1_000_000,
+            8,
+            4,
+            NoteJudgementType::Flick,
+            NoteOperateType::Flick,
+        );
+        let action = InputAction::Flick {
+            movement: InputVector {
+                delta_x: -1_000,
+                delta_y: 0,
+            },
+        };
+        let mut session = GameplaySession::from_runtime_chart(
+            runtime_chart(vec![left.clone(), normal], vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        let event = session
+            .consume_runtime_input(&runtime_input(1, 1_000_000, 10_000_000, None, action))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.note_id, "2");
+
+        let mut session = GameplaySession::from_runtime_chart(
+            runtime_chart(vec![left], vec![]),
+            SessionMode::Play,
+            TimeMicros(0),
+        )
+        .unwrap();
+        let fallback = session
+            .consume_runtime_input(&runtime_input(1, 1_000_000, 10_000_000, None, action))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.note_id, "9");
+    }
+
+    #[test]
+    fn runtime_long_line_requires_pointer_ownership_and_release_or_cancel_clears_it() {
+        let mut start = runtime_note(
+            0,
+            1_000_000,
+            8,
+            4,
+            NoteJudgementType::SlideBegin,
+            NoteOperateType::SlideBegin,
+        );
+        start.judgement_area_offset_type = JudgementAreaOffsetType::SlideBegin;
+        let mut trace_one = runtime_note(
+            1,
+            1_500_000,
+            8,
+            4,
+            NoteJudgementType::Trace,
+            NoteOperateType::Trace,
+        );
+        trace_one.judgement_area_offset_type = JudgementAreaOffsetType::Trace;
+        let mut trace_two = runtime_note(
+            2,
+            1_800_000,
+            8,
+            4,
+            NoteJudgementType::Trace,
+            NoteOperateType::Trace,
+        );
+        trace_two.judgement_area_offset_type = JudgementAreaOffsetType::Trace;
+        let mut end = runtime_note(
+            3,
+            2_000_000,
+            8,
+            4,
+            NoteJudgementType::SlideEnd,
+            NoteOperateType::SlideEnd,
+        );
+        end.judgement_area_offset_type = JudgementAreaOffsetType::SlideEnd;
+        let chart = runtime_chart(
+            vec![start, trace_one, trace_two, end],
+            vec![RuntimeLineV1 {
+                id: 7,
+                kind: RuntimeLineKind::Long,
+                note_ids: vec![0, 1, 2, 3],
+            }],
+        );
+        let mut session =
+            GameplaySession::from_runtime_chart(chart.clone(), SessionMode::Play, TimeMicros(0))
+                .unwrap();
+
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    1,
+                    1_500_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Trace,
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    2,
+                    1_000_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Tap,
+                ))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(session.runtime_pointer_line(Some(11)), Some(7));
+        assert!(session.runtime_line_is_owned(7));
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    3,
+                    1_500_000,
+                    10_000_000,
+                    Some(12),
+                    InputAction::Trace,
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    4,
+                    1_500_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Trace,
+                ))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    5,
+                    1_600_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Release,
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(session.runtime_pointer_line(Some(11)), None);
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    6,
+                    1_800_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Trace,
+                ))
+                .unwrap()
+                .is_none()
+        );
+
+        session.reset(TimeMicros(0)).unwrap();
+        for event in [
+            runtime_input(1, 1_000_000, 10_000_000, Some(11), InputAction::Tap),
+            runtime_input(2, 1_500_000, 10_000_000, Some(11), InputAction::Trace),
+            runtime_input(3, 1_800_000, 10_000_000, Some(11), InputAction::Trace),
+            runtime_input(4, 2_000_000, 10_000_000, Some(11), InputAction::Release),
+        ] {
+            assert!(session.consume_runtime_input(&event).unwrap().is_some());
+        }
+        assert!(!session.runtime_line_is_owned(7));
+
+        session.reset(TimeMicros(0)).unwrap();
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    1,
+                    1_000_000,
+                    10_000_000,
+                    Some(11),
+                    InputAction::Tap,
+                ))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            session
+                .consume_runtime_input(&runtime_input(
+                    2,
+                    1_100_000,
+                    0,
+                    Some(11),
+                    InputAction::Cancel,
+                ))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!session.runtime_line_is_owned(7));
+        assert!(
+            !session
+                .has_runtime_input_candidate(
+                    LanePosition(10_000_000),
+                    TimeMicros(1_500_000),
+                    Some(11),
+                )
+                .unwrap()
+        );
+
+        let mut seek =
+            GameplaySession::from_runtime_chart(chart, SessionMode::Play, TimeMicros(0)).unwrap();
+        let snapshot = seek.reset(TimeMicros(1_700_000)).unwrap();
+        assert_eq!(snapshot.processed, 4);
+        assert_eq!(snapshot.score, 0);
+        assert_eq!(snapshot.life, LIFE_BASE);
+    }
+
+    #[test]
+    fn runtime_input_serde_has_no_host_resolved_target() {
+        let event = runtime_input(4, 1_001, 12_000_000, Some(2), InputAction::Trace);
+        let value = serde_json::to_value(&event).unwrap();
+        assert!(value.get("targetNoteId").is_none());
+        assert_eq!(value["lane"], 12_000_000);
+        assert_eq!(
+            serde_json::from_value::<RuntimeInputEvent>(value).unwrap(),
+            event
+        );
     }
 
     #[test]
