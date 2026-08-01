@@ -41,6 +41,14 @@ pub enum NoteOperateType {
     InvalidHidden,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ComboAction {
+    Ignore,
+    Increment,
+    Break,
+}
+
 /// Fixed-point contribution numerator.
 ///
 /// One unbonused Perfect normal note is `10_000_000_000` units. Keeping the
@@ -162,10 +170,25 @@ pub const fn life_damage(judgement: Judgement) -> u32 {
 }
 
 pub const fn preserves_combo(judgement: Judgement) -> bool {
-    matches!(
-        judgement,
-        Judgement::Great | Judgement::Perfect | Judgement::Just | Judgement::Pass
-    )
+    !matches!(combo_action(judgement), ComboAction::Break)
+}
+
+pub const fn increments_combo(judgement: Judgement) -> bool {
+    matches!(combo_action(judgement), ComboAction::Increment)
+}
+
+pub const fn breaks_combo(judgement: Judgement) -> bool {
+    matches!(combo_action(judgement), ComboAction::Break)
+}
+
+pub const fn combo_action(judgement: Judgement) -> ComboAction {
+    match judgement {
+        Judgement::None | Judgement::Wait | Judgement::Pass => ComboAction::Ignore,
+        Judgement::Perfect | Judgement::Great | Judgement::Good | Judgement::Just => {
+            ComboAction::Increment
+        }
+        Judgement::Bad | Judgement::Miss => ComboAction::Break,
+    }
 }
 
 pub const fn contribution_scale() -> u64 {
@@ -238,8 +261,16 @@ mod tests {
     fn life_and_combo_rules_are_explicit() {
         assert_eq!(life_damage(Judgement::Bad), 50);
         assert_eq!(life_damage(Judgement::Miss), 100);
+        assert_eq!(combo_action(Judgement::Wait), ComboAction::Ignore);
+        assert_eq!(combo_action(Judgement::Pass), ComboAction::Ignore);
+        assert_eq!(combo_action(Judgement::Good), ComboAction::Increment);
+        assert_eq!(combo_action(Judgement::Bad), ComboAction::Break);
         assert!(preserves_combo(Judgement::Pass));
         assert!(preserves_combo(Judgement::Great));
-        assert!(!preserves_combo(Judgement::Good));
+        assert!(preserves_combo(Judgement::Good));
+        assert!(increments_combo(Judgement::Good));
+        assert!(!increments_combo(Judgement::Pass));
+        assert!(breaks_combo(Judgement::Miss));
+        assert!(!breaks_combo(Judgement::Wait));
     }
 }

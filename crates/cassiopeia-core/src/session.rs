@@ -7,8 +7,8 @@ use crate::judgement::{
     maximum_late_ms,
 };
 use crate::scoring::{
-    LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, contribution, life_damage, normalize_score,
-    perfect_ceiling, preserves_combo,
+    ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
+    life_damage, normalize_score, perfect_ceiling,
 };
 use crate::timing::TimeMicros;
 
@@ -100,7 +100,10 @@ pub struct SessionSnapshot {
     pub time: TimeMicros,
     pub judgement_offset: TimeMicros,
     pub combo: u32,
+    /// All-Perfect state for the entire run; it never recovers after loss.
     pub perfect_combo: bool,
+    /// Full-Combo state for the entire run; only Bad or Miss clears it.
+    pub full_combo: bool,
     pub max_combo: u32,
     pub score: u32,
     pub life: u32,
@@ -172,6 +175,7 @@ pub struct GameplaySession {
     time: TimeMicros,
     combo: u32,
     perfect_combo: bool,
+    full_combo: bool,
     max_combo: u32,
     score: u32,
     life: u32,
@@ -214,6 +218,7 @@ impl GameplaySession {
             time: TimeMicros(0),
             combo: 0,
             perfect_combo: true,
+            full_combo: true,
             max_combo: 0,
             score: 0,
             life: LIFE_BASE,
@@ -255,6 +260,7 @@ impl GameplaySession {
             judgement_offset: self.judgement_offset,
             combo: self.combo,
             perfect_combo: self.combo > 0 && self.perfect_combo,
+            full_combo: self.full_combo,
             max_combo: self.max_combo,
             score: self.score,
             life: self.life,
@@ -326,7 +332,7 @@ impl GameplaySession {
             SessionMode::Watch => {
                 while self.update_cursor < self.notes.len() {
                     let index = self.update_cursor;
-                    if self.notes[index].time > self.time {
+                    if self.notes[index].time >= self.time {
                         break;
                     }
                     if self.processed[index] {
@@ -395,6 +401,7 @@ impl GameplaySession {
         self.contribution_sum = ScoreUnits::ZERO;
         self.combo = 0;
         self.perfect_combo = true;
+        self.full_combo = true;
         self.max_combo = 0;
         self.score = 0;
         self.life = LIFE_BASE;
@@ -406,7 +413,7 @@ impl GameplaySession {
             match self.mode {
                 SessionMode::Watch => {
                     while self.update_cursor < self.notes.len()
-                        && self.notes[self.update_cursor].time <= time
+                        && self.notes[self.update_cursor].time < time
                     {
                         let index = self.update_cursor;
                         self.apply_judgement(
@@ -468,16 +475,18 @@ impl GameplaySession {
         judged_at: TimeMicros,
         input_sequence: Option<u64>,
     ) -> Result<JudgementEvent, SessionError> {
-        let (combo, perfect_combo) = if preserves_combo(result.judgement) {
-            let combo = self
-                .combo
-                .checked_add(1)
-                .ok_or(SessionError::CounterOverflow)?;
-            let perfect_combo = self.perfect_combo
-                && matches!(result.judgement, Judgement::Perfect | Judgement::Just);
-            (combo, perfect_combo)
-        } else {
-            (0, true)
+        let (combo, perfect_combo, full_combo) = match combo_action(result.judgement) {
+            ComboAction::Ignore => (self.combo, self.perfect_combo, self.full_combo),
+            ComboAction::Increment => {
+                let combo = self
+                    .combo
+                    .checked_add(1)
+                    .ok_or(SessionError::CounterOverflow)?;
+                let perfect_combo = self.perfect_combo
+                    && matches!(result.judgement, Judgement::Perfect | Judgement::Just);
+                (combo, perfect_combo, self.full_combo)
+            }
+            ComboAction::Break => (0, false, false),
         };
         let max_combo = self.max_combo.max(combo);
         let life = self.life.saturating_sub(life_damage(result.judgement));
@@ -508,6 +517,7 @@ impl GameplaySession {
             .ok_or(SessionError::CounterOverflow)?;
         self.combo = combo;
         self.perfect_combo = perfect_combo;
+        self.full_combo = full_combo;
         self.max_combo = max_combo;
         self.life = life;
         self.contribution_sum = contribution_sum;
@@ -614,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn input_updates_combo_score_life_and_perfect_combo_in_order() {
+    fn input_updates_combo_score_life_and_run_flags_in_order() {
         let notes = vec![
             note(
                 "perfect",
@@ -656,6 +666,7 @@ mod tests {
         assert_eq!(perfect.judgement, Judgement::Perfect);
         assert_eq!(perfect.combo, 1);
         assert!(session.snapshot().perfect_combo);
+        assert!(session.snapshot().full_combo);
 
         let great = session
             .apply_input(&input(2, "great", 2_043_000))
@@ -664,14 +675,16 @@ mod tests {
         assert_eq!(great.judgement, Judgement::Great);
         assert_eq!(great.combo, 2);
         assert!(!session.snapshot().perfect_combo);
+        assert!(session.snapshot().full_combo);
 
         let good = session
             .apply_input(&input(3, "good", 3_084_000))
             .unwrap()
             .unwrap();
         assert_eq!(good.judgement, Judgement::Good);
-        assert_eq!(good.combo, 0);
+        assert_eq!(good.combo, 3);
         assert!(!session.snapshot().perfect_combo);
+        assert!(session.snapshot().full_combo);
 
         let bad = session
             .apply_input(&input(4, "bad", 4_109_000))
@@ -679,6 +692,7 @@ mod tests {
             .unwrap();
         assert_eq!(bad.judgement, Judgement::Bad);
         assert_eq!(bad.life, 950);
+        assert!(!session.snapshot().full_combo);
 
         let miss = session
             .apply_input(&input(5, "miss", 5_126_000))
@@ -687,7 +701,77 @@ mod tests {
         assert_eq!(miss.judgement, Judgement::Miss);
         assert_eq!(miss.life, 850);
         assert_eq!(session.snapshot().processed, 5);
-        assert_eq!(session.snapshot().max_combo, 2);
+        assert_eq!(session.snapshot().max_combo, 3);
+        assert!(!session.snapshot().perfect_combo);
+        assert!(!session.snapshot().full_combo);
+    }
+
+    #[test]
+    fn combo_counter_ignores_wait_and_pass_and_run_flags_never_recover() {
+        let judgements = [
+            Judgement::Perfect,
+            Judgement::Wait,
+            Judgement::Pass,
+            Judgement::Good,
+            Judgement::Bad,
+            Judgement::Perfect,
+        ];
+        let notes = judgements
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                note(
+                    &format!("n{index}"),
+                    index as i64,
+                    NoteJudgementType::Normal,
+                    NoteOperateType::Normal,
+                )
+            })
+            .collect();
+        let mut session = GameplaySession::new(notes, SessionMode::Play, TimeMicros(0)).unwrap();
+
+        for (index, judgement) in judgements.into_iter().enumerate() {
+            session
+                .apply_judgement(
+                    index,
+                    JudgeResult {
+                        judgement,
+                        timing: JudgeTiming::Auto,
+                    },
+                    TimeMicros(0),
+                    TimeMicros(index as i64),
+                    None,
+                )
+                .unwrap();
+            let snapshot = session.snapshot();
+            match index {
+                0..=2 => {
+                    assert_eq!(snapshot.combo, 1);
+                    assert_eq!(snapshot.max_combo, 1);
+                    assert!(snapshot.perfect_combo);
+                    assert!(snapshot.full_combo);
+                }
+                3 => {
+                    assert_eq!(snapshot.combo, 2);
+                    assert_eq!(snapshot.max_combo, 2);
+                    assert!(!snapshot.perfect_combo);
+                    assert!(snapshot.full_combo);
+                }
+                4 => {
+                    assert_eq!(snapshot.combo, 0);
+                    assert_eq!(snapshot.max_combo, 2);
+                    assert!(!snapshot.perfect_combo);
+                    assert!(!snapshot.full_combo);
+                }
+                5 => {
+                    assert_eq!(snapshot.combo, 1);
+                    assert_eq!(snapshot.max_combo, 2);
+                    assert!(!snapshot.perfect_combo);
+                    assert!(!snapshot.full_combo);
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -708,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_mode_uses_automatic_perfect_not_exact_just() {
+    fn watch_cursor_is_strict_and_uses_automatic_perfect() {
         let notes = vec![note(
             "n",
             1_000,
@@ -716,10 +800,33 @@ mod tests {
             NoteOperateType::Normal,
         )];
         let mut session = GameplaySession::new(notes, SessionMode::Watch, TimeMicros(0)).unwrap();
-        let events = session.advance(TimeMicros(1_000)).unwrap();
+        assert!(session.advance(TimeMicros(1_000)).unwrap().is_empty());
+        assert_eq!(session.snapshot().processed, 0);
+        let events = session.advance(TimeMicros(1_001)).unwrap();
         assert_eq!(events[0].judgement, Judgement::Perfect);
         assert_eq!(events[0].timing, JudgeTiming::Auto);
-        assert_eq!(events[0].judged_at, TimeMicros(1_000));
+        assert_eq!(events[0].judged_at, TimeMicros(1_001));
+    }
+
+    #[test]
+    fn watch_seek_rebuild_uses_the_same_strict_time_boundary() {
+        let notes = vec![note(
+            "n",
+            1_000,
+            NoteJudgementType::Normal,
+            NoteOperateType::Normal,
+        )];
+        let mut session = GameplaySession::new(notes, SessionMode::Watch, TimeMicros(0)).unwrap();
+        let exact = session.reset(TimeMicros(1_000)).unwrap();
+        assert_eq!(exact.processed, 0);
+        assert!(exact.last_judgement.is_none());
+
+        let after = session.reset(TimeMicros(1_001)).unwrap();
+        assert_eq!(after.processed, 1);
+        assert_eq!(
+            after.last_judgement.as_ref().map(|event| event.judgement),
+            Some(Judgement::Perfect)
+        );
     }
 
     #[test]

@@ -4,17 +4,43 @@ use crate::timing::TimeMicros;
 
 /// Stable gameplay judgement values shared by browser and native hosts.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[repr(i8)]
+#[serde(try_from = "i8", into = "i8")]
 pub enum Judgement {
-    None,
-    Wait,
-    Miss,
-    Bad,
-    Good,
-    Great,
-    Perfect,
-    Just,
-    Pass,
+    None = -1,
+    Wait = 0,
+    Miss = 1,
+    Bad = 2,
+    Good = 3,
+    Great = 4,
+    Perfect = 5,
+    Just = 6,
+    Pass = 7,
+}
+
+impl From<Judgement> for i8 {
+    fn from(judgement: Judgement) -> Self {
+        judgement as Self
+    }
+}
+
+impl TryFrom<i8> for Judgement {
+    type Error = String;
+
+    fn try_from(value: i8) -> Result<Self, Self::Error> {
+        match value {
+            -1 => Ok(Self::None),
+            0 => Ok(Self::Wait),
+            1 => Ok(Self::Miss),
+            2 => Ok(Self::Bad),
+            3 => Ok(Self::Good),
+            4 => Ok(Self::Great),
+            5 => Ok(Self::Perfect),
+            6 => Ok(Self::Just),
+            7 => Ok(Self::Pass),
+            _ => Err(format!("invalid judgement value: {value}")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -347,7 +373,25 @@ mod tests {
     }
 
     #[test]
-    fn serde_contract_uses_camel_case_names() {
+    fn judgement_codes_and_serde_match_the_stable_numeric_contract() {
+        let codes = [
+            (Judgement::None, -1),
+            (Judgement::Wait, 0),
+            (Judgement::Miss, 1),
+            (Judgement::Bad, 2),
+            (Judgement::Good, 3),
+            (Judgement::Great, 4),
+            (Judgement::Perfect, 5),
+            (Judgement::Just, 6),
+            (Judgement::Pass, 7),
+        ];
+        for (judgement, code) in codes {
+            assert_eq!(i8::from(judgement), code);
+            assert_eq!(Judgement::try_from(code).unwrap(), judgement);
+            assert_eq!(serde_json::to_value(judgement).unwrap(), code);
+        }
+        assert!(Judgement::try_from(8).is_err());
+
         let result = JudgeResult {
             judgement: Judgement::Perfect,
             timing: JudgeTiming::OutOfTime,
@@ -355,7 +399,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             serde_json::json!({
-                "judgement": "perfect",
+                "judgement": 5,
                 "timing": "outOfTime"
             })
         );
@@ -365,7 +409,7 @@ mod tests {
     fn profile_deserialization_preserves_window_invariants() {
         let invalid = serde_json::json!({
             "windows": [{
-                "judgement": "perfect",
+                "judgement": 5,
                 "earlyMs": -1,
                 "lateMs": 42
             }]

@@ -18,9 +18,10 @@ pub use judgement::{
     is_within_window, judge, maximum_early_ms, maximum_late_ms,
 };
 pub use scoring::{
-    LIFE_BASE, LIFE_DANGER, MAX_NORMALIZED_SCORE, NoteOperateType, ScoreError, ScoreUnits,
-    combo_bonus_basis_points, contribution, contribution_scale, judgement_factor_milli,
-    life_damage, normalize_score, note_weight_milli, perfect_ceiling, preserves_combo,
+    ComboAction, LIFE_BASE, LIFE_DANGER, MAX_NORMALIZED_SCORE, NoteOperateType, ScoreError,
+    ScoreUnits, breaks_combo, combo_action, combo_bonus_basis_points, contribution,
+    contribution_scale, increments_combo, judgement_factor_milli, life_damage, normalize_score,
+    note_weight_milli, perfect_ceiling, preserves_combo,
 };
 pub use session::{
     GameplayNote, GameplaySession, InputAction, InputEvent, InputVector, JudgementEvent,
