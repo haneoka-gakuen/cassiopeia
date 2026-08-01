@@ -5,6 +5,11 @@ use std::fmt;
 #[serde(transparent)]
 pub struct Tick(pub i64);
 
+/// Signed integer microseconds used at every deterministic runtime boundary.
+///
+/// Hosts with fractional-millisecond clocks must quantize once before entering
+/// the core. Keeping that policy outside the kernel prevents hidden f64/f32
+/// conversions; all window comparisons after quantization are exact.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TimeMicros(pub i64);
