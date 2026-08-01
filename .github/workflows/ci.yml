@@ -20,34 +20,80 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 11.14.0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
-      - run: pnpm pack --dry-run
+      - name: Run runtime conformance tests
+        run: >-
+          node tests/runtime-trace.mjs &&
+          node tests/title-introduction.mjs &&
+          node tests/hud-presentation.mjs
+      - run: npm pack --dry-run --ignore-scripts
 
   rust:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: Rust quality
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cassiopeia-rust-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo run --quiet -p haneoka-cassiopeia-cli -- conformance fixtures/conformance/basic.ccf.json
 
+  portability:
+    name: Rust tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cassiopeia-rust-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --workspace
+
   wasm:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo check -p haneoka-cassiopeia-core --target wasm32-unknown-unknown
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cassiopeia-wasm-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo check -p haneoka-cassiopeia-core -p haneoka-cassiopeia-wasm --target wasm32-unknown-unknown
