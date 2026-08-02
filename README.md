@@ -32,6 +32,28 @@ Cassiopeia Chart Format is canonical. SS, SUS, USC, Sonolus `LevelData`, and
 source-specific formats are adapters with explicit loss reports. See the
 [format contract](docs/CASSIOPEIA_CHART_FORMAT.md).
 
+## WebAssembly
+
+Browsers can initialize the lazy entry directly:
+
+```ts
+const wasm = await import("@haneoka/cassiopeia/wasm");
+await wasm.default();
+```
+
+Node hosts initialize from the exported module bytes:
+
+```ts
+import { readFileSync } from "node:fs";
+import { initSync } from "@haneoka/cassiopeia/wasm";
+
+const url = import.meta.resolve("@haneoka/cassiopeia/wasm/module");
+initSync({ module: readFileSync(new URL(url)) });
+```
+
+`CassiopeiaCameraTimeline` parses one camera resource and reuses a fixed
+`Float64Array` frame region. `CameraFrameWord` provides its field indices.
+
 ## Development
 
 ```sh

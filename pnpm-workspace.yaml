@@ -3,5 +3,6 @@ packages:
 
 allowBuilds:
   esbuild: true
+  wasm-pack: true
 
 linkWorkspacePackages: true

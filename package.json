@@ -55,12 +55,20 @@
       "import": "./dist/player.js",
       "default": "./dist/player.js"
     },
+    "./wasm": {
+      "types": "./dist/wasm/cassiopeia_wasm.d.ts",
+      "import": "./dist/wasm/cassiopeia_wasm.js",
+      "default": "./dist/wasm/cassiopeia_wasm.js"
+    },
+    "./wasm/module": "./dist/wasm/cassiopeia_wasm_bg.wasm",
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "vite build && vue-tsc -p tsconfig.build.json",
+    "build": "pnpm run build:web && pnpm run build:wasm",
+    "build:web": "vite build && vue-tsc -p tsconfig.build.json",
+    "build:wasm": "node scripts/build-wasm.mjs",
     "benchmark": "pnpm run build && node benchmarks/runtime.mjs && node benchmarks/effects.mjs",
-    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs && node tests/background-media.mjs && node tests/particle-emission.mjs && node tests/note-mark.mjs",
+    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs && node tests/background-media.mjs && node tests/particle-emission.mjs && node tests/note-mark.mjs && node tests/wasm-boundary.mjs",
     "typecheck": "vue-tsc -p tsconfig.json --noEmit",
     "rust:check": "cargo check --workspace --all-targets",
     "rust:test": "cargo test --workspace",
@@ -88,6 +96,7 @@
     "typescript": "^6.0.3",
     "vite": "^7.3.6",
     "vue": "3.5.39",
-    "vue-tsc": "^3.3.6"
+    "vue-tsc": "^3.3.6",
+    "wasm-pack": "0.15.0"
   }
 }

@@ -24,6 +24,18 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cache/.wasm-pack
+            target
+          key: cassiopeia-web-wasm-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'pnpm-lock.yaml') }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
@@ -31,7 +43,8 @@ jobs:
         run: >-
           node tests/runtime-trace.mjs &&
           node tests/title-introduction.mjs &&
-          node tests/hud-presentation.mjs
+          node tests/hud-presentation.mjs &&
+          node tests/wasm-boundary.mjs
       - run: npm pack --dry-run --ignore-scripts
 
   rust:

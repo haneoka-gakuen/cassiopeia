@@ -21,11 +21,11 @@ pub use chart_binary::{
     CHART_NOTE_BYTES, ChartBinaryError, decode_runtime_chart_v1, encode_runtime_chart_v1,
 };
 use haneoka_cassiopeia_core::{
-    GameplaySession, InputAction, InputVector, JudgementEvent, LanePosition, PerformanceClock,
-    PlaybackRate, PlaybackState, RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode,
-    TimeMicros, resolve_screen_mode,
+    CameraEvaluation, CameraProfile, CameraTimelineResource, GameplaySession, InputAction,
+    InputVector, JudgementEvent, LanePosition, PerformanceClock, PlaybackRate, PlaybackState,
+    RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode, TimeMicros, resolve_screen_mode,
 };
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
 
 pub const HOST_ABI_VERSION: i64 = 1;
 pub const EVENT_STRIDE: usize = 12;
@@ -61,6 +61,154 @@ pub const SNAPSHOT_PROCESSED: usize = 12;
 pub const SNAPSHOT_TOTAL: usize = 13;
 pub const SNAPSHOT_LAST_INPUT_SEQUENCE: usize = 14;
 pub const SNAPSHOT_EVENT_COUNT: usize = 15;
+
+pub const CAMERA_FRAME_ABI_VERSION: u32 = 1;
+pub const CAMERA_FRAME_WORDS: usize = 13;
+pub const CAMERA_FRAME_ABI: usize = 0;
+pub const CAMERA_FRAME_AVAILABLE: usize = 1;
+pub const CAMERA_FRAME_ACTIVE_CLIPS: usize = 2;
+pub const CAMERA_FRAME_INCOMING_WEIGHT: usize = 3;
+pub const CAMERA_FRAME_INCOMING_INDEX: usize = 4;
+pub const CAMERA_FRAME_POSITION_X: usize = 5;
+pub const CAMERA_FRAME_POSITION_Y: usize = 6;
+pub const CAMERA_FRAME_POSITION_Z: usize = 7;
+pub const CAMERA_FRAME_ROTATION_X: usize = 8;
+pub const CAMERA_FRAME_ROTATION_Y: usize = 9;
+pub const CAMERA_FRAME_ROTATION_Z: usize = 10;
+pub const CAMERA_FRAME_ROTATION_W: usize = 11;
+pub const CAMERA_FRAME_VERTICAL_FOV: usize = 12;
+
+#[wasm_bindgen]
+#[repr(u8)]
+pub enum CameraFrameWord {
+    AbiVersion = 0,
+    Available = 1,
+    ActiveClips = 2,
+    IncomingWeight = 3,
+    IncomingSerializedIndex = 4,
+    PositionX = 5,
+    PositionY = 6,
+    PositionZ = 7,
+    RotationX = 8,
+    RotationY = 9,
+    RotationZ = 10,
+    RotationW = 11,
+    VerticalFovDegrees = 12,
+}
+
+/// Owns one parsed camera resource and a reusable 13-word frame region.
+#[derive(Debug)]
+#[wasm_bindgen(js_name = CassiopeiaCameraTimeline)]
+pub struct WasmCameraTimeline {
+    resource: CameraTimelineResource,
+    frame_words: [f64; CAMERA_FRAME_WORDS],
+}
+
+#[wasm_bindgen(js_class = CassiopeiaCameraTimeline)]
+impl WasmCameraTimeline {
+    #[wasm_bindgen(constructor)]
+    pub fn new(resource_json: &[u8]) -> Result<WasmCameraTimeline, JsError> {
+        Self::from_json(resource_json).map_err(js_error)
+    }
+
+    /// Writes ABI, availability, blend, transform, and FOV into one stable region.
+    pub fn evaluate(&mut self, profile: u8, time_seconds: f64) -> Result<bool, JsError> {
+        self.evaluate_frame(profile, time_seconds).map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = durationSeconds)]
+    pub fn duration_seconds(&self, profile: u8) -> Result<f64, JsError> {
+        self.profile(profile)
+            .map(|timeline| timeline.duration_seconds)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = frameRate)]
+    pub fn frame_rate(&self, profile: u8) -> Result<f64, JsError> {
+        self.profile(profile)
+            .map(|timeline| timeline.frame_rate)
+            .map_err(js_error)
+    }
+
+    /// Pointer to a reusable `Float64Array`-compatible camera frame region.
+    #[wasm_bindgen(js_name = frameBufferPtr)]
+    pub fn frame_buffer_ptr(&self) -> usize {
+        self.frame_words.as_ptr() as usize
+    }
+
+    #[wasm_bindgen(js_name = frameBufferLen)]
+    pub fn frame_buffer_len(&self) -> usize {
+        CAMERA_FRAME_WORDS
+    }
+}
+
+impl WasmCameraTimeline {
+    fn from_json(resource_json: &[u8]) -> Result<Self, String> {
+        let resource: CameraTimelineResource =
+            serde_json::from_slice(resource_json).map_err(|error| error.to_string())?;
+        Ok(Self {
+            resource,
+            frame_words: empty_camera_frame(),
+        })
+    }
+
+    fn profile(
+        &self,
+        profile: u8,
+    ) -> Result<&haneoka_cassiopeia_core::CameraTimelineProfile, String> {
+        let profile = CameraProfile::try_from(profile).map_err(|error| error.to_string())?;
+        self.resource
+            .profile(profile)
+            .ok_or_else(|| format!("camera profile is unavailable: {profile:?}"))
+    }
+
+    fn evaluate_frame(&mut self, profile: u8, time_seconds: f64) -> Result<bool, String> {
+        let evaluation = self
+            .profile(profile)?
+            .evaluate(&self.resource.curves, time_seconds)
+            .map_err(|error| error.to_string())?;
+        self.frame_words = empty_camera_frame();
+        let Some(evaluation) = evaluation else {
+            return Ok(false);
+        };
+        write_camera_frame(&mut self.frame_words, evaluation);
+        Ok(true)
+    }
+}
+
+const fn empty_camera_frame() -> [f64; CAMERA_FRAME_WORDS] {
+    let mut result = [0.0; CAMERA_FRAME_WORDS];
+    result[CAMERA_FRAME_ABI] = CAMERA_FRAME_ABI_VERSION as f64;
+    result[CAMERA_FRAME_INCOMING_INDEX] = -1.0;
+    result
+}
+
+fn write_camera_frame(words: &mut [f64; CAMERA_FRAME_WORDS], evaluation: CameraEvaluation) {
+    words[CAMERA_FRAME_AVAILABLE] = 1.0;
+    words[CAMERA_FRAME_ACTIVE_CLIPS] = f64::from(evaluation.active_clips);
+    words[CAMERA_FRAME_INCOMING_WEIGHT] = evaluation.incoming_weight;
+    words[CAMERA_FRAME_INCOMING_INDEX] = evaluation
+        .incoming_serialized_index
+        .map(f64::from)
+        .unwrap_or(-1.0);
+    words[CAMERA_FRAME_POSITION_X..=CAMERA_FRAME_POSITION_Z]
+        .copy_from_slice(&evaluation.state.position);
+    words[CAMERA_FRAME_ROTATION_X..=CAMERA_FRAME_ROTATION_W]
+        .copy_from_slice(&evaluation.state.rotation);
+    words[CAMERA_FRAME_VERTICAL_FOV] = evaluation.state.vertical_fov_degrees;
+}
+
+/// Returns the current module memory for zero-copy typed-array views.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(typescript_type = "WebAssembly.Memory")]
+    pub type CassiopeiaWasmMemory;
+}
+
+#[wasm_bindgen(js_name = cassiopeiaMemory)]
+pub fn cassiopeia_memory() -> CassiopeiaWasmMemory {
+    wasm_bindgen::memory().unchecked_into()
+}
 
 /// Deterministic transport for camera, motion, light, and penlight schedulers.
 #[derive(Debug)]
@@ -106,6 +254,7 @@ impl WasmPerformanceClock {
             .map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = setRate)]
     pub fn set_rate(&mut self, host_time_micros: i64, rate_millionths: u32) -> Result<(), JsError> {
         let rate = PlaybackRate::from_millionths(rate_millionths).map_err(js_error)?;
         self.clock
@@ -134,6 +283,7 @@ impl WasmPerformanceClock {
         Ok(())
     }
 
+    #[wasm_bindgen(js_name = timeMicros)]
     pub fn time_micros(&self, host_time_micros: i64) -> Result<i64, JsError> {
         self.clock
             .snapshot(TimeMicros(host_time_micros))
@@ -141,6 +291,7 @@ impl WasmPerformanceClock {
             .map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = rateMillionths)]
     pub fn rate_millionths(&self, host_time_micros: i64) -> Result<u32, JsError> {
         self.clock
             .snapshot(TimeMicros(host_time_micros))
@@ -605,6 +756,23 @@ mod tests {
         RuntimeChartV1, RuntimeNoteV1,
     };
 
+    const CAMERA_RESOURCE: &str = r#"{
+      "schema":"caph-live-camera-timelines-v1",
+      "curves":{"linear":[[0,0,1,1,0,0,0],[1,1,1,1,0,0,0]]},
+      "profiles":{"low":{
+        "durationSeconds":2,"frameRate":60,"wrapMode":2,
+        "baseIntroCameraName":null,"baseIntroCamera":null,
+        "cameras":{
+          "a":{"position":[0,0,0],"rotation":[0,0,0,1],"verticalFovDegrees":40},
+          "b":{"position":[10,20,30],"rotation":[0,0,1,0],"verticalFovDegrees":60}
+        },
+        "clips":[
+          ["a",0,2,-1,-1,"linear","linear",0,0,0,1,7],
+          ["b",1,1,1,-1,"linear","linear",0,0,0,1,8]
+        ]
+      }}
+    }"#;
+
     fn chart(notes: &[(u32, i64, NoteOperateType, NoteJudgementType)]) -> RuntimeChartV1 {
         RuntimeChartV1 {
             format: RUNTIME_CHART_FORMAT.into(),
@@ -631,6 +799,28 @@ mod tests {
 
     fn runtime(source: RuntimeChartV1, mode: u8) -> WasmRuntime {
         WasmRuntime::from_binary(&encode_runtime_chart_v1(&source).unwrap(), mode, 0).unwrap()
+    }
+
+    #[test]
+    fn camera_boundary_parses_once_and_reuses_one_fixed_frame_region() {
+        let mut timeline = WasmCameraTimeline::from_json(CAMERA_RESOURCE.as_bytes()).unwrap();
+        let pointer = timeline.frame_buffer_ptr();
+        assert_eq!(timeline.frame_buffer_len(), CAMERA_FRAME_WORDS);
+        assert_eq!(timeline.duration_seconds(0).unwrap(), 2.0);
+        assert_eq!(timeline.frame_rate(0).unwrap(), 60.0);
+
+        assert!(timeline.evaluate_frame(0, 1.5).unwrap());
+        assert_eq!(timeline.frame_buffer_ptr(), pointer);
+        assert_eq!(timeline.frame_words[CAMERA_FRAME_ABI], 1.0);
+        assert_eq!(timeline.frame_words[CAMERA_FRAME_AVAILABLE], 1.0);
+        assert_eq!(timeline.frame_words[CAMERA_FRAME_ACTIVE_CLIPS], 2.0);
+        assert!((timeline.frame_words[CAMERA_FRAME_INCOMING_WEIGHT] - 0.5).abs() < 1e-10);
+        assert!((timeline.frame_words[CAMERA_FRAME_POSITION_X] - 5.0).abs() < 1e-10);
+        assert!((timeline.frame_words[CAMERA_FRAME_VERTICAL_FOV] - 50.0).abs() < 1e-10);
+
+        assert!(!timeline.evaluate_frame(0, 2.0).unwrap());
+        assert_eq!(timeline.frame_buffer_ptr(), pointer);
+        assert_eq!(timeline.frame_words, empty_camera_frame());
     }
 
     #[test]
