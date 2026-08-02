@@ -3,8 +3,12 @@ import { readFileSync } from "node:fs";
 import init, {
   CameraFrameWord,
   CassiopeiaCameraTimeline,
+  CassiopeiaComboCharacterLotteryMachine,
   CassiopeiaComboCutInSequencer,
   CassiopeiaPerformanceClock,
+  ComboCharacterDialogueRole,
+  ComboCharacterLotteryKind,
+  ComboCharacterLotteryWord,
   ComboCutInEndReason,
   ComboCutInEventKind,
   ComboCutInEventWord,
@@ -32,6 +36,56 @@ assert.strictEqual(await init({ module_or_path: moduleBytes }), initialized);
 assert.equal(resolvePerformanceScreenMode(3, true, true, true), 3);
 assert.equal(resolvePerformanceScreenMode(2, false, false, false), 3);
 assert.equal(resolvePerformanceScreenMode(0, true, false, true), 1);
+
+const comboLottery = new CassiopeiaComboCharacterLotteryMachine(
+  new BigInt64Array([
+    BigInt(ComboCharacterDialogueRole.Call),
+    11n,
+    101n,
+    1_001n,
+    BigInt(ComboCharacterDialogueRole.Response),
+    22n,
+    202n,
+    2_002n,
+  ]),
+  new BigInt64Array([33n, 303n, 3_003n, 404n, 4_004n]),
+  42,
+);
+const comboLotteryPointer = comboLottery.resultBufferPtr();
+assert.equal(comboLottery.commonInputStride(), 4);
+assert.equal(comboLottery.fixedInputStride(), 5);
+assert.equal(comboLottery.resultBufferLen(), 18);
+comboLottery.loadRandomIndices(new Uint32Array([0]));
+assert.equal(comboLottery.randomIndicesRemaining(), 1);
+assert.equal(comboLottery.refresh(), true);
+assert.equal(comboLottery.randomIndicesRemaining(), 0);
+const comboLotteryResult = new BigInt64Array(
+  cassiopeiaMemory().buffer,
+  comboLotteryPointer,
+  comboLottery.resultBufferLen(),
+);
+
+assert.equal(comboLottery.draw(), ComboCharacterLotteryKind.Fixed);
+assert.equal(comboLottery.resultBufferPtr(), comboLotteryPointer);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.AbiVersion], 1n);
+assert.equal(
+  comboLotteryResult[ComboCharacterLotteryWord.Kind],
+  BigInt(ComboCharacterLotteryKind.Fixed),
+);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.Source], 0n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.FirstRole], 0n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.FirstCharacterId], 303n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.SecondRole], 1n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.SecondDialogueId], 33n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.SecondCharacterId], 404n);
+
+assert.equal(comboLottery.draw(), ComboCharacterLotteryKind.Common);
+assert.equal(comboLottery.resultBufferPtr(), comboLotteryPointer);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.Source], 1n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.FirstRole], 2n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.FirstCharacterId], 101n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.SecondRole], 3n);
+assert.equal(comboLotteryResult[ComboCharacterLotteryWord.SecondCharacterId], 202n);
 
 const cameraResource = new TextEncoder().encode(
   JSON.stringify({
@@ -334,6 +388,7 @@ assert.equal(comboCutIn.advance(0n, false), 0);
 assert.equal(comboCutIn.eventBufferPtr(), comboCutInPointer);
 
 comboCutIn.free();
+comboLottery.free();
 clock.free();
 chorusTimeline.free();
 timeline.free();

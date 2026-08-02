@@ -1,6 +1,6 @@
 use crate::TimeMicros;
 use serde::{Deserialize, Serialize};
-use std::{array, fmt};
+use std::{array, collections::VecDeque, fmt};
 
 pub const COMBO_CUT_IN_INTERVAL: u32 = 100;
 pub const COMBO_CUT_IN_PARTICIPANT_COUNT: usize = 2;
@@ -186,6 +186,302 @@ impl fmt::Display for ComboCutInCastError {
 }
 
 impl std::error::Error for ComboCutInCastError {}
+
+/// The authored role of one common combo voice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "camelCase")]
+pub enum ComboCharacterDialogueRole {
+    Call = 1,
+    Response = 2,
+}
+
+/// The compact identity needed by the lottery and by a host-side voice lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComboCharacterVoice {
+    pub character_id: i64,
+    pub voice_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComboCharacterCommonVoice {
+    pub dialogue_id: i64,
+    pub role: ComboCharacterDialogueRole,
+    pub voice: ComboCharacterVoice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComboCharacterFixedPair {
+    pub dialogue_id: i64,
+    pub first: ComboCharacterVoice,
+    pub second: ComboCharacterVoice,
+}
+
+/// Supplies the integer equivalent of `Random.Range(0, upper_exclusive)`.
+///
+/// Implementations must sample uniformly. The machine validates the returned
+/// index so a faulty host RNG becomes an explicit error instead of corrupting
+/// queue state.
+pub trait ComboCharacterLotteryRng {
+    fn range(&mut self, upper_exclusive: usize) -> usize;
+}
+
+impl<F> ComboCharacterLotteryRng for F
+where
+    F: FnMut(usize) -> usize,
+{
+    fn range(&mut self, upper_exclusive: usize) -> usize {
+        self(upper_exclusive)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComboCharacterLotteryError {
+    RandomIndexOutOfRange {
+        upper_exclusive: usize,
+        actual: usize,
+    },
+    CommonVoiceUnavailableAfterRefresh {
+        role: ComboCharacterDialogueRole,
+        ignored_character_id: i64,
+    },
+}
+
+impl fmt::Display for ComboCharacterLotteryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RandomIndexOutOfRange {
+                upper_exclusive,
+                actual,
+            } => write!(
+                formatter,
+                "combo-character RNG returned {actual}; expected 0..{upper_exclusive}"
+            ),
+            Self::CommonVoiceUnavailableAfterRefresh {
+                role,
+                ignored_character_id,
+            } => write!(
+                formatter,
+                "no {role:?} combo-character voice remained after refresh with ignored character {ignored_character_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComboCharacterLotteryError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComboCharacterLotteryPartialFailure {
+    ResponseUnavailable { ignored_character_id: i64 },
+    Error(ComboCharacterLotteryError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComboCharacterLotteryOutcome {
+    Unavailable,
+    Fixed(ComboCharacterFixedPair),
+    Common {
+        call: ComboCharacterCommonVoice,
+        response: ComboCharacterCommonVoice,
+    },
+    CommonPartial {
+        call: ComboCharacterCommonVoice,
+        failure: ComboCharacterLotteryPartialFailure,
+    },
+}
+
+/// Persistent, allocation-stable combo-character voice lottery.
+///
+/// Source rows are stored once. The two queues only contain indices and retain
+/// their allocated capacity across refreshes. A fixed pair is always consumed
+/// before common voices, and an exhausted fixed queue is never refreshed by a
+/// fixed pop. A requested common role is found by circular scan: skipped prefix
+/// entries move to the tail while the matching entry is removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComboCharacterLotteryMachine {
+    common_source: Vec<ComboCharacterCommonVoice>,
+    fixed_source: Vec<ComboCharacterFixedPair>,
+    common_queue: VecDeque<usize>,
+    fixed_queue: VecDeque<usize>,
+}
+
+impl ComboCharacterLotteryMachine {
+    pub fn new<R: ComboCharacterLotteryRng + ?Sized>(
+        common_source: Vec<ComboCharacterCommonVoice>,
+        fixed_source: Vec<ComboCharacterFixedPair>,
+        rng: &mut R,
+    ) -> Result<Self, ComboCharacterLotteryError> {
+        let common_capacity = common_source.len();
+        let fixed_capacity = fixed_source.len();
+        let mut machine = Self {
+            common_source,
+            fixed_source,
+            common_queue: VecDeque::with_capacity(common_capacity),
+            fixed_queue: VecDeque::with_capacity(fixed_capacity),
+        };
+        machine.refresh(rng)?;
+        Ok(machine)
+    }
+
+    pub fn common_source_len(&self) -> usize {
+        self.common_source.len()
+    }
+
+    pub fn fixed_source_len(&self) -> usize {
+        self.fixed_source.len()
+    }
+
+    pub fn common_remaining(&self) -> usize {
+        self.common_queue.len()
+    }
+
+    pub fn fixed_remaining(&self) -> usize {
+        self.fixed_queue.len()
+    }
+
+    /// Clears, repopulates, and independently shuffles common then fixed rows.
+    pub fn refresh<R: ComboCharacterLotteryRng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<(), ComboCharacterLotteryError> {
+        refresh_indices(&mut self.common_queue, self.common_source.len(), rng)?;
+        refresh_indices(&mut self.fixed_queue, self.fixed_source.len(), rng)
+    }
+
+    /// Pops one fixed pair without ever refreshing an exhausted fixed queue.
+    pub fn try_pop_fixed(&mut self) -> Option<ComboCharacterFixedPair> {
+        let index = self.fixed_queue.pop_front()?;
+        Some(self.fixed_source[index])
+    }
+
+    /// Circularly scans common rows for the requested role and character guard.
+    ///
+    /// `ignored_character_id == -1` disables the character guard. When a first
+    /// pass misses and `shortage_refresh` is enabled, both queues are refreshed
+    /// and the same predicate is scanned again. A second miss is an error.
+    pub fn try_pop_common<R: ComboCharacterLotteryRng + ?Sized>(
+        &mut self,
+        role: ComboCharacterDialogueRole,
+        ignored_character_id: i64,
+        shortage_refresh: bool,
+        rng: &mut R,
+    ) -> Result<Option<ComboCharacterCommonVoice>, ComboCharacterLotteryError> {
+        if let Some(index) = scan_common_queue(
+            &self.common_source,
+            &mut self.common_queue,
+            role,
+            ignored_character_id,
+        ) {
+            return Ok(Some(self.common_source[index]));
+        }
+
+        if !shortage_refresh {
+            return Ok(None);
+        }
+
+        self.refresh(rng)?;
+        let index = scan_common_queue(
+            &self.common_source,
+            &mut self.common_queue,
+            role,
+            ignored_character_id,
+        )
+        .ok_or(
+            ComboCharacterLotteryError::CommonVoiceUnavailableAfterRefresh {
+                role,
+                ignored_character_id,
+            },
+        )?;
+        Ok(Some(self.common_source[index]))
+    }
+
+    /// Draws one fixed pair or a common call/response pair.
+    ///
+    /// A common call uses no character exclusion. Its response excludes the
+    /// selected caller. Once the call is consumed it is never rolled back; a
+    /// response miss is returned as `CommonPartial` with the caller attached.
+    pub fn draw<R: ComboCharacterLotteryRng + ?Sized>(
+        &mut self,
+        shortage_refresh: bool,
+        rng: &mut R,
+    ) -> Result<ComboCharacterLotteryOutcome, ComboCharacterLotteryError> {
+        if let Some(pair) = self.try_pop_fixed() {
+            return Ok(ComboCharacterLotteryOutcome::Fixed(pair));
+        }
+
+        let Some(call) =
+            self.try_pop_common(ComboCharacterDialogueRole::Call, -1, shortage_refresh, rng)?
+        else {
+            return Ok(ComboCharacterLotteryOutcome::Unavailable);
+        };
+
+        match self.try_pop_common(
+            ComboCharacterDialogueRole::Response,
+            call.voice.character_id,
+            shortage_refresh,
+            rng,
+        ) {
+            Ok(Some(response)) => Ok(ComboCharacterLotteryOutcome::Common { call, response }),
+            Ok(None) => Ok(ComboCharacterLotteryOutcome::CommonPartial {
+                call,
+                failure: ComboCharacterLotteryPartialFailure::ResponseUnavailable {
+                    ignored_character_id: call.voice.character_id,
+                },
+            }),
+            Err(error) => Ok(ComboCharacterLotteryOutcome::CommonPartial {
+                call,
+                failure: ComboCharacterLotteryPartialFailure::Error(error),
+            }),
+        }
+    }
+}
+
+fn refresh_indices<R: ComboCharacterLotteryRng + ?Sized>(
+    queue: &mut VecDeque<usize>,
+    source_len: usize,
+    rng: &mut R,
+) -> Result<(), ComboCharacterLotteryError> {
+    queue.clear();
+    queue.extend(0..source_len);
+
+    for index in (1..source_len).rev() {
+        let upper_exclusive = index + 1;
+        let random_index = rng.range(upper_exclusive);
+        if random_index >= upper_exclusive {
+            return Err(ComboCharacterLotteryError::RandomIndexOutOfRange {
+                upper_exclusive,
+                actual: random_index,
+            });
+        }
+        queue.swap(index, random_index);
+    }
+    Ok(())
+}
+
+fn scan_common_queue(
+    source: &[ComboCharacterCommonVoice],
+    queue: &mut VecDeque<usize>,
+    role: ComboCharacterDialogueRole,
+    ignored_character_id: i64,
+) -> Option<usize> {
+    let scan_len = queue.len();
+    for _ in 0..scan_len {
+        let index = queue
+            .pop_front()
+            .expect("combo-character scan length is captured from this queue");
+        let entry = source[index];
+        let character_matches =
+            ignored_character_id == -1 || entry.voice.character_id != ignored_character_id;
+        if entry.role == role && character_matches {
+            return Some(index);
+        }
+        queue.push_back(index);
+    }
+    None
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -643,6 +939,7 @@ impl std::error::Error for ComboCutInError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     const FIRST_ACTOR: ComboCutInActor = ComboCutInActor {
         role: ComboCutInRole::Call,
@@ -656,6 +953,61 @@ mod tests {
         member_index: 4,
         voice_id: 2_002,
     };
+
+    #[derive(Default)]
+    struct ScriptedRng {
+        values: VecDeque<usize>,
+        upper_bounds: Vec<usize>,
+    }
+
+    impl ScriptedRng {
+        fn new(values: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                values: values.into_iter().collect(),
+                upper_bounds: Vec::new(),
+            }
+        }
+    }
+
+    impl ComboCharacterLotteryRng for ScriptedRng {
+        fn range(&mut self, upper_exclusive: usize) -> usize {
+            self.upper_bounds.push(upper_exclusive);
+            self.values
+                .pop_front()
+                .unwrap_or_else(|| upper_exclusive.saturating_sub(1))
+        }
+    }
+
+    fn lottery_voice(dialogue_id: i64, character_id: i64) -> ComboCharacterVoice {
+        ComboCharacterVoice {
+            character_id,
+            voice_id: dialogue_id + 10_000,
+        }
+    }
+
+    fn common_voice(
+        role: ComboCharacterDialogueRole,
+        dialogue_id: i64,
+        character_id: i64,
+    ) -> ComboCharacterCommonVoice {
+        ComboCharacterCommonVoice {
+            dialogue_id,
+            role,
+            voice: lottery_voice(dialogue_id, character_id),
+        }
+    }
+
+    fn fixed_pair(dialogue_id: i64) -> ComboCharacterFixedPair {
+        ComboCharacterFixedPair {
+            dialogue_id,
+            first: lottery_voice(dialogue_id, dialogue_id + 100),
+            second: lottery_voice(dialogue_id + 1, dialogue_id + 200),
+        }
+    }
+
+    fn identity_rng(upper_exclusive: usize) -> usize {
+        upper_exclusive - 1
+    }
 
     fn cast() -> ComboCutInCast {
         ComboCutInCast::new(ComboCutInSource::Fixed, [FIRST_ACTOR, SECOND_ACTOR]).unwrap()
@@ -1077,5 +1429,258 @@ mod tests {
             Err(ComboCutInError::NegativeDelta(TimeMicros(-1)))
         );
         assert_eq!(sequencer.active_elapsed(), Some(TimeMicros(0)));
+    }
+
+    #[test]
+    fn lottery_refresh_uses_descending_fisher_yates_for_common_then_fixed() {
+        let common = (0..5)
+            .map(|index| common_voice(ComboCharacterDialogueRole::Call, index, index + 100))
+            .collect();
+        let fixed = (0..4).map(|index| fixed_pair(index + 1_000)).collect();
+        let mut rng = ScriptedRng::new([1, 2, 0, 1, 0, 2, 0]);
+
+        let machine = ComboCharacterLotteryMachine::new(common, fixed, &mut rng).unwrap();
+
+        assert_eq!(rng.upper_bounds, vec![5, 4, 3, 2, 4, 3, 2]);
+        assert_eq!(
+            machine.common_queue.iter().copied().collect::<Vec<_>>(),
+            vec![3, 4, 0, 2, 1]
+        );
+        assert_eq!(
+            machine.fixed_queue.iter().copied().collect::<Vec<_>>(),
+            vec![1, 3, 2, 0]
+        );
+    }
+
+    #[test]
+    fn fixed_pairs_have_absolute_priority_and_do_not_self_refresh() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Call, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Response, 2, 20),
+        ];
+        let fixed = vec![fixed_pair(100), fixed_pair(200)];
+        let mut rng = identity_rng;
+        let mut machine =
+            ComboCharacterLotteryMachine::new(common, fixed.clone(), &mut rng).unwrap();
+
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Fixed(fixed[0]))
+        );
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Fixed(fixed[1]))
+        );
+        assert_eq!(machine.fixed_remaining(), 0);
+        assert!(matches!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Common { .. })
+        ));
+        assert_eq!(machine.fixed_remaining(), 0);
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Unavailable)
+        );
+    }
+
+    #[test]
+    fn common_scan_consumes_the_match_and_rotates_only_its_prefix() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Response, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Call, 2, 20),
+            common_voice(ComboCharacterDialogueRole::Response, 3, 30),
+            common_voice(ComboCharacterDialogueRole::Call, 4, 40),
+        ];
+        let mut rng = identity_rng;
+        let mut machine =
+            ComboCharacterLotteryMachine::new(common.clone(), vec![], &mut rng).unwrap();
+
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Call, -1, false, &mut rng),
+            Ok(Some(common[1]))
+        );
+        assert_eq!(
+            machine.common_queue.iter().copied().collect::<Vec<_>>(),
+            vec![2, 3, 0]
+        );
+
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Response, 30, false, &mut rng),
+            Ok(Some(common[0]))
+        );
+        assert_eq!(
+            machine.common_queue.iter().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn unsuccessful_common_scan_preserves_the_circular_order_without_refresh() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Call, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Call, 2, 20),
+            common_voice(ComboCharacterDialogueRole::Call, 3, 30),
+        ];
+        let mut rng = identity_rng;
+        let mut machine = ComboCharacterLotteryMachine::new(common, vec![], &mut rng).unwrap();
+        let before = machine.common_queue.clone();
+
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Response, -1, false, &mut rng),
+            Ok(None)
+        );
+        assert_eq!(machine.common_queue, before);
+    }
+
+    #[test]
+    fn shortage_refresh_repopulates_both_queues_then_consumes_the_requested_common_role() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Call, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Response, 2, 20),
+        ];
+        let fixed = vec![fixed_pair(100)];
+        let mut rng = identity_rng;
+        let mut machine =
+            ComboCharacterLotteryMachine::new(common.clone(), fixed.clone(), &mut rng).unwrap();
+
+        assert_eq!(machine.try_pop_fixed(), Some(fixed[0]));
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Call, -1, false, &mut rng),
+            Ok(Some(common[0]))
+        );
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Response, -1, false, &mut rng),
+            Ok(Some(common[1]))
+        );
+        assert_eq!(
+            (machine.common_remaining(), machine.fixed_remaining()),
+            (0, 0)
+        );
+
+        assert_eq!(
+            machine.try_pop_common(ComboCharacterDialogueRole::Call, -1, true, &mut rng),
+            Ok(Some(common[0]))
+        );
+        assert_eq!(
+            (machine.common_remaining(), machine.fixed_remaining()),
+            (1, 1)
+        );
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Fixed(fixed[0]))
+        );
+    }
+
+    #[test]
+    fn common_draw_excludes_the_selected_call_character_from_response() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Call, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Response, 2, 10),
+            common_voice(ComboCharacterDialogueRole::Response, 3, 20),
+        ];
+        let mut rng = identity_rng;
+        let mut machine =
+            ComboCharacterLotteryMachine::new(common.clone(), vec![], &mut rng).unwrap();
+
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Common {
+                call: common[0],
+                response: common[2],
+            })
+        );
+        assert_eq!(
+            machine.common_queue.iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn response_failure_is_partial_and_never_rolls_back_the_call() {
+        let call = common_voice(ComboCharacterDialogueRole::Call, 1, 10);
+        let mut rng = identity_rng;
+        let mut machine = ComboCharacterLotteryMachine::new(vec![call], vec![], &mut rng).unwrap();
+
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::CommonPartial {
+                call,
+                failure: ComboCharacterLotteryPartialFailure::ResponseUnavailable {
+                    ignored_character_id: 10,
+                },
+            })
+        );
+        assert_eq!(machine.common_remaining(), 0);
+        assert_eq!(
+            machine.draw(false, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::Unavailable)
+        );
+    }
+
+    #[test]
+    fn missing_call_after_shortage_refresh_is_an_explicit_error() {
+        let mut rng = identity_rng;
+        let mut machine = ComboCharacterLotteryMachine::new(
+            vec![common_voice(ComboCharacterDialogueRole::Response, 1, 10)],
+            vec![],
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(
+            machine.draw(true, &mut rng),
+            Err(
+                ComboCharacterLotteryError::CommonVoiceUnavailableAfterRefresh {
+                    role: ComboCharacterDialogueRole::Call,
+                    ignored_character_id: -1,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn missing_response_after_shortage_refresh_preserves_call_as_partial() {
+        let call = common_voice(ComboCharacterDialogueRole::Call, 1, 10);
+        let mut rng = identity_rng;
+        let mut machine = ComboCharacterLotteryMachine::new(vec![call], vec![], &mut rng).unwrap();
+
+        assert_eq!(
+            machine.draw(true, &mut rng),
+            Ok(ComboCharacterLotteryOutcome::CommonPartial {
+                call,
+                failure: ComboCharacterLotteryPartialFailure::Error(
+                    ComboCharacterLotteryError::CommonVoiceUnavailableAfterRefresh {
+                        role: ComboCharacterDialogueRole::Response,
+                        ignored_character_id: 10,
+                    }
+                ),
+            })
+        );
+        assert_eq!(machine.common_remaining(), 1);
+    }
+
+    #[test]
+    fn refresh_reuses_queue_storage_and_rejects_an_invalid_rng_index() {
+        let common = vec![
+            common_voice(ComboCharacterDialogueRole::Call, 1, 10),
+            common_voice(ComboCharacterDialogueRole::Response, 2, 20),
+            common_voice(ComboCharacterDialogueRole::Response, 3, 30),
+        ];
+        let mut rng = identity_rng;
+        let mut machine = ComboCharacterLotteryMachine::new(common, vec![], &mut rng).unwrap();
+        let queue_pointer = machine.common_queue.as_slices().0.as_ptr();
+
+        machine.refresh(&mut rng).unwrap();
+        assert_eq!(machine.common_queue.as_slices().0.as_ptr(), queue_pointer);
+
+        let mut invalid_rng = |upper_exclusive: usize| upper_exclusive;
+        assert_eq!(
+            machine.refresh(&mut invalid_rng),
+            Err(ComboCharacterLotteryError::RandomIndexOutOfRange {
+                upper_exclusive: 3,
+                actual: 3,
+            })
+        );
+        assert_eq!(machine.common_remaining(), machine.common_source_len());
     }
 }

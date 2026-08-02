@@ -43,6 +43,9 @@ pub use chart::{CassiopeiaChart, ChartEvent, ChartHeader, ChartNote, NoteKind};
 pub use combo_cutin::{
     COMBO_CUT_IN_CUE_TIMES, COMBO_CUT_IN_DURATION, COMBO_CUT_IN_EVENT_CAPACITY,
     COMBO_CUT_IN_INTERVAL, COMBO_CUT_IN_MEMBER_COUNT, COMBO_CUT_IN_PARTICIPANT_COUNT,
+    ComboCharacterCommonVoice, ComboCharacterDialogueRole, ComboCharacterFixedPair,
+    ComboCharacterLotteryError, ComboCharacterLotteryMachine, ComboCharacterLotteryOutcome,
+    ComboCharacterLotteryPartialFailure, ComboCharacterLotteryRng, ComboCharacterVoice,
     ComboCutInActor, ComboCutInCast, ComboCutInCastError, ComboCutInEndReason, ComboCutInError,
     ComboCutInEvent, ComboCutInEvents, ComboCutInFrame, ComboCutInRole, ComboCutInRoleError,
     ComboCutInSequencer, ComboCutInSource, ComboCutInSourceError, combo_cutin_milestone,
