@@ -3,9 +3,16 @@ import { readFileSync } from "node:fs";
 import init, {
   CameraFrameWord,
   CassiopeiaCameraTimeline,
+  CassiopeiaComboCutInSequencer,
   CassiopeiaPerformanceClock,
+  ComboCutInEndReason,
+  ComboCutInEventKind,
+  ComboCutInEventWord,
+  ComboCutInRole,
+  ComboCutInSource,
   cassiopeiaMemory,
   initSync,
+  resolveComboCutInMilestone,
   resolvePerformanceScreenMode,
 } from "@haneoka/cassiopeia/wasm";
 
@@ -237,9 +244,99 @@ assert.equal(clock.timeMicros(1_500_000n), 2_000_000n);
 clock.pause(1_500_000n);
 assert.equal(clock.timeMicros(9_000_000n), 2_000_000n);
 
+assert.equal(resolveComboCutInMilestone(true, 100, 1, 200, 1_000, 0), 100n);
+assert.equal(resolveComboCutInMilestone(false, 100, 1, 200, 1_000, 0), -1n);
+assert.equal(resolveComboCutInMilestone(true, 100, 1, 995, 1_000, 5), -1n);
+
+const comboCutIn = new CassiopeiaComboCutInSequencer(
+  0,
+  ComboCutInSource.Fixed,
+  ComboCutInRole.Call,
+  101n,
+  1,
+  1_001n,
+  ComboCutInRole.Response,
+  202n,
+  4,
+  2_002n,
+);
+const comboCutInPointer = comboCutIn.eventBufferPtr();
+assert.equal(comboCutIn.eventBufferLen(), 72);
+assert.equal(comboCutIn.eventBufferStride(), 18);
+const comboCutInEvents = new BigInt64Array(
+  cassiopeiaMemory().buffer,
+  comboCutInPointer,
+  comboCutIn.eventBufferLen(),
+);
+const comboCutInEvent = (index) =>
+  comboCutInEvents.subarray(
+    index * comboCutIn.eventBufferStride(),
+    (index + 1) * comboCutIn.eventBufferStride(),
+  );
+
+assert.equal(comboCutIn.observeFrame(true, 100, 1, 200, 1_000, true), 2);
+assert.equal(comboCutIn.eventBufferPtr(), comboCutInPointer);
+assert.equal(comboCutIn.eventCount(), 2);
+const comboStart = comboCutInEvent(0);
+assert.equal(comboStart[ComboCutInEventWord.AbiVersion], 1n);
+assert.equal(comboStart[ComboCutInEventWord.Kind], BigInt(ComboCutInEventKind.Started));
+assert.equal(comboStart[ComboCutInEventWord.SequenceId], 1n);
+assert.equal(comboStart[ComboCutInEventWord.MilestoneCombo], 100n);
+assert.equal(comboStart[ComboCutInEventWord.DurationMicros], 4_000_000n);
+assert.equal(comboStart[ComboCutInEventWord.ActorCharacterId], 101n);
+assert.equal(comboStart[ComboCutInEventWord.PartnerCharacterId], 202n);
+const firstComboCue = comboCutInEvent(1);
+assert.equal(
+  firstComboCue[ComboCutInEventWord.Kind],
+  BigInt(ComboCutInEventKind.CueDispatched),
+);
+assert.equal(firstComboCue[ComboCutInEventWord.CutInIndex], 0n);
+assert.equal(firstComboCue[ComboCutInEventWord.DispatchedAtMicros], 0n);
+
+assert.equal(comboCutIn.advance(1_500_000n, true), 0);
+assert.equal(comboCutIn.hasPendingCue(), true);
+assert.ok(comboCutInEvents.every((word) => word === -1n));
+assert.equal(comboCutIn.advance(2_500_000n, true), 1);
+const comboEnd = comboCutInEvent(0);
+assert.equal(comboEnd[ComboCutInEventWord.Kind], BigInt(ComboCutInEventKind.Ended));
+assert.equal(
+  comboEnd[ComboCutInEventWord.EndReason],
+  BigInt(ComboCutInEndReason.Completed),
+);
+assert.equal(comboCutIn.isActive(), false);
+assert.equal(comboCutIn.hasPendingCue(), true);
+
+assert.equal(comboCutIn.advance(0n, false), 1);
+const lateComboCue = comboCutInEvent(0);
+assert.equal(lateComboCue[ComboCutInEventWord.CutInIndex], 1n);
+assert.equal(lateComboCue[ComboCutInEventWord.AuthoredAtMicros], 1_500_000n);
+assert.equal(lateComboCue[ComboCutInEventWord.DispatchedAtMicros], 4_000_000n);
+assert.equal(lateComboCue[ComboCutInEventWord.ActorCharacterId], 202n);
+
+assert.equal(comboCutIn.observeFrame(true, 200, 1, 300, 1_000, false), 2);
+assert.equal(comboCutIn.advance(1_000_000n, false), 0);
+comboCutIn.pause();
+assert.equal(comboCutIn.advance(9_000_000n, false), 0);
+assert.equal(comboCutIn.isActive(), true);
+comboCutIn.resume();
+assert.equal(comboCutIn.advance(500_000n, false), 1);
+
+assert.equal(comboCutIn.observeFrame(true, 300, 1, 400, 1_000, false), 3);
+assert.equal(comboCutIn.advance(1_500_000n, true), 0);
+assert.equal(comboCutIn.hasPendingCue(), true);
+assert.equal(comboCutIn.cancel(), 1);
+assert.equal(
+  comboCutInEvent(0)[ComboCutInEventWord.EndReason],
+  BigInt(ComboCutInEndReason.Cancelled),
+);
+assert.equal(comboCutIn.hasPendingCue(), false);
+assert.equal(comboCutIn.advance(0n, false), 0);
+assert.equal(comboCutIn.eventBufferPtr(), comboCutInPointer);
+
+comboCutIn.free();
 clock.free();
 chorusTimeline.free();
 timeline.free();
 console.log(
-  "WASM boundary: package export, resolver, clock, score camera, and chorus camera buffers passed",
+  "WASM boundary: package export, resolver, clock, camera, chorus, and combo cut-in buffers passed",
 );

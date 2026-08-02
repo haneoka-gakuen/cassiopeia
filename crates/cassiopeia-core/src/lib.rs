@@ -11,6 +11,7 @@ pub mod camera;
 pub mod camera_chorus;
 pub mod camera_effects;
 pub mod chart;
+pub mod combo_cutin;
 pub mod judgement;
 pub mod live;
 pub mod runtime;
@@ -39,6 +40,13 @@ pub use camera_effects::{
     CameraPerlinEffect, CameraPerlinProfile, CameraPerlinSample, unity_mathf_perlin_noise,
 };
 pub use chart::{CassiopeiaChart, ChartEvent, ChartHeader, ChartNote, NoteKind};
+pub use combo_cutin::{
+    COMBO_CUT_IN_CUE_TIMES, COMBO_CUT_IN_DURATION, COMBO_CUT_IN_EVENT_CAPACITY,
+    COMBO_CUT_IN_INTERVAL, COMBO_CUT_IN_MEMBER_COUNT, COMBO_CUT_IN_PARTICIPANT_COUNT,
+    ComboCutInActor, ComboCutInCast, ComboCutInCastError, ComboCutInEndReason, ComboCutInError,
+    ComboCutInEvent, ComboCutInEvents, ComboCutInFrame, ComboCutInRole, ComboCutInRoleError,
+    ComboCutInSequencer, ComboCutInSource, ComboCutInSourceError, combo_cutin_milestone,
+};
 pub use judgement::{
     JudgeResult, JudgeTiming, Judgement, JudgementProfile, JudgementWindow, NoteJudgementType,
     is_within_window, is_within_window_with_assist, judge, judge_with_assist, judgement_windows,

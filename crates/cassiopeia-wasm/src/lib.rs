@@ -13,6 +13,7 @@
 //! should recreate typed-array views when `WebAssembly.Memory.buffer` changes.
 
 mod chart_binary;
+mod combo_cutin;
 
 use std::collections::BTreeMap;
 
@@ -20,6 +21,7 @@ pub use chart_binary::{
     CHART_BINARY_MAGIC, CHART_BINARY_VERSION, CHART_HEADER_BYTES, CHART_LINE_HEADER_BYTES,
     CHART_NOTE_BYTES, ChartBinaryError, decode_runtime_chart_v1, encode_runtime_chart_v1,
 };
+pub use combo_cutin::*;
 use haneoka_cassiopeia_core::{
     CameraChorusResource, CameraEffect, CameraEffectsResource, CameraEvaluation,
     CameraFinishEvaluation, CameraFinishSequence, CameraIntroductionEvaluation,
