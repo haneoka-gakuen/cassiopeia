@@ -21,8 +21,9 @@ pub use chart_binary::{
     CHART_NOTE_BYTES, ChartBinaryError, decode_runtime_chart_v1, encode_runtime_chart_v1,
 };
 use haneoka_cassiopeia_core::{
-    GameplaySession, InputAction, InputVector, JudgementEvent, LanePosition, RuntimeInputEvent,
-    SessionMode, TimeMicros,
+    GameplaySession, InputAction, InputVector, JudgementEvent, LanePosition, PerformanceClock,
+    PlaybackRate, PlaybackState, RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode,
+    TimeMicros, resolve_screen_mode,
 };
 use wasm_bindgen::prelude::*;
 
@@ -60,6 +61,127 @@ pub const SNAPSHOT_PROCESSED: usize = 12;
 pub const SNAPSHOT_TOTAL: usize = 13;
 pub const SNAPSHOT_LAST_INPUT_SEQUENCE: usize = 14;
 pub const SNAPSHOT_EVENT_COUNT: usize = 15;
+
+/// Deterministic transport for camera, motion, light, and penlight schedulers.
+#[derive(Debug)]
+#[wasm_bindgen(js_name = CassiopeiaPerformanceClock)]
+pub struct WasmPerformanceClock {
+    clock: PerformanceClock,
+}
+
+#[wasm_bindgen(js_class = CassiopeiaPerformanceClock)]
+impl WasmPerformanceClock {
+    #[wasm_bindgen(constructor)]
+    pub fn new(host_time_micros: i64, performance_time_micros: i64) -> Self {
+        Self {
+            clock: PerformanceClock::new(
+                TimeMicros(host_time_micros),
+                TimeMicros(performance_time_micros),
+            ),
+        }
+    }
+
+    pub fn pause(&mut self, host_time_micros: i64) -> Result<(), JsError> {
+        self.clock
+            .pause(TimeMicros(host_time_micros))
+            .map_err(js_error)
+    }
+
+    pub fn resume(&mut self, host_time_micros: i64) -> Result<(), JsError> {
+        self.clock
+            .resume(TimeMicros(host_time_micros))
+            .map_err(js_error)
+    }
+
+    pub fn seek(
+        &mut self,
+        host_time_micros: i64,
+        performance_time_micros: i64,
+    ) -> Result<(), JsError> {
+        self.clock
+            .seek(
+                TimeMicros(host_time_micros),
+                TimeMicros(performance_time_micros),
+            )
+            .map_err(js_error)
+    }
+
+    pub fn set_rate(&mut self, host_time_micros: i64, rate_millionths: u32) -> Result<(), JsError> {
+        let rate = PlaybackRate::from_millionths(rate_millionths).map_err(js_error)?;
+        self.clock
+            .set_rate(TimeMicros(host_time_micros), rate)
+            .map_err(js_error)
+    }
+
+    pub fn rebuild(
+        &mut self,
+        host_time_micros: i64,
+        performance_time_micros: i64,
+        rate_millionths: u32,
+        playing: bool,
+    ) -> Result<(), JsError> {
+        let rate = PlaybackRate::from_millionths(rate_millionths).map_err(js_error)?;
+        self.clock.rebuild(
+            TimeMicros(host_time_micros),
+            TimeMicros(performance_time_micros),
+            rate,
+            if playing {
+                PlaybackState::Playing
+            } else {
+                PlaybackState::Paused
+            },
+        );
+        Ok(())
+    }
+
+    pub fn time_micros(&self, host_time_micros: i64) -> Result<i64, JsError> {
+        self.clock
+            .snapshot(TimeMicros(host_time_micros))
+            .map(|snapshot| snapshot.time.0)
+            .map_err(js_error)
+    }
+
+    pub fn rate_millionths(&self, host_time_micros: i64) -> Result<u32, JsError> {
+        self.clock
+            .snapshot(TimeMicros(host_time_micros))
+            .map(|snapshot| snapshot.rate.millionths())
+            .map_err(js_error)
+    }
+
+    pub fn playing(&self, host_time_micros: i64) -> Result<bool, JsError> {
+        self.clock
+            .snapshot(TimeMicros(host_time_micros))
+            .map(|snapshot| snapshot.state == PlaybackState::Playing)
+            .map_err(js_error)
+    }
+
+    pub fn revision(&self, host_time_micros: i64) -> Result<u64, JsError> {
+        self.clock
+            .snapshot(TimeMicros(host_time_micros))
+            .map(|snapshot| snapshot.revision)
+            .map_err(js_error)
+    }
+}
+
+#[wasm_bindgen(js_name = resolvePerformanceScreenMode)]
+pub fn resolve_performance_screen_mode(
+    requested: u8,
+    live2d_stage: bool,
+    main_music_video: bool,
+    band_video_jockey: bool,
+) -> Result<u8, JsError> {
+    let requested = ScreenMode::try_from(requested).map_err(js_error)?;
+    Ok(resolve_screen_mode(
+        requested,
+        ScreenResources {
+            live2d_stage,
+            main_music_video,
+            band_video_jockey,
+        },
+    )
+    .effective
+    .into())
+}
 
 /// Owns one validated chart and exposes only synchronous, fixed-width calls.
 #[derive(Debug)]

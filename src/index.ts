@@ -1,4 +1,5 @@
 export * from "./core/enums";
+export * from "./core/livePerformance";
 export * from "./core/assist";
 export * from "./core/types";
 export * from "./core/timing";
