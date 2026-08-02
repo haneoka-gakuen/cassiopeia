@@ -25,6 +25,14 @@ interface CanvasDimensions {
   readonly height: number;
 }
 
+/** Unversioned producers preserve the legacy per-render upload behavior. */
+export function dynamicCanvasFrameChanged(
+  producerVersion: number | undefined,
+  uploadedVersion: number | undefined,
+): boolean {
+  return producerVersion === undefined || producerVersion !== uploadedVersion;
+}
+
 /** Mark one produced canvas frame for upload and report a backing-size change. */
 export function refreshDynamicCanvasTexture(
   texture: DynamicCanvasTexture,

@@ -11,6 +11,8 @@ export interface ChartPlayerExpose {
 export interface ChartPlayerEvents {
   ready: [];
   playing: [value: boolean];
+  /** True only while chart media advances; title-introduction playback stays false. */
+  "media-playing": [value: boolean];
   timeupdate: [seconds: number];
   duration: [seconds: number];
   judgement: [event: JudgementEvent];

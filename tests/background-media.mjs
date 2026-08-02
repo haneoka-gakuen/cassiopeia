@@ -1,9 +1,26 @@
 import assert from "node:assert/strict";
 
 import {
+  dynamicCanvasFrameChanged,
   refreshDynamicCanvasTexture,
   selectBackgroundMediaSource,
 } from "../dist/index.js";
+
+assert.equal(
+  dynamicCanvasFrameChanged(undefined, undefined),
+  true,
+  "legacy unversioned canvases refresh per render",
+);
+assert.equal(
+  dynamicCanvasFrameChanged(7, 7),
+  false,
+  "an unchanged producer frame skips the upload",
+);
+assert.equal(
+  dynamicCanvasFrameChanged(8, 7),
+  true,
+  "a new producer frame uploads exactly once",
+);
 
 assert.equal(
   selectBackgroundMediaSource(true, true, true),

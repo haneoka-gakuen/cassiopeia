@@ -64,6 +64,8 @@ const props = withDefaults(
     backgroundVideoUrl?: string;
     /** Host-owned dynamic stage canvas, used when no playable video is selected. */
     backgroundCanvas?: HTMLCanvasElement;
+    /** Monotonic producer version; avoids uploading an unchanged canvas every render. */
+    backgroundCanvasVersion?: number;
     mode?: ChartMode;
     settings?: Partial<RenderSettings> & {
       judgementOffsetMs?: number;
@@ -139,6 +141,7 @@ let perfProbe: ChartPerfProbe | undefined;
 let backgroundVideoRevision = 0;
 let boundBackgroundVideoUrl = "";
 let failedBackgroundVideoUrl = "";
+let lastEmittedMediaPlaying = false;
 const inputMusicTime = new MusicTimeAnchor();
 const activePointerIds = new Set<number>();
 const inputFeedbackClaimedPointerIds = new Set<number>();
@@ -174,6 +177,13 @@ const presentationDurationMs = () =>
     0,
   );
 const playbackRate = () => clock?.rate ?? normalizePlaybackRate(props.rate);
+
+function emitMediaPlaying(value: boolean): void {
+  const next = Boolean(value);
+  if (lastEmittedMediaPlaying === next) return;
+  lastEmittedMediaPlaying = next;
+  emit("media-playing", next);
+}
 
 function renderPixelRatio(width: number, height: number): number {
   const quality = Math.max(
@@ -235,7 +245,7 @@ async function applyBackgroundFallback(
 ): Promise<void> {
   const canvas = props.backgroundCanvas;
   if (canvas) {
-    target.setBackgroundCanvas(canvas);
+    target.setBackgroundCanvas(canvas, props.backgroundCanvasVersion);
     return;
   }
   target.setBackgroundVideo(undefined);
@@ -276,7 +286,10 @@ async function applyBackgroundMedia(target: OurNotesRenderer): Promise<void> {
   if (url !== failedBackgroundVideoUrl) failedBackgroundVideoUrl = "";
   clearBackgroundVideo();
   if (source === "canvas") {
-    target.setBackgroundCanvas(props.backgroundCanvas);
+    target.setBackgroundCanvas(
+      props.backgroundCanvas,
+      props.backgroundCanvasVersion,
+    );
     return;
   }
   target.setBackgroundVideo(undefined);
@@ -761,6 +774,7 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
           .catch((reason) => renderer?.reportAssetError(reason))
       : undefined;
     await Promise.all([noteSoundUnlock, musicPlay, videoPlay]);
+    emitMediaPlaying(gameplayIsPlaying());
     requestFrame();
   } catch (reason) {
     if (!destroyed) {
@@ -769,6 +783,7 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
       restoreTitleIntroductionMedia(true);
       backgroundVideo.value?.pause();
       clock?.pause();
+      emitMediaPlaying(false);
       emit("playing", false);
       reportError(reason);
     }
@@ -823,6 +838,7 @@ function pause(): void {
   backgroundVideo.value?.pause();
   if (titleIntroductionMediaPrimed) restoreTitleIntroductionMedia(true);
   else clock?.pause();
+  emitMediaPlaying(false);
   if (introductionWasPlaying && !clock?.playing) emit("playing", false);
 }
 
@@ -835,6 +851,7 @@ function seek(seconds: number, skipIntroduction = true): void {
   clock.seek(seconds * 1000);
   resetTimeline(chartTimeMs());
   if (introductionWasPlaying) emit("playing", false);
+  if (introductionWasPlaying) emitMediaPlaying(false);
 }
 
 function attachInternalAudio(): void {
@@ -857,6 +874,7 @@ function attachInternalAudio(): void {
       if (candidate.timeMs + props.bgmOffsetMs < presentationDurationMs())
         timelineFinished = false;
       requestFrame();
+      emitMediaPlaying(true);
       emit("playing", true);
     }
   });
@@ -869,12 +887,14 @@ function attachInternalAudio(): void {
       pauseTitleIntroduction();
       dirty = true;
       requestFrame();
+      emitMediaPlaying(false);
       emit("playing", false);
     }
   });
   candidate.audio.addEventListener("ended", () => {
     if (active()) {
       finishTimeline();
+      emitMediaPlaying(false);
       emit("playing", false);
     }
   });
@@ -892,6 +912,7 @@ function attachInternalAudio(): void {
 function detachInternalAudio(): void {
   const previousClock = clock;
   clock = undefined;
+  if (previousClock?.playing) emitMediaPlaying(false);
   previousClock?.destroy();
   noteSounds?.dispose();
   noteSounds = undefined;
@@ -941,6 +962,7 @@ async function initialize(): Promise<void> {
         ?.play()
         .catch((reason) => candidate.reportAssetError(reason));
     }
+    emitMediaPlaying(gameplayIsPlaying());
     emit("duration", presentationDurationMs() / 1000);
     emit("ready");
   } catch (reason) {
@@ -953,6 +975,7 @@ watch(
     () => props.backgroundUrl,
     () => props.backgroundVideoUrl,
     () => props.backgroundCanvas,
+    () => props.backgroundCanvasVersion,
   ],
   async () => {
     const target = renderer;
@@ -1033,7 +1056,16 @@ watch(externalClockControlled, (controlled) => {
   if (controlled) skipTitleIntroduction();
   resetTimeline(chartTimeMs());
   emit("duration", presentationDurationMs() / 1000);
+  emitMediaPlaying(
+    controlled ? props.externalPlaying === true : gameplayIsPlaying(),
+  );
 });
+watch(
+  () => props.externalPlaying,
+  (value) => {
+    if (externalClockControlled.value) emitMediaPlaying(value === true);
+  },
+);
 watch(
   () => props.externalTimeMs,
   (value, previous) => {

@@ -14,7 +14,7 @@ import {
 import type { Texture } from "three";
 import { OUR_NOTES_LIVE_GEOMETRY } from "../assets/manifest";
 import { SpriteAtlas } from "../assets/SpriteAtlas";
-import { refreshDynamicCanvasTexture } from "./backgroundMedia";
+import { dynamicCanvasFrameChanged, refreshDynamicCanvasTexture } from "./backgroundMedia";
 import { HoldRibbonLayer } from "./HoldRibbon";
 import { HudLayer } from "./HudLayer";
 import { liveEffectFrameAction, LiveUrpBloomPipeline, liveEffectFrameIndex } from "./LiveUrpBloom";
@@ -94,6 +94,8 @@ export class OurNotesRenderer {
   private backgroundCanvas?: HTMLCanvasElement;
   private backgroundCanvasWidth = 0;
   private backgroundCanvasHeight = 0;
+  private backgroundCanvasVersion?: number;
+  private uploadedBackgroundCanvasVersion?: number;
   private loadPromise?: Promise<void>;
   private assetsReady = false;
   private contextLost = false;
@@ -425,6 +427,8 @@ export class OurNotesRenderer {
       this.backgroundCanvas = undefined;
       this.backgroundCanvasWidth = 0;
       this.backgroundCanvasHeight = 0;
+      this.backgroundCanvasVersion = undefined;
+      this.uploadedBackgroundCanvasVersion = undefined;
       this.backgroundTexture?.dispose();
       this.backgroundTexture = undefined;
       this.screenLane.setBackgroundTexture(undefined);
@@ -445,6 +449,8 @@ export class OurNotesRenderer {
     this.backgroundCanvas = undefined;
     this.backgroundCanvasWidth = 0;
     this.backgroundCanvasHeight = 0;
+    this.backgroundCanvasVersion = undefined;
+    this.uploadedBackgroundCanvasVersion = undefined;
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
     previous?.dispose();
@@ -458,6 +464,8 @@ export class OurNotesRenderer {
     this.backgroundCanvas = undefined;
     this.backgroundCanvasWidth = 0;
     this.backgroundCanvasHeight = 0;
+    this.backgroundCanvasVersion = undefined;
+    this.uploadedBackgroundCanvasVersion = undefined;
     if (!video) {
       this.backgroundTexture = undefined;
       this.screenLane.setBackgroundTexture(undefined);
@@ -473,10 +481,11 @@ export class OurNotesRenderer {
   }
 
   /** Bind a host-owned dynamic canvas inside the WebGL base framebuffer. */
-  setBackgroundCanvas(canvas?: HTMLCanvasElement): void {
+  setBackgroundCanvas(canvas?: HTMLCanvasElement, version?: number): void {
     if (this.disposed) return;
     this.backgroundLoadRevision += 1;
     if (canvas && canvas === this.backgroundCanvas && this.backgroundTexture) {
+      this.backgroundCanvasVersion = Number.isFinite(version) ? version : undefined;
       this.refreshBackgroundCanvas();
       return;
     }
@@ -485,6 +494,8 @@ export class OurNotesRenderer {
       this.backgroundCanvas = undefined;
       this.backgroundCanvasWidth = 0;
       this.backgroundCanvasHeight = 0;
+      this.backgroundCanvasVersion = undefined;
+      this.uploadedBackgroundCanvasVersion = undefined;
       this.backgroundTexture = undefined;
       this.screenLane.setBackgroundTexture(undefined);
       previous?.dispose();
@@ -496,6 +507,8 @@ export class OurNotesRenderer {
     this.backgroundCanvas = canvas;
     this.backgroundCanvasWidth = canvas.width;
     this.backgroundCanvasHeight = canvas.height;
+    this.backgroundCanvasVersion = Number.isFinite(version) ? version : undefined;
+    this.uploadedBackgroundCanvasVersion = this.backgroundCanvasVersion;
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
     previous?.dispose();
@@ -505,15 +518,15 @@ export class OurNotesRenderer {
     const canvas = this.backgroundCanvas;
     const texture = this.backgroundTexture;
     if (!canvas || !texture) return;
-    if (
-      !refreshDynamicCanvasTexture(
-        texture,
-        canvas,
-        this.backgroundCanvasWidth,
-        this.backgroundCanvasHeight,
-      )
-    )
-      return;
+    if (!dynamicCanvasFrameChanged(this.backgroundCanvasVersion, this.uploadedBackgroundCanvasVersion)) return;
+    const resized = refreshDynamicCanvasTexture(
+      texture,
+      canvas,
+      this.backgroundCanvasWidth,
+      this.backgroundCanvasHeight,
+    );
+    this.uploadedBackgroundCanvasVersion = this.backgroundCanvasVersion;
+    if (!resized) return;
     this.backgroundCanvasWidth = canvas.width;
     this.backgroundCanvasHeight = canvas.height;
     this.screenLane.refreshBackgroundLayout();
@@ -563,6 +576,8 @@ export class OurNotesRenderer {
     this.backgroundCanvas = undefined;
     this.backgroundCanvasWidth = 0;
     this.backgroundCanvasHeight = 0;
+    this.backgroundCanvasVersion = undefined;
+    this.uploadedBackgroundCanvasVersion = undefined;
     this.scene.clear();
     this.effectScene.clear();
     this.renderer.setAnimationLoop(null);
