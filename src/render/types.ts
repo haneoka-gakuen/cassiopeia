@@ -176,6 +176,7 @@ export interface RenderHudState {
   judgement?: RenderJudgement;
   judgementAge?: number;
   fastSlow?: "FAST" | "SLOW" | null;
+  differenceMs?: number;
   /** Active result views. Lane mode can display several simultaneous notes. */
   judgements?: ReadonlyArray<RenderJudgementInstance>;
   judgementPosition?: "center" | "lane" | "none";

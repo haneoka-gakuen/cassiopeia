@@ -59,8 +59,8 @@
   },
   "scripts": {
     "build": "vite build && vue-tsc -p tsconfig.build.json",
-    "benchmark": "pnpm run build && node benchmarks/runtime.mjs",
-    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs",
+    "benchmark": "pnpm run build && node benchmarks/runtime.mjs && node benchmarks/effects.mjs",
+    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs && node tests/background-media.mjs && node tests/particle-emission.mjs && node tests/note-mark.mjs",
     "typecheck": "vue-tsc -p tsconfig.json --noEmit",
     "rust:check": "cargo check --workspace --all-targets",
     "rust:test": "cargo test --workspace",

@@ -36,6 +36,8 @@ export interface RenderSettings {
   showJudgementLine: boolean;
   /** Native SimultaneousLineDisplay (OptionItemType 108). */
   showSimultaneousLine: boolean;
+  /** Emphasize critical/ease-note marks; the original option defaults off. */
+  showEaseNote: boolean;
   backgroundBrightness: number;
   judgeResultPosition: "center" | "lane" | "none";
   noteOverlapLaneBuffer: number;
@@ -70,6 +72,7 @@ export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
   showJudgementLine: false,
   // MasterOptionDefault stores TRUE for option 108 in every preset.
   showSimultaneousLine: true,
+  showEaseNote: false,
   backgroundBrightness: 0.7,
   judgeResultPosition: "center",
   noteOverlapLaneBuffer: 0,
@@ -1157,6 +1160,7 @@ export class RenderFrameBuilder {
     hud.judgement = last ? judgementName(last.judgement) : undefined;
     hud.judgementAge = last ? Math.max(0, (timeMs - last.judgedAtMs) / 1000) : undefined;
     hud.fastSlow = last?.timing === 1 ? "FAST" : last?.timing === 2 ? "SLOW" : null;
+    hud.differenceMs = last?.diffMs;
     hud.judgements = hudJudgements;
     hud.judgementPosition = settings.judgeResultPosition ?? DEFAULT_RENDER_SETTINGS.judgeResultPosition;
     hud.noteOverlapLaneBuffer = settings.noteOverlapLaneBuffer ?? DEFAULT_RENDER_SETTINGS.noteOverlapLaneBuffer;

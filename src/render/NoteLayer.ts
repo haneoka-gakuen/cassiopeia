@@ -43,6 +43,8 @@ interface NoteVisual {
   layoutWidth: number;
   layoutScale: number;
   lastAlpha: number;
+  /** Cached ease-note mark state; retained across pooling so reuse can restore it. */
+  lastEaseMarkEmphasized?: boolean;
 }
 
 /** Left, main-left border, main-middle, main-right border, right. */
@@ -57,6 +59,35 @@ interface NoteDescriptor {
   signature: string;
   decorationName?: string;
   arrowName?: string;
+}
+
+export interface EaseNoteMarkPresentation {
+  /** Whether this note view owns the mark SpriteRenderer affected by the option. */
+  hasMark: boolean;
+  emphasized: boolean;
+  /** Native mark Transform.localScale multiplier, including its Z component. */
+  scaleMultiplier: 1 | 2;
+  /** SpriteRenderer tint expressed as a Three.js hexadecimal color. */
+  color: 0x000000 | 0xffffff;
+}
+
+/**
+ * Resolve the ease-note mark branch independently of body and flick-arrow
+ * presentation. Slide-end views do not own a rendered mark.
+ */
+export function resolveEaseNoteMarkPresentation(
+  kind: RenderNoteKind,
+  critical: boolean,
+  isShowEaseNote: boolean,
+): EaseNoteMarkPresentation {
+  const hasMark = noteSkinDecorationName(kind) !== undefined;
+  const emphasized = hasMark && critical && isShowEaseNote;
+  return {
+    hasMark,
+    emphasized,
+    scaleMultiplier: emphasized ? 2 : 1,
+    color: emphasized ? 0x000000 : 0xffffff,
+  };
 }
 
 /** Sprite-atlas note renderer backed only by skin001 and native view rules. */
@@ -76,6 +107,7 @@ export class NoteLayer {
   private visualReuses = 0;
   private visualReleases = 0;
   private meshAllocations = 0;
+  private isShowEaseNote = false;
 
   constructor(projector: StageProjector, assets: OurNotesAssetManifest) {
     this.projector = projector;
@@ -88,6 +120,11 @@ export class NoteLayer {
     this.descriptors.clear();
     this.bounds.clear();
     this.atlas = atlas;
+  }
+
+  /** Mirrors the live-view ease-note option; disabled by default. */
+  setShowEaseNote(isShowEaseNote: boolean): void {
+    this.isShowEaseNote = isShowEaseNote;
   }
 
   update(notes: ReadonlyArray<RenderNote> | undefined): void {
@@ -232,6 +269,7 @@ export class NoteLayer {
       const material = this.material(decorationName);
       materials.push(material);
       decoration = new Mesh(this.plane, material);
+      decoration.name = "note-mark";
       decoration.renderOrder = OUR_NOTES_LIVE_GEOMETRY.sortingOrders.noteDecoration;
       root.add(decoration);
     }
@@ -382,7 +420,8 @@ export class NoteLayer {
 
   private layout(visual: NoteVisual, note: RenderNote): void {
     const scale = Math.max(0.05, note.scale ?? 1);
-    if (visual.layoutWidth !== note.width || visual.layoutScale !== scale) {
+    const layoutChanged = visual.layoutWidth !== note.width || visual.layoutScale !== scale;
+    if (layoutChanged) {
       const viewWidth = this.projector.widthToWorld(note.width) * scale;
       const leftBounds = this.spriteBounds(visual.parts.left.spriteName);
       const rightBounds = this.spriteBounds(visual.parts.right.spriteName);
@@ -417,15 +456,6 @@ export class NoteLayer {
         visual.bodyPositions.needsUpdate = true;
       }
 
-      if (visual.decoration) {
-        const bounds = this.spriteBounds(visual.decorationName);
-        visual.decoration.visible = Boolean(bounds);
-        if (bounds) {
-          const layout = layoutNoteSkinDecoration(bounds, scale);
-          visual.decoration.scale.set(layout.width, layout.height, 1);
-          visual.decoration.position.set(layout.centerX, layout.centerY, 0);
-        }
-      }
       if (visual.arrow) {
         const bounds = this.spriteBounds(visual.arrowName);
         visual.arrow.visible = Boolean(bounds && visual.arrowName);
@@ -438,6 +468,27 @@ export class NoteLayer {
       }
       visual.layoutWidth = note.width;
       visual.layoutScale = scale;
+    }
+
+    if (visual.decoration) {
+      const presentation = resolveEaseNoteMarkPresentation(
+        note.kind,
+        note.critical === true,
+        this.isShowEaseNote,
+      );
+      if (layoutChanged || visual.lastEaseMarkEmphasized !== presentation.emphasized) {
+        const bounds = this.spriteBounds(visual.decorationName);
+        visual.decoration.visible = Boolean(bounds && presentation.hasMark);
+        if (bounds && presentation.hasMark) {
+          // The mark's sprite pivot offset is part of its local geometry, so
+          // doubling the native local scale doubles both its bounds and centre.
+          const layout = layoutNoteSkinDecoration(bounds, scale * presentation.scaleMultiplier);
+          visual.decoration.scale.set(layout.width, layout.height, presentation.scaleMultiplier);
+          visual.decoration.position.set(layout.centerX, layout.centerY, 0);
+        }
+        visual.decoration.material.color.setHex(presentation.color);
+        visual.lastEaseMarkEmphasized = presentation.emphasized;
+      }
     }
 
     const alpha = Math.max(0, Math.min(1, note.alpha ?? 1));

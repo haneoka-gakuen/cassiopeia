@@ -67,6 +67,10 @@ export interface NativeParticleSystemData {
 
 interface LoadedParticleSystem extends NativeParticleSystemData {
   ref: Effect001ParticleSystemAssetRef;
+  /** Cached once when the authored system is loaded; read on every effect frame. */
+  animationPathHash?: number;
+  readonly animationPathHierarchy: ReadonlyArray<number>;
+  readonly nameHash: number;
   emissionBuffer: ParticleEmission[];
   emissionPool: ParticleEmission[];
 }
@@ -171,6 +175,7 @@ interface ImpactVisual {
 
 const EMPTY_EFFECTS: ReadonlyArray<RenderParticleEffect> = [];
 const EMPTY_VALUES: ReadonlyArray<unknown> = [];
+const EMPTY_PATH_HASHES: ReadonlyArray<number> = [];
 const LANE_EFFECT_EMISSION: ParticleEmission = { simulationTime: 0, originX: 0, originY: 0, originZ: 0, index: 0 };
 // The native lane-effect prefab root is +90° around Unity X. StageProjector
 // reflects Unity Z into Three space, so the equivalent rendered rotation is
@@ -808,6 +813,22 @@ function animationPathHierarchy(path: string): number[] {
   return parts.map((_, index) => unityStringHash(parts.slice(0, index + 1).join("/")));
 }
 
+function loadedParticleSystem(
+  data: NativeParticleSystemData,
+  ref: Effect001ParticleSystemAssetRef,
+): LoadedParticleSystem {
+  const animationPath = ref.animationPath;
+  return {
+    ...data,
+    ref,
+    animationPathHash: animationPath ? unityStringHash(animationPath) : undefined,
+    animationPathHierarchy: animationPath ? animationPathHierarchy(animationPath) : EMPTY_PATH_HASHES,
+    nameHash: hash(ref.name),
+    emissionBuffer: [],
+    emissionPool: [],
+  };
+}
+
 function particleSystemActiveAt(clip: NativeAnimationClip, paths: ReadonlyArray<number>, time: number): boolean {
   return paths.every((path) => {
     const active = clipBindingValue(clip, path, ATTRIBUTE_ACTIVE, time);
@@ -836,7 +857,7 @@ function particleSystemPlayback(
   } else {
     animationTime = Math.min(animationTime, animation.duration);
   }
-  const paths = animationPathHierarchy(path);
+  const paths = system.animationPathHierarchy;
   if (!particleSystemActiveAt(animation, paths, animationTime)) return undefined;
 
   let active = particleSystemActiveAt(animation, paths, 0);
@@ -867,15 +888,30 @@ function particleSystemSimulationSpeedAt(
   animation: NativeAnimationClip | undefined,
   absoluteAnimationTime: number,
 ): number {
-  const animated = system.ref.animationPath
-    ? clipBindingValue(
-        animation,
-        unityStringHash(system.ref.animationPath),
-        ATTRIBUTE_PARTICLE_SIMULATION_SPEED,
-        animationPlaybackTime(manifest, animation, absoluteAnimationTime),
-      )
-    : undefined;
+  const animated =
+    system.animationPathHash === undefined
+      ? undefined
+      : clipBindingValue(
+          animation,
+          system.animationPathHash,
+          ATTRIBUTE_PARTICLE_SIMULATION_SPEED,
+          animationPlaybackTime(manifest, animation, absoluteAnimationTime),
+        );
   return Math.max(Number.EPSILON, animated ?? system.simulationSpeed);
+}
+
+function particleSystemDistanceEmissionRate(system: LoadedParticleSystem, seed: number): number {
+  const emission = record(system.raw.EmissionModule);
+  if (!emission || emission.enabled !== true) return 0;
+  return Math.max(0, evaluateNativeMinMaxCurve(emission.rateOverDistance, 0, random(seed + 67)));
+}
+
+function particleSystemHasAnimatedSimulationSpeed(
+  system: LoadedParticleSystem,
+  animation: NativeAnimationClip | undefined,
+): boolean {
+  const path = system.animationPathHash;
+  return path !== undefined && animation?.bindingLookup.get(path)?.has(ATTRIBUTE_PARTICLE_SIMULATION_SPEED) === true;
 }
 
 function particleSimulationClock(
@@ -898,6 +934,32 @@ function particleSimulationClock(
     return Math.max(0, simulated - delay);
   };
   return { current: timeAt(age), timeAt };
+}
+
+/**
+ * Constant-speed systems can derive simulated time in O(1). Keep the sampled
+ * clock only for authored speed animation and distance emission, whose old
+ * path needs timeAt(realTime) while walking the moving emitter.
+ */
+function particleSimulationClockFor(
+  system: LoadedParticleSystem,
+  manifest: Effect001PrefabAssetRef,
+  animation: NativeAnimationClip | undefined,
+  animationTimeOffset: number,
+  seed: number,
+  age: number,
+): ParticleSimulationClock | undefined {
+  if (
+    !particleSystemHasAnimatedSimulationSpeed(system, animation) &&
+    particleSystemDistanceEmissionRate(system, seed) <= 0
+  )
+    return undefined;
+  return particleSimulationClock(system, manifest, animation, animationTimeOffset, seed, age);
+}
+
+function constantParticleSimulationTime(system: LoadedParticleSystem, age: number, seed: number): number {
+  const delay = evaluateNativeMinMaxCurve(system.raw.startDelay, 0, random(seed + 1));
+  return Math.max(0, Math.max(0, age) * system.simulationSpeed - delay);
 }
 
 function transparentTexture(): DataTexture {
@@ -1925,16 +1987,10 @@ function writeIncrementalOutput(state: IncrementalEmissionState, capacity: numbe
  * elapsed 1/60-second steps. Bursts and distance emission retain the complete
  * replay fallback below; all shipped SlideLoop systems satisfy this predicate.
  */
-function supportsIncrementalRateEmission(
-  system: LoadedParticleSystem,
-  prefab: LoadedPrefab,
-  seed: number,
-  judgementAnimation: NativeAnimationClip | undefined,
-): boolean {
+function supportsIncrementalRateEmission(system: LoadedParticleSystem, seed: number): boolean {
   const emission = record(system.raw.EmissionModule);
   if (!emission || emission.enabled !== true || array(emission.m_Bursts).length > 0) return false;
-  const distanceRate = Math.max(0, evaluateNativeMinMaxCurve(emission.rateOverDistance, 0, random(seed + 67)));
-  return distanceRate <= 0 || (!prefab.distanceAnimation && !judgementAnimation);
+  return particleSystemDistanceEmissionRate(system, seed) <= 0;
 }
 
 function processRateStep(
@@ -2283,20 +2339,15 @@ export class ParticleLayer {
         if (!parsed) throw new Error(`${ref.particleSystemMetadataUrl}: invalid ParticleSystem projection`);
         return [
           key,
-          {
-            ...parsed,
-            ref: {
-              name: `lane-effect/${key}`,
-              metadataUrl: ref.particleSystemMetadataUrl,
-              texture: "star",
-              localPosition: [0, 0, 0],
-              // Lane effects render through EffectMeshBatch, not the
-              // effect001 billboard shader that consumes this field.
-              rendererMaxParticleSize: 0,
-            },
-            emissionBuffer: [],
-            emissionPool: [],
-          },
+          loadedParticleSystem(parsed, {
+            name: `lane-effect/${key}`,
+            metadataUrl: ref.particleSystemMetadataUrl,
+            texture: "star",
+            localPosition: [0, 0, 0],
+            // Lane effects render through EffectMeshBatch, not the
+            // effect001 billboard shader that consumes this field.
+            rendererMaxParticleSize: 0,
+          }),
         ] as const;
       }),
     );
@@ -2331,7 +2382,7 @@ export class ParticleLayer {
               if (!response.ok) throw new Error(`${ref.metadataUrl}: HTTP ${response.status}`);
               const parsed = readNativeParticleSystem(await response.json());
               if (!parsed) throw new Error(`${ref.metadataUrl}: invalid ParticleSystem projection`);
-              return { ...parsed, ref, emissionBuffer: [], emissionPool: [] };
+              return loadedParticleSystem(parsed, ref);
             }),
           ),
           loadAnimation(manifest.animationClipUrl),
@@ -2436,6 +2487,7 @@ export class ParticleLayer {
       const loaded = this.loadedPrefabs.get(prefabId);
       const judgement = effectAnimationJudgement(effect);
       const movementAnimation = loaded?.animations.get(judgement) ?? loaded?.animation;
+      const effectSeed = effect.seed ?? hash(id);
       const impact = this.updateImpact(
         id,
         manifest,
@@ -2445,7 +2497,7 @@ export class ParticleLayer {
         width,
         this.pointScratch,
         epoch,
-        effect.seed ?? hash(id),
+        effectSeed,
       );
       if (!loaded) continue;
       // The per-texture instance batch is the only capacity guard. It is
@@ -2455,8 +2507,8 @@ export class ParticleLayer {
         if (system.ref.renderer === "wallMesh") continue;
         const playback = particleSystemPlayback(system, manifest, movementAnimation, effect.age);
         if (!playback) continue;
-        const systemSeed = (effect.seed ?? hash(id)) ^ hash(system.ref.name);
-        const simulationClock = particleSimulationClock(
+        const systemSeed = effectSeed ^ system.nameHash;
+        const simulationClock = particleSimulationClockFor(
           system,
           manifest,
           movementAnimation,
@@ -2464,7 +2516,7 @@ export class ParticleLayer {
           systemSeed,
           playback.age,
         );
-        const systemTime = simulationClock.current;
+        const systemTime = simulationClock?.current ?? constantParticleSimulationTime(system, playback.age, systemSeed);
         const emissions = this.emissionEventsFor(
           impact,
           system,
@@ -2635,8 +2687,8 @@ export class ParticleLayer {
     if (!loaded || !wallSystem || !wallTexture) return impact;
     const playback = particleSystemPlayback(wallSystem, manifest, animation, age);
     if (!playback) return impact;
-    const wallSeed = seed ^ hash(wallSystem.ref.name);
-    const simulationClock = particleSimulationClock(
+    const wallSeed = seed ^ wallSystem.nameHash;
+    const simulationClock = particleSimulationClockFor(
       wallSystem,
       manifest,
       animation,
@@ -2654,7 +2706,7 @@ export class ParticleLayer {
       playback.animationTimeOffset,
       simulationClock,
     );
-    const wallTime = simulationClock.current;
+    const wallTime = simulationClock?.current ?? constantParticleSimulationTime(wallSystem, playback.age, wallSeed);
     for (const emission of emissions) {
       const sample = sampleParticle(wallSystem, emission, wallTime, width, wallSeed);
       if (!sample) continue;
@@ -2691,7 +2743,7 @@ export class ParticleLayer {
       !this.incrementalEmissions ||
       system.ref.animationPath ||
       simulationClock ||
-      !supportsIncrementalRateEmission(system, prefab, seed, judgementAnimation)
+      !supportsIncrementalRateEmission(system, seed)
     ) {
       return emissionEvents(system, prefab, age, seed, judgementAnimation, animationTimeOffset, simulationClock);
     }

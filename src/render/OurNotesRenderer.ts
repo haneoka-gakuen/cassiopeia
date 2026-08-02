@@ -1,4 +1,5 @@
 import {
+  CanvasTexture,
   Color,
   Group,
   PerspectiveCamera,
@@ -13,6 +14,7 @@ import {
 import type { Texture } from "three";
 import { OUR_NOTES_LIVE_GEOMETRY } from "../assets/manifest";
 import { SpriteAtlas } from "../assets/SpriteAtlas";
+import { refreshDynamicCanvasTexture } from "./backgroundMedia";
 import { HoldRibbonLayer } from "./HoldRibbon";
 import { HudLayer } from "./HudLayer";
 import { liveEffectFrameAction, LiveUrpBloomPipeline, liveEffectFrameIndex } from "./LiveUrpBloom";
@@ -89,6 +91,9 @@ export class OurNotesRenderer {
   private readonly hud?: HudLayer;
   private atlas?: SpriteAtlas;
   private backgroundTexture?: Texture;
+  private backgroundCanvas?: HTMLCanvasElement;
+  private backgroundCanvasWidth = 0;
+  private backgroundCanvasHeight = 0;
   private loadPromise?: Promise<void>;
   private assetsReady = false;
   private contextLost = false;
@@ -200,6 +205,12 @@ export class OurNotesRenderer {
     return error;
   }
 
+  /** Toggle the optional critical/ease-note mark treatment. Disabled by default. */
+  setShowEaseNote(showEaseNote = false): void {
+    if (this.disposed) return;
+    this.notes.setShowEaseNote(showEaseNote);
+  }
+
   private async loadAssets(): Promise<void> {
     const assets = this.options.assets;
     const results = await Promise.allSettled([
@@ -232,6 +243,7 @@ export class OurNotesRenderer {
 
   render(frame: RenderFrame): void {
     if (this.disposed || this.contextLost) return;
+    this.refreshBackgroundCanvas();
     this.renderer.info.reset();
     this.stage.update(frame.stage);
     this.screenLane?.setOpacity(frame.stage?.laneOpacity ?? 1);
@@ -410,6 +422,9 @@ export class OurNotesRenderer {
   async setBackgroundTexture(url?: string, loader = new TextureLoader()): Promise<void> {
     const revision = ++this.backgroundLoadRevision;
     if (!url) {
+      this.backgroundCanvas = undefined;
+      this.backgroundCanvasWidth = 0;
+      this.backgroundCanvasHeight = 0;
       this.backgroundTexture?.dispose();
       this.backgroundTexture = undefined;
       this.screenLane.setBackgroundTexture(undefined);
@@ -427,6 +442,9 @@ export class OurNotesRenderer {
     texture.anisotropy = 4;
     texture.needsUpdate = true;
     const previous = this.backgroundTexture;
+    this.backgroundCanvas = undefined;
+    this.backgroundCanvasWidth = 0;
+    this.backgroundCanvasHeight = 0;
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
     previous?.dispose();
@@ -437,6 +455,9 @@ export class OurNotesRenderer {
     if (this.disposed) return;
     this.backgroundLoadRevision += 1;
     const previous = this.backgroundTexture;
+    this.backgroundCanvas = undefined;
+    this.backgroundCanvasWidth = 0;
+    this.backgroundCanvasHeight = 0;
     if (!video) {
       this.backgroundTexture = undefined;
       this.screenLane.setBackgroundTexture(undefined);
@@ -449,6 +470,53 @@ export class OurNotesRenderer {
     this.backgroundTexture = texture;
     this.screenLane.setBackgroundTexture(texture);
     previous?.dispose();
+  }
+
+  /** Bind a host-owned dynamic canvas inside the WebGL base framebuffer. */
+  setBackgroundCanvas(canvas?: HTMLCanvasElement): void {
+    if (this.disposed) return;
+    this.backgroundLoadRevision += 1;
+    if (canvas && canvas === this.backgroundCanvas && this.backgroundTexture) {
+      this.refreshBackgroundCanvas();
+      return;
+    }
+    const previous = this.backgroundTexture;
+    if (!canvas) {
+      this.backgroundCanvas = undefined;
+      this.backgroundCanvasWidth = 0;
+      this.backgroundCanvasHeight = 0;
+      this.backgroundTexture = undefined;
+      this.screenLane.setBackgroundTexture(undefined);
+      previous?.dispose();
+      return;
+    }
+    const texture = new CanvasTexture(canvas);
+    texture.colorSpace = SRGBColorSpace;
+    texture.generateMipmaps = false;
+    this.backgroundCanvas = canvas;
+    this.backgroundCanvasWidth = canvas.width;
+    this.backgroundCanvasHeight = canvas.height;
+    this.backgroundTexture = texture;
+    this.screenLane.setBackgroundTexture(texture);
+    previous?.dispose();
+  }
+
+  private refreshBackgroundCanvas(): void {
+    const canvas = this.backgroundCanvas;
+    const texture = this.backgroundTexture;
+    if (!canvas || !texture) return;
+    if (
+      !refreshDynamicCanvasTexture(
+        texture,
+        canvas,
+        this.backgroundCanvasWidth,
+        this.backgroundCanvasHeight,
+      )
+    )
+      return;
+    this.backgroundCanvasWidth = canvas.width;
+    this.backgroundCanvasHeight = canvas.height;
+    this.screenLane.refreshBackgroundLayout();
   }
 
   refreshBackgroundLayout(): void {
@@ -492,6 +560,9 @@ export class OurNotesRenderer {
     this.atlas = undefined;
     this.backgroundTexture?.dispose();
     this.backgroundTexture = undefined;
+    this.backgroundCanvas = undefined;
+    this.backgroundCanvasWidth = 0;
+    this.backgroundCanvasHeight = 0;
     this.scene.clear();
     this.effectScene.clear();
     this.renderer.setAnimationLoop(null);

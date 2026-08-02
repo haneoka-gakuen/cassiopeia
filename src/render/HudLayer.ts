@@ -29,6 +29,11 @@ const JUDGEMENT_PUNCH_DURATION = 0.15000000596046448;
 const JUDGEMENT_PUNCH_RISE_DURATION = 0.05000000447034836;
 const JUDGEMENT_PUNCH_SCALE = 0.2;
 const JUDGEMENT_SUB_SCALE = 0.75;
+const JUDGEMENT_TIMING_NATIVE_WIDTH = 307;
+const JUDGEMENT_TIMING_NATIVE_HEIGHT = 31;
+const JUDGEMENT_TIMING_FONT_SIZE = 44;
+const JUDGEMENT_FAST_COLOR = [0.36320751905441284, 0.7607458233833313, 1] as const;
+const JUDGEMENT_LATE_COLOR = [0.801886796951294, 0.2988162934780121, 0.2988162934780121] as const;
 const DEFAULT_TITLE_THEME: RenderTitleIntroductionTheme = {
   panelBackground: "rgba(92, 59, 190, 0.5)",
   panelBorderColor: "rgba(255, 255, 255, 0)",
@@ -147,6 +152,74 @@ export function sampleJudgementPunchScale(age: number): number {
   }
   const recoveryDuration = JUDGEMENT_PUNCH_DURATION - JUDGEMENT_PUNCH_RISE_DURATION;
   return 1 + JUDGEMENT_PUNCH_SCALE * (1 - outQuad((age - JUDGEMENT_PUNCH_RISE_DURATION) / recoveryDuration));
+}
+
+export interface JudgementTimingPresentation {
+  readonly mode: "sprite" | "milliseconds";
+  readonly timing: "fast" | "late";
+  readonly nativeWidth: number;
+  readonly nativeHeight: number;
+  readonly fontSize: number;
+  readonly text?: string;
+  readonly color?: string;
+  readonly scale: number;
+  readonly alpha: number;
+  readonly localX: number;
+  readonly localY: number;
+}
+
+/** Resolves the separately restarted native FAST/LATE sub tween. */
+export function resolveJudgementTimingPresentation(
+  state: Pick<
+    RenderHudState,
+    "alwaysShowFastSlow" | "showFastSlow" | "showPerfectFastSlow" | "showJudgeOffsetMs"
+  >,
+  judgement: RenderJudgementInstance["judgement"],
+  fastSlow: RenderJudgementInstance["fastSlow"],
+  differenceMs: number,
+  age: number,
+): JudgementTimingPresentation | null {
+  if (!fastSlow || age < 0 || age >= JUDGEMENT_SHOW_DURATION) return null;
+  const perfect = judgement === "perfect" || judgement === "just";
+  const good = judgement === "good";
+  const ordinaryFastSlow = judgement === "bad" || good || judgement === "great";
+  const perfectFastSlow = good || perfect;
+  const visible =
+    state.alwaysShowFastSlow === true ||
+    (state.showFastSlow !== false && ordinaryFastSlow) ||
+    (state.showPerfectFastSlow !== false && perfectFastSlow);
+  if (!visible) return null;
+
+  const timing = fastSlow === "FAST" ? "fast" : "late";
+  const scale = JUDGEMENT_SUB_SCALE * sampleJudgementPunchScale(age);
+  if (state.showJudgeOffsetMs === true) {
+    if (!Number.isFinite(differenceMs)) return null;
+    const color = timing === "fast" ? JUDGEMENT_FAST_COLOR : JUDGEMENT_LATE_COLOR;
+    return {
+      mode: "milliseconds",
+      timing,
+      nativeWidth: JUDGEMENT_TIMING_NATIVE_WIDTH,
+      nativeHeight: JUDGEMENT_TIMING_NATIVE_HEIGHT,
+      fontSize: JUDGEMENT_TIMING_FONT_SIZE,
+      text: String(Math.abs(Math.round(differenceMs))),
+      color: rgba(color[0], color[1], color[2], 1),
+      scale,
+      alpha: 1,
+      localX: 0,
+      localY: 0,
+    };
+  }
+  return {
+    mode: "sprite",
+    timing,
+    nativeWidth: JUDGEMENT_TIMING_NATIVE_WIDTH,
+    nativeHeight: JUDGEMENT_TIMING_NATIVE_HEIGHT,
+    fontSize: JUDGEMENT_TIMING_FONT_SIZE,
+    scale,
+    alpha: 1,
+    localX: 0,
+    localY: 0,
+  };
 }
 
 function rgba(red: number, green: number, blue: number, alpha: number): string {
@@ -814,7 +887,7 @@ export class HudLayer {
     this.drawJudgementSprite(
       state.judgement,
       state.fastSlow ?? null,
-      0,
+      state.differenceMs ?? 0,
       this.logicalWidth / 2,
       state,
       state.judgementAge ?? 0,
@@ -843,7 +916,14 @@ export class HudLayer {
   }
 
   private drawJudgementInstance(state: RenderHudState, result: RenderJudgementInstance, x: number): void {
-    this.drawJudgementSprite(result.judgement, result.fastSlow, result.differenceMs, x, state, result.age);
+    this.drawJudgementSprite(
+      result.judgement,
+      result.fastSlow,
+      result.differenceMs,
+      x,
+      state,
+      result.age,
+    );
   }
 
   private drawJudgementSprite(
@@ -856,39 +936,49 @@ export class HudLayer {
   ): void {
     if (age >= JUDGEMENT_SHOW_DURATION) return;
     const image = this.judgementImages[judgement];
-    if (!image) return;
     const context = this.context;
     // Live.prefab: UILiveJudgement y=-109; its effect_root/main_judge child
     // places the judgement center another 16 px below that root. Initialize
     // replaces the common editor placeholder with Image.SetNativeSize().
     const y = this.logicalHeight / 2 + 66;
-    const [width, height] = JUDGEMENT_NATIVE_SIZES[judgement];
+    if (image && age < JUDGEMENT_SHOW_DURATION) {
+      const [width, height] = JUDGEMENT_NATIVE_SIZES[judgement];
+      context.save();
+      context.translate(x, y);
+      const scale = sampleJudgementPunchScale(Math.max(0, age));
+      context.scale(scale, scale);
+      context.drawImage(image, -width / 2, -height / 2, width, height);
+      context.restore();
+    }
+
+    const timing = resolveJudgementTimingPresentation(
+      state,
+      judgement,
+      fastSlow,
+      differenceMs,
+      Math.max(0, age),
+    );
+    if (!timing) return;
     context.save();
     context.translate(x, y);
-    const scale = sampleJudgementPunchScale(Math.max(0, age));
-    context.scale(scale, scale);
-    context.drawImage(image, -width / 2, -height / 2, width, height);
-    const perfect = judgement === "perfect" || judgement === "just";
-    const good = judgement === "good";
-    const ordinaryFastSlow = judgement === "bad" || good || judgement === "great";
-    const perfectFastSlow = good || perfect;
-    const showTiming =
-      fastSlow &&
-      (state.alwaysShowFastSlow === true ||
-        (state.showFastSlow !== false && ordinaryFastSlow) ||
-        (state.showPerfectFastSlow !== false && perfectFastSlow));
-    if (showTiming) {
-      this.tmpSdfFont?.drawText(context, fastSlow, 0, 0, {
+    context.globalAlpha *= timing.alpha;
+    context.scale(timing.scale, timing.scale);
+    if (timing.mode === "sprite") {
+      const timingImage = this.judgementImages[timing.timing];
+      if (timingImage) {
+        context.drawImage(
+          timingImage,
+          timing.localX - timing.nativeWidth / 2,
+          timing.localY - timing.nativeHeight / 2,
+          timing.nativeWidth,
+          timing.nativeHeight,
+        );
+      }
+    } else {
+      this.tmpSdfFont?.drawText(context, timing.text ?? "", timing.localX, timing.localY, {
         align: "center",
-        fontSize: 44 * JUDGEMENT_SUB_SCALE,
-        color: fastSlow === "FAST" ? "rgb(92.62, 194.0, 255)" : "rgb(204.48, 76.2, 76.2)",
-      });
-    }
-    if (state.showJudgeOffsetMs && Number.isFinite(differenceMs)) {
-      this.tmpSdfFont?.drawText(context, `${differenceMs > 0 ? "+" : ""}${Math.round(differenceMs)} ms`, 0, 72, {
-        align: "center",
-        fontSize: 44,
-        color: "rgba(255, 255, 255, 0.92)",
+        fontSize: timing.fontSize,
+        color: timing.color ?? "rgba(255, 255, 255, 1)",
       });
     }
     context.restore();

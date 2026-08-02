@@ -8,6 +8,7 @@ import {
   watch,
 } from "vue";
 import {
+  DEFAULT_RENDER_SETTINGS,
   RenderFrameBuilder,
   type RenderSettings,
 } from "../adapter/renderFrame";
@@ -30,6 +31,7 @@ import {
   type TitleIntroductionSnapshot,
 } from "../presentation/TitleIntroduction";
 import { OurNotesRenderer } from "../render/OurNotesRenderer";
+import { selectBackgroundMediaSource } from "../render/backgroundMedia";
 import { ChartPerfProbe } from "../render/PerfProbe";
 import { nativeRenderPixelRatio } from "../render/pixelRatio";
 import type {
@@ -60,6 +62,8 @@ const props = withDefaults(
     backgroundUrl?: string;
     /** Optional muted stage video synchronized to the music clock. */
     backgroundVideoUrl?: string;
+    /** Host-owned dynamic stage canvas, used when no playable video is selected. */
+    backgroundCanvas?: HTMLCanvasElement;
     mode?: ChartMode;
     settings?: Partial<RenderSettings> & {
       judgementOffsetMs?: number;
@@ -217,10 +221,36 @@ function clearBackgroundVideo(): void {
   video.load();
 }
 
+function backgroundVideoIsSelected(): boolean {
+  const url = props.backgroundVideoUrl;
+  return Boolean(
+    url &&
+      failedBackgroundVideoUrl !== url &&
+      boundBackgroundVideoUrl === url,
+  );
+}
+
+async function applyBackgroundFallback(
+  target: OurNotesRenderer,
+): Promise<void> {
+  const canvas = props.backgroundCanvas;
+  if (canvas) {
+    target.setBackgroundCanvas(canvas);
+    return;
+  }
+  target.setBackgroundVideo(undefined);
+  await applyBackgroundTexture(target, props.backgroundUrl);
+}
+
 async function applyBackgroundMedia(target: OurNotesRenderer): Promise<void> {
   const video = backgroundVideo.value;
   const url = props.backgroundVideoUrl;
-  if (url && video && failedBackgroundVideoUrl !== url) {
+  const source = selectBackgroundMediaSource(
+    Boolean(url && video && failedBackgroundVideoUrl !== url),
+    Boolean(props.backgroundCanvas),
+    Boolean(props.backgroundUrl),
+  );
+  if (source === "video" && url && video) {
     video.muted = true;
     video.loop = props.loop;
     video.playbackRate = playbackRate();
@@ -245,8 +275,13 @@ async function applyBackgroundMedia(target: OurNotesRenderer): Promise<void> {
   }
   if (url !== failedBackgroundVideoUrl) failedBackgroundVideoUrl = "";
   clearBackgroundVideo();
+  if (source === "canvas") {
+    target.setBackgroundCanvas(props.backgroundCanvas);
+    return;
+  }
   target.setBackgroundVideo(undefined);
-  await applyBackgroundTexture(target, props.backgroundUrl);
+  if (source === "static")
+    await applyBackgroundTexture(target, props.backgroundUrl);
 }
 
 function syncBackgroundVideo(
@@ -299,8 +334,7 @@ function reportBackgroundVideoError(revision: number, url: string): void {
     video.load();
   }
   target.reportAssetError(message);
-  target.setBackgroundVideo(undefined);
-  void applyBackgroundTexture(target, props.backgroundUrl).then(() => {
+  void applyBackgroundFallback(target).then(() => {
     if (destroyed || renderer !== target) return;
     dirty = true;
     requestFrame();
@@ -721,13 +755,11 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
     restoreTitleIntroductionMedia(false);
     const musicPlay = clock?.playing ? undefined : clock?.play();
     syncBackgroundVideo(true);
-    const videoPlay =
-      props.backgroundVideoUrl &&
-      failedBackgroundVideoUrl !== props.backgroundVideoUrl
-        ? backgroundVideo.value
-            ?.play()
-            .catch((reason) => renderer?.reportAssetError(reason))
-        : undefined;
+    const videoPlay = backgroundVideoIsSelected()
+      ? backgroundVideo.value
+          ?.play()
+          .catch((reason) => renderer?.reportAssetError(reason))
+      : undefined;
     await Promise.all([noteSoundUnlock, musicPlay, videoPlay]);
     requestFrame();
   } catch (reason) {
@@ -879,6 +911,9 @@ async function initialize(): Promise<void> {
       pixelRatio: renderPixelRatio(initialWidth, initialHeight),
       assets: props.assets,
     });
+    candidate.setShowEaseNote(
+      props.settings.showEaseNote ?? DEFAULT_RENDER_SETTINGS.showEaseNote,
+    );
     renderer = candidate;
     await Promise.all([candidate.load(), applyBackgroundMedia(candidate)]);
     if (destroyed || renderer !== candidate) {
@@ -899,7 +934,7 @@ async function initialize(): Promise<void> {
     if (
       externalClockControlled.value &&
       props.externalPlaying &&
-      props.backgroundVideoUrl
+      backgroundVideoIsSelected()
     ) {
       syncBackgroundVideo(true);
       void backgroundVideo.value
@@ -913,20 +948,27 @@ async function initialize(): Promise<void> {
   }
 }
 
-watch([() => props.backgroundUrl, () => props.backgroundVideoUrl], async () => {
-  const target = renderer;
-  if (!target) return;
-  await applyBackgroundMedia(target);
-  if (destroyed || renderer !== target) return;
-  if (playerIsPlaying() && props.backgroundVideoUrl) {
-    syncBackgroundVideo(true);
-    void backgroundVideo.value
-      ?.play()
-      .catch((reason) => target.reportAssetError(reason));
-  }
-  dirty = true;
-  requestFrame();
-});
+watch(
+  [
+    () => props.backgroundUrl,
+    () => props.backgroundVideoUrl,
+    () => props.backgroundCanvas,
+  ],
+  async () => {
+    const target = renderer;
+    if (!target) return;
+    await applyBackgroundMedia(target);
+    if (destroyed || renderer !== target) return;
+    if (playerIsPlaying() && backgroundVideoIsSelected()) {
+      syncBackgroundVideo(true);
+      void backgroundVideo.value
+        ?.play()
+        .catch((reason) => target.reportAssetError(reason));
+    }
+    dirty = true;
+    requestFrame();
+  },
+);
 watch(
   () => props.mode,
   (mode) => {
@@ -1027,7 +1069,7 @@ watch(
     } else {
       timelineFinished = false;
       skipTitleIntroduction();
-      if (props.backgroundVideoUrl) {
+      if (backgroundVideoIsSelected()) {
         syncBackgroundVideo(true);
         void backgroundVideo.value
           ?.play()
@@ -1042,6 +1084,9 @@ watch(
   () => props.settings,
   (value) => {
     perfProbe = value.__perf ? (perfProbe ?? new ChartPerfProbe()) : undefined;
+    renderer?.setShowEaseNote(
+      value.showEaseNote ?? DEFAULT_RENDER_SETTINGS.showEaseNote,
+    );
     session?.setOffset(value.judgementOffsetMs ?? 0);
     resize();
     dirty = true;
