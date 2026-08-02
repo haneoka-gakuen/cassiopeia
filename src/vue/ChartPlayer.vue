@@ -23,6 +23,7 @@ import { normalizePlaybackRate } from "../audio/playbackRate";
 import type { ChartMode } from "../core/enums";
 import { LANE_COUNT } from "../core/geometry";
 import { ChartSession } from "../core/session";
+import { breaksCombo, incrementsCombo } from "../core/scoring";
 import type { ChartDocument, LaneInputEffectEvent } from "../core/types";
 import { OurNotesInput, type InputPoint } from "../input/OurNotesInput";
 import {
@@ -141,6 +142,9 @@ let resizeObserver: ResizeObserver | undefined;
 let animationFrame = 0;
 let lastTimeEmit = -1;
 let lastRenderedTimeMs = Number.NaN;
+let performanceEpoch = 0;
+let frameComboUpdated = false;
+let frameAddedCombo = 0;
 let suppressEffects = false;
 let destroyed = false;
 let dirty = true;
@@ -185,6 +189,10 @@ const presentationDurationMs = () =>
     0,
   );
 const playbackRate = () => clock?.rate ?? normalizePlaybackRate(props.rate);
+
+function beginPerformanceEpoch(): void {
+  performanceEpoch += 1;
+}
 
 function emitMediaPlaying(value: boolean): void {
   const next = Boolean(value);
@@ -378,6 +386,8 @@ function attachSession(): void {
   inputFeedbackClaimedPointerIds.clear();
   lastLaneInputEffect.clear();
   timelineFinished = false;
+  frameComboUpdated = false;
+  frameAddedCombo = 0;
   session = new ChartSession(props.chart, {
     mode: props.mode,
     judgementOffsetMs: props.settings.judgementOffsetMs ?? 0,
@@ -386,6 +396,14 @@ function attachSession(): void {
     particleSeed: props.effectSeed,
   });
   session.on("judgement", (event) => {
+    if (incrementsCombo(event.judgement)) {
+      frameComboUpdated = true;
+      frameAddedCombo += 1;
+    } else if (breaksCombo(event.judgement)) {
+      // Only additions after the latest break belong to the visible combo.
+      frameComboUpdated = true;
+      frameAddedCombo = 0;
+    }
     if (!suppressEffects) {
       frameBuilder?.addJudgement(event, chartTimeMs());
       if (props.noteSoundEnabled) noteSounds?.queue(event);
@@ -638,7 +656,8 @@ function renderFrame(): void {
   const playing = playerIsPlaying();
   const gameplayPlaying = gameplayIsPlaying();
   if (!dirty && !playing) return;
-  const timeMs = chartTimeMs();
+  const framePresentationTimeMs = presentationTimeMs();
+  const timeMs = framePresentationTimeMs - props.bgmOffsetMs;
   const simulationTimeMs = Math.floor(timeMs);
   inputMusicTime.sample(simulationTimeMs, performance.now(), playbackRate());
   if (playing) syncBackgroundVideo(false, timeMs + props.bgmOffsetMs);
@@ -704,7 +723,21 @@ function renderFrame(): void {
   }
   lastRenderedTimeMs = timeMs;
   dirty = false;
-  const timeSeconds = presentationTimeMs() / 1000;
+  // Positional arguments keep this 60/120 Hz path free of payload allocation.
+  emit(
+    "frame",
+    framePresentationTimeMs,
+    timeMs,
+    performanceEpoch,
+    snapshot.combo,
+    snapshot.processed,
+    snapshot.total,
+    frameComboUpdated,
+    frameAddedCombo,
+  );
+  frameComboUpdated = false;
+  frameAddedCombo = 0;
+  const timeSeconds = framePresentationTimeMs / 1000;
   if (lastTimeEmit < 0 || Math.abs(timeSeconds - lastTimeEmit) >= 0.03) {
     lastTimeEmit = timeSeconds;
     emit("timeupdate", timeSeconds);
@@ -754,6 +787,8 @@ function resetTimeline(timeMs: number): void {
   noteSounds?.clearQueue();
   noteSounds?.stopLongLine();
   timelineFinished = false;
+  frameComboUpdated = false;
+  frameAddedCombo = 0;
   try {
     frameBuilder.reset();
     session.reset(timeMs);
@@ -864,7 +899,7 @@ async function play(): Promise<void> {
     emit("playing", true);
     return;
   }
-  if (timelineFinished && finishDirectionLifecycle.complete) seek(0);
+  if (timelineFinished && finishDirectionLifecycle.complete) restart();
   if (!shouldPlayTitleIntroduction()) {
     await startMediaPlayback();
     return;
@@ -933,6 +968,18 @@ function seek(seconds: number, skipIntroduction = true): void {
   if (introductionWasPlaying || finishDirectionWasPlaying)
     emit("playing", false);
   if (introductionWasPlaying) emitMediaPlaying(false);
+}
+
+function restart(): void {
+  if (!session || !frameBuilder) return;
+  beginPerformanceEpoch();
+  if (externalClockControlled.value) {
+    // The owner moves its controlled clock to the beginning. Reconstruct now
+    // so the new epoch cannot retain judgement/effect state from the old run.
+    resetTimeline(chartTimeMs());
+    return;
+  }
+  seek(0);
 }
 
 function attachInternalAudio(): void {
@@ -1026,6 +1073,7 @@ async function initialize(): Promise<void> {
     introductionLifecycle.reset();
     titleIntroductionStartPending = false;
     attachSession();
+    beginPerformanceEpoch();
     attachInput();
     resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(root.value);
@@ -1104,6 +1152,7 @@ watch(
     introductionLifecycle.reset();
     titleIntroductionStartPending = false;
     attachSession();
+    if (ready.value) beginPerformanceEpoch();
     if (externalClockControlled.value) {
       skipTitleIntroduction();
       resetTimeline(chartTimeMs());
@@ -1274,7 +1323,7 @@ watch(
     requestFrame();
   },
 );
-defineExpose<ChartPlayerExpose>({ play, pause, seek, resize });
+defineExpose<ChartPlayerExpose>({ play, pause, seek, restart, resize });
 
 onMounted(() => nextTick(initialize));
 onBeforeUnmount(() => {
