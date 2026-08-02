@@ -6,7 +6,9 @@ import init, {
   CassiopeiaComboCharacterLotteryMachine,
   CassiopeiaComboCutInSequencer,
   CassiopeiaPerformanceClock,
+  CassiopeiaRandomRangeTape,
   ComboCharacterDialogueRole,
+  ComboCharacterLotteryFailure,
   ComboCharacterLotteryKind,
   ComboCharacterLotteryWord,
   ComboCutInEndReason,
@@ -36,6 +38,93 @@ assert.strictEqual(await init({ module_or_path: moduleBytes }), initialized);
 assert.equal(resolvePerformanceScreenMode(3, true, true, true), 3);
 assert.equal(resolvePerformanceScreenMode(2, false, false, false), 3);
 assert.equal(resolvePerformanceScreenMode(0, true, false, true), 1);
+
+const exactRangeTape = new CassiopeiaRandomRangeTape(
+  new Int32Array([-4, 5, -2, 0, 3, 2]),
+);
+assert.equal(exactRangeTape.inputStride(), 3);
+assert.equal(exactRangeTape.len(), 2);
+assert.equal(exactRangeTape.isEmpty(), false);
+assert.equal(exactRangeTape.rangeInt(-4, 5), -2);
+assert.equal(exactRangeTape.cursor(), 1);
+assert.equal(exactRangeTape.remaining(), 1);
+assert.throws(
+  () => exactRangeTape.rangeInt(0, 4),
+  /expects \[0, 3\); requested \[0, 4\)/,
+);
+assert.equal(exactRangeTape.cursor(), 1);
+exactRangeTape.restoreCursor(0);
+assert.equal(exactRangeTape.rangeInt(-4, 5), -2);
+exactRangeTape.restore(0);
+assert.equal(exactRangeTape.cursor(), 0);
+exactRangeTape.reset();
+assert.equal(exactRangeTape.cursor(), 0);
+
+const sharedRangeTape = new CassiopeiaRandomRangeTape(
+  new Int32Array([
+    0, 8, 6, // host camera selection
+    0, 2, 1, // initial common queue shuffle
+    0, 2, 0, // explicit common queue refresh
+  ]),
+);
+assert.equal(sharedRangeTape.rangeInt(0, 8), 6);
+const replayComboLottery =
+  CassiopeiaComboCharacterLotteryMachine.withRandomRangeTape(
+    new BigInt64Array([
+      BigInt(ComboCharacterDialogueRole.Call),
+      11n,
+      101n,
+      1_001n,
+      BigInt(ComboCharacterDialogueRole.Response),
+      22n,
+      202n,
+      2_002n,
+    ]),
+    new BigInt64Array([33n, 303n, 3_003n, 404n, 4_004n]),
+    42,
+    sharedRangeTape,
+  );
+const replayComboResult = new BigInt64Array(
+  cassiopeiaMemory().buffer,
+  replayComboLottery.resultBufferPtr(),
+  replayComboLottery.resultBufferLen(),
+);
+assert.equal(replayComboLottery.hasRandomRangeTape(), true);
+assert.equal(replayComboLottery.replayRecoveryRequired(), false);
+assert.equal(sharedRangeTape.cursor(), 2);
+assert.equal(replayComboLottery.refreshWithRandomRangeTape(), true);
+assert.equal(sharedRangeTape.cursor(), 3);
+assert.equal(
+  replayComboLottery.drawWithRandomRangeTape(),
+  ComboCharacterLotteryKind.Fixed,
+);
+assert.throws(
+  () => replayComboLottery.refreshWithRandomRangeTape(),
+  /exhausted at cursor 3/,
+);
+assert.equal(sharedRangeTape.cursor(), 3);
+assert.equal(replayComboLottery.replayRecoveryRequired(), true);
+const replayCommonRemaining = replayComboLottery.commonRemaining();
+const replayFixedRemaining = replayComboLottery.fixedRemaining();
+assert.equal(replayComboLottery.draw(), ComboCharacterLotteryKind.Error);
+assert.equal(
+  replayComboResult[ComboCharacterLotteryWord.Failure],
+  BigInt(ComboCharacterLotteryFailure.ReplayRecoveryRequired),
+);
+assert.equal(replayComboLottery.commonRemaining(), replayCommonRemaining);
+assert.equal(replayComboLottery.fixedRemaining(), replayFixedRemaining);
+assert.equal(sharedRangeTape.cursor(), 3);
+assert.equal(
+  replayComboLottery.drawWithShortageRefresh(false),
+  ComboCharacterLotteryKind.Error,
+);
+assert.equal(replayComboLottery.commonRemaining(), replayCommonRemaining);
+assert.equal(replayComboLottery.fixedRemaining(), replayFixedRemaining);
+assert.equal(sharedRangeTape.cursor(), 3);
+replayComboLottery.detachRandomRangeTape();
+assert.equal(replayComboLottery.hasRandomRangeTape(), false);
+assert.equal(replayComboLottery.refresh(), true);
+assert.equal(replayComboLottery.replayRecoveryRequired(), false);
 
 const comboLottery = new CassiopeiaComboCharacterLotteryMachine(
   new BigInt64Array([

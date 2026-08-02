@@ -1,12 +1,13 @@
+use crate::random_range_tape::{SharedRandomRangeTape, WasmRandomRangeTape};
 use haneoka_cassiopeia_core::{
     COMBO_CUT_IN_EVENT_CAPACITY, ComboCharacterCommonVoice, ComboCharacterDialogueRole,
     ComboCharacterFixedPair, ComboCharacterLotteryError, ComboCharacterLotteryMachine,
     ComboCharacterLotteryOutcome, ComboCharacterLotteryPartialFailure, ComboCharacterLotteryRng,
     ComboCharacterVoice, ComboCutInActor, ComboCutInCast, ComboCutInEvent, ComboCutInEvents,
-    ComboCutInFrame, ComboCutInRole, ComboCutInSequencer, ComboCutInSource, TimeMicros,
-    combo_cutin_milestone,
+    ComboCutInFrame, ComboCutInRole, ComboCutInSequencer, ComboCutInSource, RandomRangeTape,
+    RandomRangeTapeError, TimeMicros, combo_cutin_milestone,
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt};
 use wasm_bindgen::prelude::*;
 
 pub const COMBO_CUT_IN_EVENT_ABI_VERSION: i64 = 1;
@@ -98,6 +99,7 @@ pub enum WasmComboCharacterLotteryFailure {
     ResponseUnavailable = 0,
     CommonVoiceUnavailableAfterRefresh = 1,
     RandomIndexOutOfRange = 2,
+    ReplayRecoveryRequired = 3,
 }
 
 #[wasm_bindgen(js_name = ComboCharacterDialogueRole)]
@@ -168,6 +170,59 @@ impl ComboCharacterLotteryRng for WasmComboCharacterRng {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComboRandomRangeTapeError {
+    Tape(RandomRangeTapeError),
+    UpperExclusiveTooLarge { upper_exclusive: usize },
+}
+
+impl fmt::Display for ComboRandomRangeTapeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tape(error) => error.fmt(formatter),
+            Self::UpperExclusiveTooLarge { upper_exclusive } => write!(
+                formatter,
+                "combo-character range upper bound {upper_exclusive} exceeds i32::MAX"
+            ),
+        }
+    }
+}
+
+struct ComboRandomRangeTapeRng<'a> {
+    tape: &'a mut RandomRangeTape,
+    failure: Option<ComboRandomRangeTapeError>,
+}
+
+impl<'a> ComboRandomRangeTapeRng<'a> {
+    fn new(tape: &'a mut RandomRangeTape) -> Self {
+        Self {
+            tape,
+            failure: None,
+        }
+    }
+}
+
+impl ComboCharacterLotteryRng for ComboRandomRangeTapeRng<'_> {
+    fn range(&mut self, upper_exclusive: usize) -> usize {
+        if self.failure.is_some() {
+            return upper_exclusive;
+        }
+
+        let Ok(max_exclusive) = i32::try_from(upper_exclusive) else {
+            self.failure =
+                Some(ComboRandomRangeTapeError::UpperExclusiveTooLarge { upper_exclusive });
+            return upper_exclusive;
+        };
+        match self.tape.range_int(0, max_exclusive) {
+            Ok(result) => result as usize,
+            Err(error) => {
+                self.failure = Some(ComboRandomRangeTapeError::Tape(error));
+                upper_exclusive
+            }
+        }
+    }
+}
+
 /// Preloaded combo-character lottery with seeded in-WASM shuffling and a
 /// reusable `BigInt64Array` result region.
 ///
@@ -179,6 +234,8 @@ impl ComboCharacterLotteryRng for WasmComboCharacterRng {
 pub struct WasmComboCharacterLotteryMachine {
     machine: ComboCharacterLotteryMachine,
     rng: WasmComboCharacterRng,
+    random_range_tape: Option<SharedRandomRangeTape>,
+    replay_recovery_required: bool,
     result_words: [i64; COMBO_CHARACTER_LOTTERY_WORDS],
 }
 
@@ -193,7 +250,25 @@ impl WasmComboCharacterLotteryMachine {
         Self::from_flat_words(common_words, fixed_words, seed).map_err(super::js_error)
     }
 
+    /// Constructs the initial queues from an exact replay tape and retains the
+    /// same shared tape for explicit replay draws and refreshes. `seed` only
+    /// initializes the unchanged production RNG used by `draw()`/`refresh()`.
+    /// If construction fails, successfully matched prefix calls stay consumed;
+    /// the host may explicitly restore the tape cursor before retrying.
+    #[wasm_bindgen(js_name = withRandomRangeTape)]
+    pub fn with_random_range_tape(
+        common_words: &[i64],
+        fixed_words: &[i64],
+        seed: u32,
+        tape: &WasmRandomRangeTape,
+    ) -> Result<WasmComboCharacterLotteryMachine, JsError> {
+        Self::from_flat_words_with_random_range_tape(common_words, fixed_words, seed, tape.shared())
+            .map_err(super::js_error)
+    }
+
     /// Draws fixed or common call/response data into the stable result region.
+    /// While replay recovery is required this returns an Error result without
+    /// touching lottery queues; a successful refresh clears the gate.
     pub fn draw(&mut self) -> u32 {
         self.draw_with_shortage_refresh(true)
     }
@@ -203,8 +278,56 @@ impl WasmComboCharacterLotteryMachine {
     /// common shortage.
     #[wasm_bindgen(js_name = drawWithShortageRefresh)]
     pub fn draw_with_shortage_refresh(&mut self, shortage_refresh: bool) -> u32 {
+        if self.replay_recovery_required {
+            self.write_replay_recovery_required();
+            return WasmComboCharacterLotteryKind::Error as u32;
+        }
         let outcome = self.machine.draw(shortage_refresh, &mut self.rng);
         self.write_outcome(outcome) as u32
+    }
+
+    /// Draws with the attached exact replay tape. Unlike `draw()`, a tape
+    /// mismatch or exhaustion throws and never falls back to the seeded RNG.
+    /// Such a failure can leave queues partially rebuilt; callers must perform
+    /// a successful explicit replay or production refresh before any draw.
+    #[wasm_bindgen(js_name = drawWithRandomRangeTape)]
+    pub fn draw_with_random_range_tape(&mut self) -> Result<u32, JsError> {
+        self.draw_with_random_range_tape_inner(true)
+            .map_err(super::js_error)
+    }
+
+    /// Diagnostic variant of `drawWithRandomRangeTape()`.
+    #[wasm_bindgen(js_name = drawWithRandomRangeTapeAndShortageRefresh)]
+    pub fn draw_with_random_range_tape_and_shortage_refresh(
+        &mut self,
+        shortage_refresh: bool,
+    ) -> Result<u32, JsError> {
+        self.draw_with_random_range_tape_inner(shortage_refresh)
+            .map_err(super::js_error)
+    }
+
+    /// Attaches a shared tape for future explicit replay methods. Existing
+    /// queues are not rebuilt; use `withRandomRangeTape()` when the initial
+    /// queue shuffle must also be replayed.
+    #[wasm_bindgen(js_name = attachRandomRangeTape)]
+    pub fn attach_random_range_tape(&mut self, tape: &WasmRandomRangeTape) {
+        self.random_range_tape = Some(tape.shared());
+    }
+
+    #[wasm_bindgen(js_name = detachRandomRangeTape)]
+    pub fn detach_random_range_tape(&mut self) {
+        self.random_range_tape = None;
+    }
+
+    #[wasm_bindgen(js_name = hasRandomRangeTape)]
+    pub fn has_random_range_tape(&self) -> bool {
+        self.random_range_tape.is_some()
+    }
+
+    /// Whether a failed replay shuffle requires a successful queue refresh.
+    #[wasm_bindgen(js_name = replayRecoveryRequired)]
+    pub fn replay_recovery_required(&self) -> bool {
+        self.replay_recovery_required
     }
 
     /// Replaces only the PRNG state used by future queue refreshes.
@@ -235,6 +358,7 @@ impl WasmComboCharacterLotteryMachine {
     pub fn refresh(&mut self) -> bool {
         match self.machine.refresh(&mut self.rng) {
             Ok(()) => {
+                self.replay_recovery_required = false;
                 self.clear_result(WasmComboCharacterLotteryKind::Unavailable);
                 true
             }
@@ -243,6 +367,13 @@ impl WasmComboCharacterLotteryMachine {
                 false
             }
         }
+    }
+
+    /// Rebuilds both queues with the attached shared replay tape.
+    #[wasm_bindgen(js_name = refreshWithRandomRangeTape)]
+    pub fn refresh_with_random_range_tape(&mut self) -> Result<bool, JsError> {
+        self.refresh_with_random_range_tape_inner()
+            .map_err(super::js_error)
     }
 
     #[wasm_bindgen(js_name = resultBufferPtr)]
@@ -282,60 +413,7 @@ impl WasmComboCharacterLotteryMachine {
         fixed_words: &[i64],
         seed: u32,
     ) -> Result<Self, String> {
-        if !common_words
-            .len()
-            .is_multiple_of(COMBO_CHARACTER_COMMON_INPUT_STRIDE)
-        {
-            return Err(format!(
-                "combo-character common input length {} is not a multiple of {}",
-                common_words.len(),
-                COMBO_CHARACTER_COMMON_INPUT_STRIDE
-            ));
-        }
-        if !fixed_words
-            .len()
-            .is_multiple_of(COMBO_CHARACTER_FIXED_INPUT_STRIDE)
-        {
-            return Err(format!(
-                "combo-character fixed input length {} is not a multiple of {}",
-                fixed_words.len(),
-                COMBO_CHARACTER_FIXED_INPUT_STRIDE
-            ));
-        }
-
-        let mut common_source =
-            Vec::with_capacity(common_words.len() / COMBO_CHARACTER_COMMON_INPUT_STRIDE);
-        for words in common_words.chunks_exact(COMBO_CHARACTER_COMMON_INPUT_STRIDE) {
-            let role = match words[0] {
-                1 => ComboCharacterDialogueRole::Call,
-                2 => ComboCharacterDialogueRole::Response,
-                value => return Err(format!("invalid combo-character dialogue role: {value}")),
-            };
-            common_source.push(ComboCharacterCommonVoice {
-                dialogue_id: words[1],
-                role,
-                voice: ComboCharacterVoice {
-                    character_id: words[2],
-                    voice_id: words[3],
-                },
-            });
-        }
-
-        let mut fixed_source =
-            Vec::with_capacity(fixed_words.len() / COMBO_CHARACTER_FIXED_INPUT_STRIDE);
-        for words in fixed_words.chunks_exact(COMBO_CHARACTER_FIXED_INPUT_STRIDE) {
-            fixed_source.push(ComboCharacterFixedPair {
-                dialogue_id: words[0],
-                first: ComboCharacterVoice {
-                    character_id: words[1],
-                    voice_id: words[2],
-                },
-                second: ComboCharacterVoice {
-                    character_id: words[3],
-                    voice_id: words[4],
-                },
-            });
-        }
+        let (common_source, fixed_source) = parse_lottery_sources(common_words, fixed_words)?;
 
         let mut rng = WasmComboCharacterRng::new(seed);
         let machine = ComboCharacterLotteryMachine::new(common_source, fixed_source, &mut rng)
@@ -343,10 +421,101 @@ impl WasmComboCharacterLotteryMachine {
         let mut result = Self {
             machine,
             rng,
+            random_range_tape: None,
+            replay_recovery_required: false,
             result_words: [NO_COMBO_CUT_IN_VALUE; COMBO_CHARACTER_LOTTERY_WORDS],
         };
         result.clear_result(WasmComboCharacterLotteryKind::Unavailable);
         Ok(result)
+    }
+
+    fn from_flat_words_with_random_range_tape(
+        common_words: &[i64],
+        fixed_words: &[i64],
+        seed: u32,
+        random_range_tape: SharedRandomRangeTape,
+    ) -> Result<Self, String> {
+        let (common_source, fixed_source) = parse_lottery_sources(common_words, fixed_words)?;
+        let machine = {
+            let mut tape = random_range_tape
+                .try_borrow_mut()
+                .map_err(|_| "random-range tape is already in use".to_owned())?;
+            let mut replay_rng = ComboRandomRangeTapeRng::new(&mut tape);
+            let machine =
+                ComboCharacterLotteryMachine::new(common_source, fixed_source, &mut replay_rng);
+            if let Some(error) = replay_rng.failure {
+                return Err(error.to_string());
+            }
+            machine.map_err(|error| error.to_string())?
+        };
+
+        let mut result = Self {
+            machine,
+            rng: WasmComboCharacterRng::new(seed),
+            random_range_tape: Some(random_range_tape),
+            replay_recovery_required: false,
+            result_words: [NO_COMBO_CUT_IN_VALUE; COMBO_CHARACTER_LOTTERY_WORDS],
+        };
+        result.clear_result(WasmComboCharacterLotteryKind::Unavailable);
+        Ok(result)
+    }
+
+    fn draw_with_random_range_tape_inner(&mut self, shortage_refresh: bool) -> Result<u32, String> {
+        if self.replay_recovery_required {
+            return Err(
+                "combo-character lottery requires a successful queue refresh after a previous random-range replay failure"
+                    .to_owned(),
+            );
+        }
+        let random_range_tape = self
+            .random_range_tape
+            .clone()
+            .ok_or_else(|| "no random-range tape is attached".to_owned())?;
+        let (outcome, replay_failure) = {
+            let mut tape = random_range_tape
+                .try_borrow_mut()
+                .map_err(|_| "random-range tape is already in use".to_owned())?;
+            let mut replay_rng = ComboRandomRangeTapeRng::new(&mut tape);
+            let outcome = self.machine.draw(shortage_refresh, &mut replay_rng);
+            (outcome, replay_rng.failure)
+        };
+        let kind = self.write_outcome(outcome) as u32;
+        if let Some(error) = replay_failure {
+            self.replay_recovery_required = true;
+            return Err(error.to_string());
+        }
+        Ok(kind)
+    }
+
+    fn refresh_with_random_range_tape_inner(&mut self) -> Result<bool, String> {
+        let random_range_tape = self
+            .random_range_tape
+            .clone()
+            .ok_or_else(|| "no random-range tape is attached".to_owned())?;
+        let (outcome, replay_failure) = {
+            let mut tape = random_range_tape
+                .try_borrow_mut()
+                .map_err(|_| "random-range tape is already in use".to_owned())?;
+            let mut replay_rng = ComboRandomRangeTapeRng::new(&mut tape);
+            let outcome = self.machine.refresh(&mut replay_rng);
+            (outcome, replay_rng.failure)
+        };
+        let refreshed = match outcome {
+            Ok(()) => {
+                self.replay_recovery_required = false;
+                self.clear_result(WasmComboCharacterLotteryKind::Unavailable);
+                true
+            }
+            Err(error) => {
+                self.write_error(error);
+                false
+            }
+        };
+        if let Some(error) = replay_failure {
+            self.replay_recovery_required = true;
+            return Err(error.to_string());
+        }
+        Ok(refreshed)
     }
 
     fn write_outcome(
@@ -456,6 +625,12 @@ impl WasmComboCharacterLotteryMachine {
         self.write_error_fields(error);
     }
 
+    fn write_replay_recovery_required(&mut self) {
+        self.clear_result(WasmComboCharacterLotteryKind::Error);
+        self.result_words[COMBO_CHARACTER_LOTTERY_FAILURE] =
+            i64::from(WasmComboCharacterLotteryFailure::ReplayRecoveryRequired as u8);
+    }
+
     fn write_error_fields(&mut self, error: ComboCharacterLotteryError) {
         match error {
             ComboCharacterLotteryError::RandomIndexOutOfRange {
@@ -483,6 +658,68 @@ impl WasmComboCharacterLotteryMachine {
             }
         }
     }
+}
+
+fn parse_lottery_sources(
+    common_words: &[i64],
+    fixed_words: &[i64],
+) -> Result<(Vec<ComboCharacterCommonVoice>, Vec<ComboCharacterFixedPair>), String> {
+    if !common_words
+        .len()
+        .is_multiple_of(COMBO_CHARACTER_COMMON_INPUT_STRIDE)
+    {
+        return Err(format!(
+            "combo-character common input length {} is not a multiple of {}",
+            common_words.len(),
+            COMBO_CHARACTER_COMMON_INPUT_STRIDE
+        ));
+    }
+    if !fixed_words
+        .len()
+        .is_multiple_of(COMBO_CHARACTER_FIXED_INPUT_STRIDE)
+    {
+        return Err(format!(
+            "combo-character fixed input length {} is not a multiple of {}",
+            fixed_words.len(),
+            COMBO_CHARACTER_FIXED_INPUT_STRIDE
+        ));
+    }
+
+    let mut common_source =
+        Vec::with_capacity(common_words.len() / COMBO_CHARACTER_COMMON_INPUT_STRIDE);
+    for words in common_words.chunks_exact(COMBO_CHARACTER_COMMON_INPUT_STRIDE) {
+        let role = match words[0] {
+            1 => ComboCharacterDialogueRole::Call,
+            2 => ComboCharacterDialogueRole::Response,
+            value => return Err(format!("invalid combo-character dialogue role: {value}")),
+        };
+        common_source.push(ComboCharacterCommonVoice {
+            dialogue_id: words[1],
+            role,
+            voice: ComboCharacterVoice {
+                character_id: words[2],
+                voice_id: words[3],
+            },
+        });
+    }
+
+    let mut fixed_source =
+        Vec::with_capacity(fixed_words.len() / COMBO_CHARACTER_FIXED_INPUT_STRIDE);
+    for words in fixed_words.chunks_exact(COMBO_CHARACTER_FIXED_INPUT_STRIDE) {
+        fixed_source.push(ComboCharacterFixedPair {
+            dialogue_id: words[0],
+            first: ComboCharacterVoice {
+                character_id: words[1],
+                voice_id: words[2],
+            },
+            second: ComboCharacterVoice {
+                character_id: words[3],
+                voice_id: words[4],
+            },
+        });
+    }
+
+    Ok((common_source, fixed_source))
 }
 
 fn write_lottery_voice(
@@ -1056,6 +1293,119 @@ mod tests {
 
         machine.use_seeded_random();
         assert!(machine.refresh());
+    }
+
+    #[test]
+    fn lottery_replay_constructor_shares_the_host_tape_cursor() {
+        let tape = WasmRandomRangeTape::from_words(&[
+            0, 8, 6, // host camera selection
+            0, 2, 1, // initial common queue shuffle
+            0, 2, 0, // explicit common queue refresh
+        ])
+        .unwrap();
+
+        assert_eq!(tape.range_int_inner(0, 8), Ok(6));
+        let mut machine = WasmComboCharacterLotteryMachine::from_flat_words_with_random_range_tape(
+            &COMMON_WORDS,
+            &FIXED_WORDS,
+            42,
+            tape.shared(),
+        )
+        .unwrap();
+        assert!(machine.has_random_range_tape());
+        assert_eq!(tape.cursor(), 2);
+
+        assert_eq!(machine.refresh_with_random_range_tape_inner(), Ok(true));
+        assert!(!machine.replay_recovery_required());
+        assert_eq!(tape.cursor(), 3);
+        assert_eq!(tape.remaining(), 0);
+
+        machine.detach_random_range_tape();
+        assert!(!machine.has_random_range_tape());
+        assert_eq!(
+            machine.refresh_with_random_range_tape_inner(),
+            Err("no random-range tape is attached".to_owned())
+        );
+    }
+
+    #[test]
+    fn attached_tape_mismatch_is_explicit_and_never_uses_the_seeded_rng() {
+        let tape = WasmRandomRangeTape::from_words(&[0, 3, 2]).unwrap();
+        let mut machine = lottery(&COMMON_WORDS, &FIXED_WORDS);
+        machine.attach_random_range_tape(&tape);
+
+        let error = machine.refresh_with_random_range_tape_inner().unwrap_err();
+        assert!(error.contains("expects [0, 3); requested [0, 2)"));
+        assert_eq!(tape.cursor(), 0);
+        assert!(machine.replay_recovery_required());
+        assert_eq!(
+            machine.result_words[COMBO_CHARACTER_LOTTERY_FAILURE],
+            WasmComboCharacterLotteryFailure::RandomIndexOutOfRange as i64
+        );
+
+        let common_remaining = machine.common_remaining();
+        let fixed_remaining = machine.fixed_remaining();
+        assert_eq!(machine.draw(), WasmComboCharacterLotteryKind::Error as u32);
+        assert_eq!(
+            machine.result_words[COMBO_CHARACTER_LOTTERY_FAILURE],
+            WasmComboCharacterLotteryFailure::ReplayRecoveryRequired as i64
+        );
+        assert_eq!(machine.common_remaining(), common_remaining);
+        assert_eq!(machine.fixed_remaining(), fixed_remaining);
+        assert_eq!(tape.cursor(), 0);
+        assert!(machine.replay_recovery_required());
+
+        assert_eq!(
+            machine.draw_with_shortage_refresh(false),
+            WasmComboCharacterLotteryKind::Error as u32
+        );
+        assert_eq!(machine.common_remaining(), common_remaining);
+        assert_eq!(machine.fixed_remaining(), fixed_remaining);
+        assert_eq!(tape.cursor(), 0);
+
+        // The unchanged production method remains independently usable.
+        assert!(machine.refresh());
+        assert!(!machine.replay_recovery_required());
+        assert_eq!(tape.cursor(), 0);
+    }
+
+    #[test]
+    fn shared_tape_borrow_conflicts_are_reported_without_mutation() {
+        let tape = WasmRandomRangeTape::from_words(&[0, 2, 1]).unwrap();
+        let shared = tape.shared();
+        let mut machine = lottery(&COMMON_WORDS, &FIXED_WORDS);
+        machine.attach_random_range_tape(&tape);
+        let cursor = tape.cursor();
+        let common_remaining = machine.common_remaining();
+        let fixed_remaining = machine.fixed_remaining();
+
+        let borrow = shared.borrow_mut();
+        assert_eq!(
+            machine.refresh_with_random_range_tape_inner(),
+            Err("random-range tape is already in use".to_owned())
+        );
+        drop(borrow);
+
+        assert_eq!(tape.cursor(), cursor);
+        assert_eq!(machine.common_remaining(), common_remaining);
+        assert_eq!(machine.fixed_remaining(), fixed_remaining);
+        assert!(!machine.replay_recovery_required());
+        assert_eq!(machine.refresh_with_random_range_tape_inner(), Ok(true));
+    }
+
+    #[test]
+    fn replay_constructor_reports_exhaustion_without_seed_fallback() {
+        let tape = WasmRandomRangeTape::from_words(&[]).unwrap();
+        let error = WasmComboCharacterLotteryMachine::from_flat_words_with_random_range_tape(
+            &COMMON_WORDS,
+            &FIXED_WORDS,
+            42,
+            tape.shared(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "random-range tape is exhausted at cursor 0");
+        assert_eq!(tape.cursor(), 0);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 mod chart_binary;
 mod combo_cutin;
+mod random_range_tape;
 
 use std::collections::BTreeMap;
 
@@ -30,6 +31,7 @@ use haneoka_cassiopeia_core::{
     PlaybackState, RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode, TimeMicros,
     resolve_screen_mode,
 };
+pub use random_range_tape::*;
 use wasm_bindgen::{JsCast, prelude::*};
 
 pub const HOST_ABI_VERSION: i64 = 1;

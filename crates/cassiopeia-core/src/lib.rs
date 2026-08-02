@@ -14,6 +14,7 @@ pub mod chart;
 pub mod combo_cutin;
 pub mod judgement;
 pub mod live;
+pub mod random_range_tape;
 pub mod runtime;
 pub mod scoring;
 pub mod session;
@@ -62,6 +63,7 @@ pub use live::{
     PlaybackState, ScreenFallback, ScreenMode, ScreenResources, ScreenSelection,
     resolve_screen_mode,
 };
+pub use random_range_tape::{RANDOM_RANGE_TAPE_STRIDE, RandomRangeTape, RandomRangeTapeError};
 pub use runtime::{
     AREA_OFFSETS, AREA_OFFSETS_PER_LEVEL, JudgementAreaOffsetType, LANE_UNITS_PER_LANE,
     LanePosition, NoteDirection, RUNTIME_CHART_FORMAT, RUNTIME_CHART_VERSION, RUNTIME_LANE_COUNT,
