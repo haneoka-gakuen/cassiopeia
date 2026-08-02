@@ -221,9 +221,15 @@ async function applyBackgroundTexture(
 }
 
 function clearBackgroundVideo(): void {
+  const video = backgroundVideo.value;
+  if (
+    !boundBackgroundVideoUrl &&
+    !video?.getAttribute("src") &&
+    !video?.onerror
+  )
+    return;
   backgroundVideoRevision += 1;
   boundBackgroundVideoUrl = "";
-  const video = backgroundVideo.value;
   if (!video) return;
   video.onerror = null;
   video.pause();
@@ -237,6 +243,15 @@ function backgroundVideoIsSelected(): boolean {
     url &&
       failedBackgroundVideoUrl !== url &&
       boundBackgroundVideoUrl === url,
+  );
+}
+
+function backgroundMediaSource() {
+  const url = props.backgroundVideoUrl;
+  return selectBackgroundMediaSource(
+    Boolean(url && backgroundVideo.value && failedBackgroundVideoUrl !== url),
+    Boolean(props.backgroundCanvas),
+    Boolean(props.backgroundUrl),
   );
 }
 
@@ -255,11 +270,7 @@ async function applyBackgroundFallback(
 async function applyBackgroundMedia(target: OurNotesRenderer): Promise<void> {
   const video = backgroundVideo.value;
   const url = props.backgroundVideoUrl;
-  const source = selectBackgroundMediaSource(
-    Boolean(url && video && failedBackgroundVideoUrl !== url),
-    Boolean(props.backgroundCanvas),
-    Boolean(props.backgroundUrl),
-  );
+  const source = backgroundMediaSource();
   if (source === "video" && url && video) {
     video.muted = true;
     video.loop = props.loop;
@@ -975,7 +986,6 @@ watch(
     () => props.backgroundUrl,
     () => props.backgroundVideoUrl,
     () => props.backgroundCanvas,
-    () => props.backgroundCanvasVersion,
   ],
   async () => {
     const target = renderer;
@@ -988,6 +998,17 @@ watch(
         ?.play()
         .catch((reason) => target.reportAssetError(reason));
     }
+    dirty = true;
+    requestFrame();
+  },
+);
+watch(
+  () => props.backgroundCanvasVersion,
+  (version) => {
+    const target = renderer;
+    const canvas = props.backgroundCanvas;
+    if (!target || !canvas || backgroundMediaSource() !== "canvas") return;
+    target.setBackgroundCanvas(canvas, version);
     dirty = true;
     requestFrame();
   },
