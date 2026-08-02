@@ -21,9 +21,12 @@ pub use chart_binary::{
     CHART_NOTE_BYTES, ChartBinaryError, decode_runtime_chart_v1, encode_runtime_chart_v1,
 };
 use haneoka_cassiopeia_core::{
-    CameraEvaluation, CameraProfile, CameraTimelineResource, GameplaySession, InputAction,
-    InputVector, JudgementEvent, LanePosition, PerformanceClock, PlaybackRate, PlaybackState,
-    RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode, TimeMicros, resolve_screen_mode,
+    CameraChorusResource, CameraEffect, CameraEffectsResource, CameraEvaluation,
+    CameraFinishEvaluation, CameraFinishSequence, CameraIntroductionEvaluation,
+    CameraIntroductionSequence, CameraProfile, CameraTimelineResource, GameplaySession,
+    InputAction, InputVector, JudgementEvent, LanePosition, PerformanceClock, PlaybackRate,
+    PlaybackState, RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode, TimeMicros,
+    resolve_screen_mode,
 };
 use wasm_bindgen::{JsCast, prelude::*};
 
@@ -78,6 +81,23 @@ pub const CAMERA_FRAME_ROTATION_Z: usize = 10;
 pub const CAMERA_FRAME_ROTATION_W: usize = 11;
 pub const CAMERA_FRAME_VERTICAL_FOV: usize = 12;
 
+pub const CAMERA_INTRODUCTION_FRAME_ABI_VERSION: u32 = 1;
+pub const CAMERA_INTRODUCTION_FRAME_WORDS: usize = 5;
+pub const CAMERA_INTRODUCTION_FRAME_ABI: usize = 0;
+pub const CAMERA_INTRODUCTION_FRAME_AVAILABLE: usize = 1;
+pub const CAMERA_INTRODUCTION_FRAME_POSITION_X: usize = 2;
+pub const CAMERA_INTRODUCTION_FRAME_POSITION_Y: usize = 3;
+pub const CAMERA_INTRODUCTION_FRAME_POSITION_Z: usize = 4;
+
+pub const CAMERA_FINISH_FRAME_ABI_VERSION: u32 = 1;
+pub const CAMERA_FINISH_FRAME_WORDS: usize = 6;
+pub const CAMERA_FINISH_FRAME_ABI: usize = 0;
+pub const CAMERA_FINISH_FRAME_AVAILABLE: usize = 1;
+pub const CAMERA_FINISH_FRAME_ACTIVE_CLIPS: usize = 2;
+pub const CAMERA_FINISH_FRAME_INCOMING_WEIGHT: usize = 3;
+pub const CAMERA_FINISH_FRAME_INCOMING_INDEX: usize = 4;
+pub const CAMERA_FINISH_FRAME_VERTICAL_FOV: usize = 5;
+
 #[wasm_bindgen]
 #[repr(u8)]
 pub enum CameraFrameWord {
@@ -96,12 +116,40 @@ pub enum CameraFrameWord {
     VerticalFovDegrees = 12,
 }
 
+/// Position-only stage-camera introduction ABI. The host preserves orientation and lens.
+#[wasm_bindgen]
+#[repr(u8)]
+pub enum CameraIntroductionFrameWord {
+    AbiVersion = 0,
+    Available = 1,
+    PositionX = 2,
+    PositionY = 3,
+    PositionZ = 4,
+}
+
+/// Lens-only finish ABI. The host preserves the current camera pose.
+#[wasm_bindgen]
+#[repr(u8)]
+pub enum CameraFinishFrameWord {
+    AbiVersion = 0,
+    Available = 1,
+    ActiveClips = 2,
+    IncomingWeight = 3,
+    IncomingSerializedIndex = 4,
+    VerticalFovDegrees = 5,
+}
+
 /// Owns one parsed camera resource and a reusable 13-word frame region.
 #[derive(Debug)]
 #[wasm_bindgen(js_name = CassiopeiaCameraTimeline)]
 pub struct WasmCameraTimeline {
     resource: CameraTimelineResource,
+    effects: Option<CameraEffectsResource>,
+    chorus: Option<CameraChorusResource>,
     frame_words: [f64; CAMERA_FRAME_WORDS],
+    chorus_frame_words: [f64; CAMERA_FRAME_WORDS],
+    introduction_frame_words: [f64; CAMERA_INTRODUCTION_FRAME_WORDS],
+    finish_frame_words: [f64; CAMERA_FINISH_FRAME_WORDS],
 }
 
 #[wasm_bindgen(js_class = CassiopeiaCameraTimeline)]
@@ -111,9 +159,48 @@ impl WasmCameraTimeline {
         Self::from_json(resource_json).map_err(js_error)
     }
 
+    /// Parses and validates a separate optional camera-effects contract.
+    #[wasm_bindgen(js_name = withEffects)]
+    pub fn with_effects(
+        resource_json: &[u8],
+        effects_json: &[u8],
+    ) -> Result<WasmCameraTimeline, JsError> {
+        Self::from_json_with_effects(resource_json, effects_json).map_err(js_error)
+    }
+
+    /// Parses the score Timeline, effects contract, and independent chorus camera.
+    #[wasm_bindgen(js_name = withEffectsAndChorus)]
+    pub fn with_effects_and_chorus(
+        resource_json: &[u8],
+        effects_json: &[u8],
+        chorus_json: &[u8],
+    ) -> Result<WasmCameraTimeline, JsError> {
+        Self::from_json_with_effects_and_chorus(resource_json, effects_json, chorus_json)
+            .map_err(js_error)
+    }
+
     /// Writes ABI, availability, blend, transform, and FOV into one stable region.
     pub fn evaluate(&mut self, profile: u8, time_seconds: f64) -> Result<bool, JsError> {
         self.evaluate_frame(profile, time_seconds).map_err(js_error)
+    }
+
+    /// Samples the position-only introduction track into its stable frame region.
+    #[wasm_bindgen(js_name = evaluateIntroduction)]
+    pub fn evaluate_introduction(&mut self, time_seconds: f64) -> Result<bool, JsError> {
+        self.evaluate_introduction_frame(time_seconds)
+            .map_err(js_error)
+    }
+
+    /// Samples the lens-only finish track into its stable frame region.
+    #[wasm_bindgen(js_name = evaluateFinish)]
+    pub fn evaluate_finish(&mut self, time_seconds: f64) -> Result<bool, JsError> {
+        self.evaluate_finish_frame(time_seconds).map_err(js_error)
+    }
+
+    /// Samples the full one-shot chorus camera into its independent frame region.
+    #[wasm_bindgen(js_name = evaluateChorus)]
+    pub fn evaluate_chorus(&mut self, time_seconds: f64) -> Result<bool, JsError> {
+        self.evaluate_chorus_frame(time_seconds).map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = durationSeconds)]
@@ -130,6 +217,70 @@ impl WasmCameraTimeline {
             .map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = hasIntroduction)]
+    pub fn has_introduction(&self) -> bool {
+        self.resource.introduction().is_some()
+    }
+
+    #[wasm_bindgen(js_name = introductionDurationSeconds)]
+    pub fn introduction_duration_seconds(&self) -> Result<f64, JsError> {
+        self.introduction()
+            .map(|introduction| introduction.duration_seconds)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = introductionFrameRate)]
+    pub fn introduction_frame_rate(&self) -> Result<f64, JsError> {
+        self.introduction()
+            .map(|introduction| introduction.frame_rate)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = introductionInheritsOrientationAndLens)]
+    pub fn introduction_inherits_orientation_and_lens(&self) -> Result<bool, JsError> {
+        self.introduction()
+            .map(|introduction| introduction.inherits_orientation_and_lens)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = hasFinish)]
+    pub fn has_finish(&self) -> bool {
+        self.resource.finish().is_some()
+    }
+
+    #[wasm_bindgen(js_name = finishDurationSeconds)]
+    pub fn finish_duration_seconds(&self) -> Result<f64, JsError> {
+        self.finish()
+            .map(|finish| finish.duration_seconds)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = finishFrameRate)]
+    pub fn finish_frame_rate(&self) -> Result<f64, JsError> {
+        self.finish()
+            .map(|finish| finish.frame_rate)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = hasChorus)]
+    pub fn has_chorus(&self) -> bool {
+        self.chorus.is_some()
+    }
+
+    #[wasm_bindgen(js_name = chorusDurationSeconds)]
+    pub fn chorus_duration_seconds(&self) -> Result<f64, JsError> {
+        self.chorus()
+            .map(|chorus| chorus.duration_seconds)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = chorusFrameRate)]
+    pub fn chorus_frame_rate(&self) -> Result<f64, JsError> {
+        self.chorus()
+            .map(|chorus| chorus.frame_rate)
+            .map_err(js_error)
+    }
+
     /// Pointer to a reusable `Float64Array`-compatible camera frame region.
     #[wasm_bindgen(js_name = frameBufferPtr)]
     pub fn frame_buffer_ptr(&self) -> usize {
@@ -140,6 +291,68 @@ impl WasmCameraTimeline {
     pub fn frame_buffer_len(&self) -> usize {
         CAMERA_FRAME_WORDS
     }
+
+    /// Pointer to a second full-camera frame so score and chorus samples can coexist.
+    #[wasm_bindgen(js_name = chorusFrameBufferPtr)]
+    pub fn chorus_frame_buffer_ptr(&self) -> usize {
+        self.chorus_frame_words.as_ptr() as usize
+    }
+
+    #[wasm_bindgen(js_name = chorusFrameBufferLen)]
+    pub fn chorus_frame_buffer_len(&self) -> usize {
+        CAMERA_FRAME_WORDS
+    }
+
+    /// Pointer to a reusable `Float64Array`-compatible introduction position region.
+    #[wasm_bindgen(js_name = introductionFrameBufferPtr)]
+    pub fn introduction_frame_buffer_ptr(&self) -> usize {
+        self.introduction_frame_words.as_ptr() as usize
+    }
+
+    #[wasm_bindgen(js_name = introductionFrameBufferLen)]
+    pub fn introduction_frame_buffer_len(&self) -> usize {
+        CAMERA_INTRODUCTION_FRAME_WORDS
+    }
+
+    /// Pointer to a reusable `Float64Array`-compatible finish lens region.
+    #[wasm_bindgen(js_name = finishFrameBufferPtr)]
+    pub fn finish_frame_buffer_ptr(&self) -> usize {
+        self.finish_frame_words.as_ptr() as usize
+    }
+
+    #[wasm_bindgen(js_name = finishFrameBufferLen)]
+    pub fn finish_frame_buffer_len(&self) -> usize {
+        CAMERA_FINISH_FRAME_WORDS
+    }
+
+    #[wasm_bindgen(js_name = hasEffectsContract)]
+    pub fn has_effects_contract(&self) -> bool {
+        self.effects.is_some()
+    }
+
+    /// Remains false until Unity's native Perlin samples and inactive-camera phase are pinned.
+    #[wasm_bindgen(js_name = effectsSamplingSupported)]
+    pub fn effects_sampling_supported(&self) -> bool {
+        false
+    }
+
+    #[wasm_bindgen(js_name = cameraHasPerlin)]
+    pub fn camera_has_perlin(&self, profile: u8, camera_name: &str) -> Result<bool, JsError> {
+        self.effect(profile, camera_name)
+            .map(|effect| effect.perlin.is_some())
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = cameraUsesCustomLookAt)]
+    pub fn camera_uses_custom_look_at(
+        &self,
+        profile: u8,
+        camera_name: &str,
+    ) -> Result<bool, JsError> {
+        self.effect(profile, camera_name)
+            .map(|effect| effect.custom_look_at_target)
+            .map_err(js_error)
+    }
 }
 
 impl WasmCameraTimeline {
@@ -148,8 +361,45 @@ impl WasmCameraTimeline {
             serde_json::from_slice(resource_json).map_err(|error| error.to_string())?;
         Ok(Self {
             resource,
+            effects: None,
+            chorus: None,
             frame_words: empty_camera_frame(),
+            chorus_frame_words: empty_camera_frame(),
+            introduction_frame_words: empty_camera_introduction_frame(),
+            finish_frame_words: empty_camera_finish_frame(),
         })
+    }
+
+    fn from_json_with_effects(resource_json: &[u8], effects_json: &[u8]) -> Result<Self, String> {
+        let resource: CameraTimelineResource =
+            serde_json::from_slice(resource_json).map_err(|error| error.to_string())?;
+        let effects: CameraEffectsResource =
+            serde_json::from_slice(effects_json).map_err(|error| error.to_string())?;
+        effects
+            .validate_timeline_coverage(&resource)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            resource,
+            effects: Some(effects),
+            chorus: None,
+            frame_words: empty_camera_frame(),
+            chorus_frame_words: empty_camera_frame(),
+            introduction_frame_words: empty_camera_introduction_frame(),
+            finish_frame_words: empty_camera_finish_frame(),
+        })
+    }
+
+    fn from_json_with_effects_and_chorus(
+        resource_json: &[u8],
+        effects_json: &[u8],
+        chorus_json: &[u8],
+    ) -> Result<Self, String> {
+        let mut timeline = Self::from_json_with_effects(resource_json, effects_json)?;
+        let chorus: CameraChorusResource =
+            serde_json::from_slice(chorus_json).map_err(|error| error.to_string())?;
+        chorus.validate().map_err(|error| error.to_string())?;
+        timeline.chorus = Some(chorus);
+        Ok(timeline)
     }
 
     fn profile(
@@ -162,17 +412,97 @@ impl WasmCameraTimeline {
             .ok_or_else(|| format!("camera profile is unavailable: {profile:?}"))
     }
 
+    fn introduction(&self) -> Result<&CameraIntroductionSequence, String> {
+        self.resource
+            .introduction()
+            .ok_or_else(|| "camera introduction is unavailable".to_owned())
+    }
+
+    fn finish(&self) -> Result<&CameraFinishSequence, String> {
+        self.resource
+            .finish()
+            .ok_or_else(|| "camera finish is unavailable".to_owned())
+    }
+
+    fn chorus(&self) -> Result<&CameraChorusResource, String> {
+        self.chorus
+            .as_ref()
+            .ok_or_else(|| "chorus camera is unavailable".to_owned())
+    }
+
     fn evaluate_frame(&mut self, profile: u8, time_seconds: f64) -> Result<bool, String> {
+        self.frame_words = empty_camera_frame();
         let evaluation = self
             .profile(profile)?
             .evaluate(&self.resource.curves, time_seconds)
             .map_err(|error| error.to_string())?;
-        self.frame_words = empty_camera_frame();
         let Some(evaluation) = evaluation else {
             return Ok(false);
         };
         write_camera_frame(&mut self.frame_words, evaluation);
         Ok(true)
+    }
+
+    fn evaluate_introduction_frame(&mut self, time_seconds: f64) -> Result<bool, String> {
+        self.introduction_frame_words = empty_camera_introduction_frame();
+        let evaluation = self
+            .resource
+            .introduction()
+            .map(|introduction| introduction.evaluate(time_seconds))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        let Some(evaluation) = evaluation else {
+            return Ok(false);
+        };
+        write_camera_introduction_frame(&mut self.introduction_frame_words, evaluation);
+        Ok(true)
+    }
+
+    fn evaluate_finish_frame(&mut self, time_seconds: f64) -> Result<bool, String> {
+        self.finish_frame_words = empty_camera_finish_frame();
+        let evaluation = self
+            .resource
+            .finish()
+            .map(|finish| finish.evaluate(&self.resource.curves, time_seconds))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        let Some(evaluation) = evaluation else {
+            return Ok(false);
+        };
+        write_camera_finish_frame(&mut self.finish_frame_words, evaluation);
+        Ok(true)
+    }
+
+    fn evaluate_chorus_frame(&mut self, time_seconds: f64) -> Result<bool, String> {
+        self.chorus_frame_words = empty_camera_frame();
+        let evaluation = self
+            .chorus()?
+            .evaluate(time_seconds)
+            .map_err(|error| error.to_string())?;
+        let Some(state) = evaluation else {
+            return Ok(false);
+        };
+        write_camera_frame(
+            &mut self.chorus_frame_words,
+            CameraEvaluation {
+                state,
+                active_clips: 1,
+                incoming_weight: 1.0,
+                incoming_serialized_index: None,
+            },
+        );
+        Ok(true)
+    }
+
+    fn effect(&self, profile: u8, camera_name: &str) -> Result<CameraEffect<'_>, String> {
+        let profile = CameraProfile::try_from(profile).map_err(|error| error.to_string())?;
+        self.effects
+            .as_ref()
+            .ok_or_else(|| "camera-effects contract is unavailable".to_owned())?
+            .camera_effect(profile, camera_name)
+            .ok_or_else(|| format!("camera effect is unavailable: {camera_name}"))
     }
 }
 
@@ -196,6 +526,42 @@ fn write_camera_frame(words: &mut [f64; CAMERA_FRAME_WORDS], evaluation: CameraE
     words[CAMERA_FRAME_ROTATION_X..=CAMERA_FRAME_ROTATION_W]
         .copy_from_slice(&evaluation.state.rotation);
     words[CAMERA_FRAME_VERTICAL_FOV] = evaluation.state.vertical_fov_degrees;
+}
+
+const fn empty_camera_introduction_frame() -> [f64; CAMERA_INTRODUCTION_FRAME_WORDS] {
+    let mut result = [0.0; CAMERA_INTRODUCTION_FRAME_WORDS];
+    result[CAMERA_INTRODUCTION_FRAME_ABI] = CAMERA_INTRODUCTION_FRAME_ABI_VERSION as f64;
+    result
+}
+
+fn write_camera_introduction_frame(
+    words: &mut [f64; CAMERA_INTRODUCTION_FRAME_WORDS],
+    evaluation: CameraIntroductionEvaluation,
+) {
+    words[CAMERA_INTRODUCTION_FRAME_AVAILABLE] = 1.0;
+    words[CAMERA_INTRODUCTION_FRAME_POSITION_X..=CAMERA_INTRODUCTION_FRAME_POSITION_Z]
+        .copy_from_slice(&evaluation.position);
+}
+
+const fn empty_camera_finish_frame() -> [f64; CAMERA_FINISH_FRAME_WORDS] {
+    let mut result = [0.0; CAMERA_FINISH_FRAME_WORDS];
+    result[CAMERA_FINISH_FRAME_ABI] = CAMERA_FINISH_FRAME_ABI_VERSION as f64;
+    result[CAMERA_FINISH_FRAME_INCOMING_INDEX] = -1.0;
+    result
+}
+
+fn write_camera_finish_frame(
+    words: &mut [f64; CAMERA_FINISH_FRAME_WORDS],
+    evaluation: CameraFinishEvaluation,
+) {
+    words[CAMERA_FINISH_FRAME_AVAILABLE] = 1.0;
+    words[CAMERA_FINISH_FRAME_ACTIVE_CLIPS] = f64::from(evaluation.active_clips);
+    words[CAMERA_FINISH_FRAME_INCOMING_WEIGHT] = evaluation.incoming_weight;
+    words[CAMERA_FINISH_FRAME_INCOMING_INDEX] = evaluation
+        .incoming_serialized_index
+        .map(f64::from)
+        .unwrap_or(-1.0);
+    words[CAMERA_FINISH_FRAME_VERTICAL_FOV] = evaluation.vertical_fov_degrees;
 }
 
 /// Returns the current module memory for zero-copy typed-array views.
@@ -773,6 +1139,95 @@ mod tests {
       }}
     }"#;
 
+    const CAMERA_INTRODUCTION_RESOURCE: &str = r#"{
+      "schema":"org.haneoka.caph.live-camera-timelines",
+      "curves":{"empty":[]},
+      "profiles":{},
+      "sequences":{"introduction":{
+        "type":"position-animation",
+        "durationSeconds":4,
+        "frameRate":60,
+        "wrapMode":2,
+        "inheritsOrientationAndLens":true,
+        "animation":{
+          "startSeconds":1,
+          "durationSeconds":3,
+          "sourceDurationSeconds":1,
+          "preExtrapolation":"hold",
+          "postExtrapolation":"hold",
+          "positionCurves":{
+            "x":[[0,0,0,2,10],[1,0,0,0,12]],
+            "y":[[0,1,0,0,20],[1,0,0,0,21]],
+            "z":[[0,0,3,0,30],[1,0,0,0,33]]
+          }
+        }
+      },"finish":{
+        "type":"camera-blend",
+        "durationSeconds":3,
+        "frameRate":60,
+        "wrapMode":2,
+        "cameras":{
+          "from":{"position":[0,0,-10],"rotation":[0,0,0,1],"verticalFovDegrees":40},
+          "to":{"position":[0,0,-10],"rotation":[0,0,0,1],"verticalFovDegrees":70}
+        },
+        "clips":[
+          ["from",0,3,-1,3,"empty","empty",0,0,0,1,0],
+          ["to",0,3,3,-1,"empty","empty",0,0,0,1,1]
+        ]
+      }}
+    }"#;
+
+    const CAMERA_EFFECTS: &str = r#"{
+      "schema":"org.haneoka.caph.live-camera-effects",
+      "schemaVersion":1,
+      "channelTuple":["amplitude","frequency","constant"],
+      "octaveTuple":["x","y","z"],
+      "sampling":{
+        "cinemachine":"3.1",
+        "timeBase":"absolute-seconds-times-frequency-gain",
+        "noiseFunction":"unity-mathf-perlin-noise-2d",
+        "implementationStatus":"parameters-only"
+      },
+      "noiseProfiles":{"handheld":{"positionOctaves":[],"orientationOctaves":[
+        [[4,0.2,false],[2,0.15,false],[0,0,false]]
+      ]}},
+      "profiles":{"low":{
+        "cameraNames":["a","b"],
+        "customLookAtTarget":["b"],
+        "perlin":{
+          "enabled":true,
+          "noiseProfile":"handheld",
+          "pivotOffset":[0,0,0],
+          "noiseOffsets":[347.368896484375,731.6524658203125,-17.897705078125],
+          "defaultGain":[0.1,1],
+          "gainOverrides":{"b":[0.2,2]}
+        }
+      }}
+    }"#;
+
+    const CAMERA_CHORUS: &str = r#"{
+      "schema":"org.haneoka.caph.live-chorus-camera",
+      "schemaVersion":1,
+      "durationSeconds":10,
+      "frameRate":60,
+      "playback":"once",
+      "completion":"restore-score-timeline",
+      "coefficientTuple":["timeSeconds","a","b","c","d"],
+      "channels":{
+        "position":{
+          "x":[[0,0,0,0,0]],
+          "y":[[0,0,0,0,1]],
+          "z":[[0,0,0,0,-15]]
+        },
+        "eulerDegrees":{
+          "x":[[0,0,0,0,-4]],
+          "y":[[0,0,0,0,0]],
+          "z":[[0,0,0,0,0]]
+        },
+        "verticalFovDegrees":[[0,0,0,0,20]]
+      }
+    }"#;
+
     fn chart(notes: &[(u32, i64, NoteOperateType, NoteJudgementType)]) -> RuntimeChartV1 {
         RuntimeChartV1 {
             format: RUNTIME_CHART_FORMAT.into(),
@@ -804,6 +1259,8 @@ mod tests {
     #[test]
     fn camera_boundary_parses_once_and_reuses_one_fixed_frame_region() {
         let mut timeline = WasmCameraTimeline::from_json(CAMERA_RESOURCE.as_bytes()).unwrap();
+        assert!(!timeline.has_effects_contract());
+        assert!(!timeline.effects_sampling_supported());
         let pointer = timeline.frame_buffer_ptr();
         assert_eq!(timeline.frame_buffer_len(), CAMERA_FRAME_WORDS);
         assert_eq!(timeline.duration_seconds(0).unwrap(), 2.0);
@@ -818,9 +1275,177 @@ mod tests {
         assert!((timeline.frame_words[CAMERA_FRAME_POSITION_X] - 5.0).abs() < 1e-10);
         assert!((timeline.frame_words[CAMERA_FRAME_VERTICAL_FOV] - 50.0).abs() < 1e-10);
 
+        assert!(timeline.evaluate_frame(0, f64::NAN).is_err());
+        assert_eq!(timeline.frame_words, empty_camera_frame());
+        assert!(timeline.evaluate_frame(0, 1.5).unwrap());
         assert!(!timeline.evaluate_frame(0, 2.0).unwrap());
         assert_eq!(timeline.frame_buffer_ptr(), pointer);
         assert_eq!(timeline.frame_words, empty_camera_frame());
+    }
+
+    #[test]
+    fn camera_boundary_accepts_a_validated_optional_effects_contract() {
+        let timeline = WasmCameraTimeline::from_json_with_effects(
+            CAMERA_RESOURCE.as_bytes(),
+            CAMERA_EFFECTS.as_bytes(),
+        )
+        .unwrap();
+        assert!(timeline.has_effects_contract());
+        assert!(!timeline.effects_sampling_supported());
+        assert!(!timeline.camera_uses_custom_look_at(0, "a").unwrap());
+        assert!(timeline.camera_uses_custom_look_at(0, "b").unwrap());
+        assert!(timeline.camera_has_perlin(0, "b").unwrap());
+        assert!(timeline.effect(0, "missing").is_err());
+    }
+
+    #[test]
+    fn chorus_camera_uses_an_independent_reused_full_frame_region() {
+        let mut timeline = WasmCameraTimeline::from_json_with_effects_and_chorus(
+            CAMERA_RESOURCE.as_bytes(),
+            CAMERA_EFFECTS.as_bytes(),
+            CAMERA_CHORUS.as_bytes(),
+        )
+        .unwrap();
+        assert!(timeline.has_chorus());
+        assert_eq!(timeline.chorus_duration_seconds().unwrap(), 10.0);
+        assert_eq!(timeline.chorus_frame_rate().unwrap(), 60.0);
+        assert_eq!(timeline.chorus_frame_buffer_len(), CAMERA_FRAME_WORDS);
+
+        let score_pointer = timeline.frame_buffer_ptr();
+        let chorus_pointer = timeline.chorus_frame_buffer_ptr();
+        assert_ne!(score_pointer, chorus_pointer);
+        assert!(timeline.evaluate_frame(0, 1.5).unwrap());
+        let score_frame = timeline.frame_words;
+
+        assert!(timeline.evaluate_chorus_frame(0.0).unwrap());
+        assert_eq!(timeline.frame_words, score_frame);
+        assert_eq!(timeline.chorus_frame_buffer_ptr(), chorus_pointer);
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_ABI], 1.0);
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_AVAILABLE], 1.0);
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_ACTIVE_CLIPS], 1.0);
+        assert_eq!(
+            timeline.chorus_frame_words[CAMERA_FRAME_INCOMING_WEIGHT],
+            1.0
+        );
+        assert_eq!(
+            timeline.chorus_frame_words[CAMERA_FRAME_INCOMING_INDEX],
+            -1.0
+        );
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_POSITION_X], 0.0);
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_POSITION_Y], 1.0);
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_POSITION_Z], -15.0);
+        assert!(
+            (timeline.chorus_frame_words[CAMERA_FRAME_ROTATION_X] - -0.03489949554204941).abs()
+                < 1e-7
+        );
+        assert_eq!(timeline.chorus_frame_words[CAMERA_FRAME_VERTICAL_FOV], 20.0);
+
+        assert!(timeline.evaluate_chorus_frame(f64::NAN).is_err());
+        assert_eq!(timeline.chorus_frame_words, empty_camera_frame());
+        assert_eq!(timeline.frame_words, score_frame);
+        assert!(timeline.evaluate_chorus_frame(10.0 - 1.0 / 60.0).unwrap());
+        assert!(!timeline.evaluate_chorus_frame(10.0).unwrap());
+        assert_eq!(timeline.chorus_frame_words, empty_camera_frame());
+        assert_eq!(timeline.frame_words, score_frame);
+        assert_eq!(timeline.frame_buffer_ptr(), score_pointer);
+        assert_eq!(timeline.chorus_frame_buffer_ptr(), chorus_pointer);
+    }
+
+    #[test]
+    fn camera_sequences_use_separate_reused_bound_field_regions() {
+        let mut legacy = WasmCameraTimeline::from_json(CAMERA_RESOURCE.as_bytes()).unwrap();
+        assert!(!legacy.has_introduction());
+        assert!(!legacy.has_finish());
+        assert!(!legacy.evaluate_introduction_frame(0.0).unwrap());
+        assert!(!legacy.evaluate_finish_frame(0.0).unwrap());
+        assert_eq!(
+            legacy.introduction_frame_words,
+            empty_camera_introduction_frame()
+        );
+        assert_eq!(legacy.finish_frame_words, empty_camera_finish_frame());
+
+        let mut timeline =
+            WasmCameraTimeline::from_json(CAMERA_INTRODUCTION_RESOURCE.as_bytes()).unwrap();
+        assert!(timeline.has_introduction());
+        assert_eq!(timeline.introduction_duration_seconds().unwrap(), 4.0);
+        assert_eq!(timeline.introduction_frame_rate().unwrap(), 60.0);
+        assert!(
+            timeline
+                .introduction_inherits_orientation_and_lens()
+                .unwrap()
+        );
+        assert_eq!(
+            timeline.introduction_frame_buffer_len(),
+            CAMERA_INTRODUCTION_FRAME_WORDS
+        );
+
+        let pointer = timeline.introduction_frame_buffer_ptr();
+        assert!(timeline.evaluate_introduction_frame(1.5).unwrap());
+        assert_eq!(timeline.introduction_frame_buffer_ptr(), pointer);
+        assert_eq!(
+            timeline.introduction_frame_words[CAMERA_INTRODUCTION_FRAME_ABI],
+            1.0
+        );
+        assert_eq!(
+            timeline.introduction_frame_words[CAMERA_INTRODUCTION_FRAME_AVAILABLE],
+            1.0
+        );
+        assert_eq!(
+            &timeline.introduction_frame_words
+                [CAMERA_INTRODUCTION_FRAME_POSITION_X..=CAMERA_INTRODUCTION_FRAME_POSITION_Z],
+            &[11.0, 20.125, 30.75]
+        );
+
+        assert!(timeline.evaluate_introduction_frame(f64::NAN).is_err());
+        assert_eq!(
+            timeline.introduction_frame_words,
+            empty_camera_introduction_frame()
+        );
+        assert!(timeline.evaluate_introduction_frame(1.5).unwrap());
+        assert!(!timeline.evaluate_introduction_frame(4.0 + 1e-9).unwrap());
+        assert_eq!(timeline.introduction_frame_buffer_ptr(), pointer);
+        assert_eq!(
+            timeline.introduction_frame_words,
+            empty_camera_introduction_frame()
+        );
+
+        assert!(timeline.has_finish());
+        assert_eq!(timeline.finish_duration_seconds().unwrap(), 3.0);
+        assert_eq!(timeline.finish_frame_rate().unwrap(), 60.0);
+        assert_eq!(
+            timeline.finish_frame_buffer_len(),
+            CAMERA_FINISH_FRAME_WORDS
+        );
+        let finish_pointer = timeline.finish_frame_buffer_ptr();
+        assert!(timeline.evaluate_finish_frame(1.5).unwrap());
+        assert_eq!(timeline.finish_frame_buffer_ptr(), finish_pointer);
+        assert_eq!(timeline.finish_frame_words[CAMERA_FINISH_FRAME_ABI], 1.0);
+        assert_eq!(
+            timeline.finish_frame_words[CAMERA_FINISH_FRAME_AVAILABLE],
+            1.0
+        );
+        assert_eq!(
+            timeline.finish_frame_words[CAMERA_FINISH_FRAME_ACTIVE_CLIPS],
+            2.0
+        );
+        assert_eq!(
+            timeline.finish_frame_words[CAMERA_FINISH_FRAME_INCOMING_WEIGHT],
+            0.5
+        );
+        assert_eq!(
+            timeline.finish_frame_words[CAMERA_FINISH_FRAME_INCOMING_INDEX],
+            1.0
+        );
+        assert_eq!(
+            timeline.finish_frame_words[CAMERA_FINISH_FRAME_VERTICAL_FOV],
+            55.0
+        );
+        assert!(timeline.evaluate_finish_frame(f64::NAN).is_err());
+        assert_eq!(timeline.finish_frame_words, empty_camera_finish_frame());
+        assert!(timeline.evaluate_finish_frame(1.5).unwrap());
+        assert!(!timeline.evaluate_finish_frame(3.0).unwrap());
+        assert_eq!(timeline.finish_frame_buffer_ptr(), finish_pointer);
+        assert_eq!(timeline.finish_frame_words, empty_camera_finish_frame());
     }
 
     #[test]

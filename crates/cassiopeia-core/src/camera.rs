@@ -4,12 +4,16 @@ use std::fmt;
 
 use crate::live::CameraProfile;
 
+const DIRECTOR_WRAP_MODE_NONE: u8 = 2;
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraTimelineResource {
     pub schema: String,
     pub curves: BTreeMap<String, CameraCurve>,
     pub profiles: BTreeMap<String, CameraTimelineProfile>,
+    #[serde(default)]
+    pub sequences: CameraSequences,
 }
 
 impl CameraTimelineResource {
@@ -21,6 +25,100 @@ impl CameraTimelineResource {
         };
         self.profiles.get(name)
     }
+
+    pub fn introduction(&self) -> Option<&CameraIntroductionSequence> {
+        self.sequences.introduction.as_ref()
+    }
+
+    pub fn finish(&self) -> Option<&CameraFinishSequence> {
+        self.sequences.finish.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraSequences {
+    pub introduction: Option<CameraIntroductionSequence>,
+    pub finish: Option<CameraFinishSequence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraIntroductionSequence {
+    #[serde(rename = "type")]
+    pub sequence_type: CameraIntroductionType,
+    pub duration_seconds: f64,
+    pub frame_rate: f64,
+    pub wrap_mode: u8,
+    pub inherits_orientation_and_lens: bool,
+    pub animation: CameraPositionAnimation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum CameraIntroductionType {
+    #[serde(rename = "position-animation")]
+    PositionAnimation,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraFinishSequence {
+    #[serde(rename = "type")]
+    pub sequence_type: CameraFinishType,
+    pub duration_seconds: f64,
+    pub frame_rate: f64,
+    pub wrap_mode: u8,
+    pub cameras: BTreeMap<String, CameraState>,
+    pub clips: Vec<CameraClip>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum CameraFinishType {
+    #[serde(rename = "camera-blend")]
+    CameraBlend,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraPositionAnimation {
+    pub start_seconds: f64,
+    pub duration_seconds: f64,
+    pub source_duration_seconds: f64,
+    pub pre_extrapolation: CameraExtrapolation,
+    pub post_extrapolation: CameraExtrapolation,
+    pub position_curves: CameraPositionCurves,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct CameraPositionCurves {
+    pub x: Vec<CameraCubicSegment>,
+    pub y: Vec<CameraCubicSegment>,
+    pub z: Vec<CameraCubicSegment>,
+}
+
+/// Authored float32 `[timeSeconds, a, b, c, d]`, evaluated as
+/// `((a * dt + b) * dt + c) * dt + d`.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+pub struct CameraCubicSegment(pub f32, pub f32, pub f32, pub f32, pub f32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CameraExtrapolation {
+    Hold,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraIntroductionEvaluation {
+    pub position: [f64; 3],
+    pub inherits_orientation_and_lens: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraFinishEvaluation {
+    pub vertical_fov_degrees: f64,
+    pub active_clips: u8,
+    pub incoming_weight: f64,
+    pub incoming_serialized_index: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -74,6 +172,149 @@ pub struct CameraEvaluation {
     pub incoming_serialized_index: Option<u32>,
 }
 
+impl CameraIntroductionSequence {
+    /// Samples the bound position track without allocating. Orientation and lens
+    /// remain owned by the host because this sequence does not bind either one.
+    pub fn evaluate(
+        &self,
+        time_seconds: f64,
+    ) -> Result<Option<CameraIntroductionEvaluation>, CameraEvaluationError> {
+        if !time_seconds.is_finite() {
+            return Err(CameraEvaluationError::NonFiniteTime);
+        }
+        ensure_director_wrap_none(self.wrap_mode)?;
+        if time_seconds < 0.0 || time_seconds > self.duration_seconds {
+            return Ok(None);
+        }
+
+        let source_time = self.animation.source_time(time_seconds);
+        Ok(Some(CameraIntroductionEvaluation {
+            position: [
+                evaluate_camera_cubic_segments(&self.animation.position_curves.x, source_time)
+                    .ok_or(CameraEvaluationError::MissingIntroductionPositionCurve("x"))?,
+                evaluate_camera_cubic_segments(&self.animation.position_curves.y, source_time)
+                    .ok_or(CameraEvaluationError::MissingIntroductionPositionCurve("y"))?,
+                evaluate_camera_cubic_segments(&self.animation.position_curves.z, source_time)
+                    .ok_or(CameraEvaluationError::MissingIntroductionPositionCurve("z"))?,
+            ],
+            inherits_orientation_and_lens: self.inherits_orientation_and_lens,
+        }))
+    }
+}
+
+impl CameraFinishSequence {
+    /// Samples only the lens field bound by the finish sequence. The host pose is
+    /// intentionally left untouched.
+    pub fn evaluate(
+        &self,
+        curves: &BTreeMap<String, CameraCurve>,
+        time_seconds: f64,
+    ) -> Result<Option<CameraFinishEvaluation>, CameraEvaluationError> {
+        if !time_seconds.is_finite() {
+            return Err(CameraEvaluationError::NonFiniteTime);
+        }
+        ensure_director_wrap_none(self.wrap_mode)?;
+        if time_seconds < 0.0 || time_seconds > self.duration_seconds {
+            return Ok(None);
+        }
+
+        let active = first_two_active_clips(&self.clips, time_seconds);
+        let Some(first) = active[0] else {
+            return Ok(None);
+        };
+        let first_fov = self.camera_fov(first)?;
+        let Some(second) = active[1] else {
+            return Ok(Some(CameraFinishEvaluation {
+                vertical_fov_degrees: first_fov,
+                active_clips: 1,
+                incoming_weight: first.weight(curves, time_seconds)?,
+                incoming_serialized_index: Some(first.serialized_index()),
+            }));
+        };
+
+        let (outgoing, incoming) = if first.runtime_precedes(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let incoming_weight = incoming.weight(curves, time_seconds)?;
+        Ok(Some(CameraFinishEvaluation {
+            vertical_fov_degrees: f64::from(lerp_f32(
+                self.camera_fov(outgoing)?,
+                self.camera_fov(incoming)?,
+                incoming_weight as f32,
+            )),
+            active_clips: 2,
+            incoming_weight,
+            incoming_serialized_index: Some(incoming.serialized_index()),
+        }))
+    }
+
+    fn camera_fov(&self, clip: &CameraClip) -> Result<f64, CameraEvaluationError> {
+        self.cameras
+            .get(clip.camera())
+            .map(|camera| f64::from(camera.vertical_fov_degrees as f32))
+            .ok_or_else(|| CameraEvaluationError::MissingFinishCamera(clip.camera().to_owned()))
+    }
+}
+
+fn ensure_director_wrap_none(wrap_mode: u8) -> Result<(), CameraEvaluationError> {
+    if wrap_mode == DIRECTOR_WRAP_MODE_NONE {
+        Ok(())
+    } else {
+        Err(CameraEvaluationError::UnsupportedDirectorWrapMode(
+            wrap_mode,
+        ))
+    }
+}
+
+impl CameraPositionAnimation {
+    fn source_time(&self, sequence_time: f64) -> f64 {
+        let clip_end = self.start_seconds + self.duration_seconds;
+        let local_time = if sequence_time < self.start_seconds {
+            match self.pre_extrapolation {
+                CameraExtrapolation::Hold => 0.0,
+            }
+        } else if sequence_time > clip_end {
+            match self.post_extrapolation {
+                CameraExtrapolation::Hold => self.duration_seconds,
+            }
+        } else {
+            sequence_time - self.start_seconds
+        };
+
+        // A non-looping AnimationClip holds its final source sample when the
+        // authored Timeline clip is longer than the source clip.
+        local_time.clamp(0.0, self.source_duration_seconds.max(0.0))
+    }
+}
+
+/// Samples compact streamed-curve polynomial segments without allocating.
+pub fn evaluate_camera_cubic_segments(
+    segments: &[CameraCubicSegment],
+    time_seconds: f64,
+) -> Option<f64> {
+    if !time_seconds.is_finite() {
+        return None;
+    }
+    let time_seconds = time_seconds as f32;
+    let first = *segments.first()?;
+    if time_seconds <= first.0 {
+        return Some(f64::from(first.4));
+    }
+    let last = *segments.last()?;
+    if time_seconds >= last.0 {
+        return Some(f64::from(last.4));
+    }
+
+    let upper = segments.partition_point(|segment| segment.0 <= time_seconds);
+    let segment = segments[upper - 1];
+    let delta = time_seconds - segment.0;
+    Some(f64::from(
+        ((segment.1 * delta + segment.2) * delta + segment.3) * delta + segment.4,
+    ))
+}
+
 impl CameraTimelineProfile {
     /// Evaluates the first two active Timeline inputs without allocating.
     pub fn evaluate(
@@ -85,13 +326,7 @@ impl CameraTimelineProfile {
             return Err(CameraEvaluationError::NonFiniteTime);
         }
 
-        let mut active: [Option<&CameraClip>; 2] = [None, None];
-        for clip in &self.clips {
-            if !clip.is_active(time_seconds) {
-                continue;
-            }
-            insert_by_serialized_index(&mut active, clip);
-        }
+        let active = first_two_active_clips(&self.clips, time_seconds);
 
         let Some(first) = active[0] else {
             return Ok(None);
@@ -102,7 +337,7 @@ impl CameraTimelineProfile {
             let state = self
                 .base_intro_camera
                 .map(|base| CameraState::interpolate(base, first_state, weight))
-                .unwrap_or(first_state);
+                .unwrap_or_else(|| first_state.canonicalized());
             return Ok(Some(CameraEvaluation {
                 state,
                 active_clips: 1,
@@ -160,6 +395,7 @@ impl CameraClip {
     fn runtime_precedes(&self, other: &Self) -> bool {
         self.start_seconds()
             .total_cmp(&other.start_seconds())
+            .then_with(|| other.duration_seconds().total_cmp(&self.duration_seconds()))
             .then_with(|| self.serialized_index().cmp(&other.serialized_index()))
             .is_le()
     }
@@ -188,65 +424,82 @@ impl CameraClip {
             time_seconds - (self.start_seconds() + self.duration_seconds() - self.4),
             CurveDefault::MixOut,
         )?;
-        Ok((mix_in * mix_out).clamp(0.0, 1.0))
+        Ok(f64::from((mix_in * mix_out).clamp(0.0, 1.0)))
     }
 }
 
 impl CameraState {
+    fn canonicalized(self) -> Self {
+        Self {
+            position: self.position.map(|component| f64::from(component as f32)),
+            rotation: self.rotation.map(|component| f64::from(component as f32)),
+            vertical_fov_degrees: f64::from(self.vertical_fov_degrees as f32),
+        }
+    }
+
     pub fn interpolate(outgoing: Self, incoming: Self, amount: f64) -> Self {
-        let amount = amount.clamp(0.0, 1.0);
+        // Timeline camera weights and Unity's CameraState.Lerp API are
+        // single-precision even though PlayableDirector time is a double.
+        let amount = (amount as f32).clamp(0.0, 1.0);
         Self {
             position: [
-                lerp(outgoing.position[0], incoming.position[0], amount),
-                lerp(outgoing.position[1], incoming.position[1], amount),
-                lerp(outgoing.position[2], incoming.position[2], amount),
+                f64::from(lerp_f32(outgoing.position[0], incoming.position[0], amount)),
+                f64::from(lerp_f32(outgoing.position[1], incoming.position[1], amount)),
+                f64::from(lerp_f32(outgoing.position[2], incoming.position[2], amount)),
             ],
-            rotation: shortest_arc_slerp(outgoing.rotation, incoming.rotation, amount),
-            vertical_fov_degrees: lerp(
+            rotation: shortest_arc_slerp_f32(outgoing.rotation, incoming.rotation, amount),
+            vertical_fov_degrees: f64::from(lerp_f32(
                 outgoing.vertical_fov_degrees,
                 incoming.vertical_fov_degrees,
                 amount,
-            ),
+            )),
         }
     }
 }
 
 /// Piecewise cubic interpolation, including weighted tangent handles.
 pub fn evaluate_camera_curve(keys: &[CameraCurveKey], time: f64) -> Option<f64> {
+    evaluate_camera_curve_f32(keys, time as f32).map(f64::from)
+}
+
+fn evaluate_camera_curve_f32(keys: &[CameraCurveKey], time: f32) -> Option<f32> {
+    if !time.is_finite() {
+        return None;
+    }
     let first = *keys.first()?;
-    if time <= first.0 {
-        return Some(first.1);
+    if time <= first.0 as f32 {
+        return Some(first.1 as f32);
     }
     let last = *keys.last()?;
-    if time >= last.0 {
-        return Some(last.1);
+    if time >= last.0 as f32 {
+        return Some(last.1 as f32);
     }
-    let upper = keys.partition_point(|key| key.0 <= time);
+    let upper = keys.partition_point(|key| key.0 as f32 <= time);
     let left = keys[upper - 1];
     let right = keys[upper];
-    let duration = right.0 - left.0;
+    let duration = right.0 as f32 - left.0 as f32;
     if duration <= 0.0 {
-        return Some(right.1);
+        return Some(right.1 as f32);
     }
-    let normalized = ((time - left.0) / duration).clamp(0.0, 1.0);
+    let normalized = ((time - left.0 as f32) / duration).clamp(0.0, 1.0);
     let out_weight = if left.6 & 2 != 0 {
-        left.5.clamp(0.0, 1.0)
+        (left.5 as f32).clamp(0.0, 1.0)
     } else {
-        1.0 / 3.0
+        1.0_f32 / 3.0
     };
     let in_weight = if right.6 & 1 != 0 {
-        right.4.clamp(0.0, 1.0)
+        (right.4 as f32).clamp(0.0, 1.0)
     } else {
-        1.0 / 3.0
+        1.0_f32 / 3.0
     };
-    let parameter = solve_bezier_x(normalized, out_weight, 1.0 - in_weight);
-    let first_control = left.1 + left.3 * duration * out_weight;
-    let second_control = right.1 - right.2 * duration * in_weight;
-    Some(cubic_bezier(
-        left.1,
+    let parameter = solve_bezier_x_f32(normalized, out_weight, 1.0 - in_weight);
+    let first_control = left.1 as f32 + left.3 as f32 * duration * out_weight;
+    let second_control = right.1 as f32 - right.2 as f32 * duration * in_weight;
+    Some(cubic_bezier_f32(
+        left.1 as f32,
         first_control,
         second_control,
-        right.1,
+        right.1 as f32,
         parameter,
     ))
 }
@@ -258,6 +511,16 @@ fn insert_by_serialized_index<'a>(active: &mut [Option<&'a CameraClip>; 2], clip
     } else if active[1].is_none_or(|current| clip.serialized_index() < current.serialized_index()) {
         active[1] = Some(clip);
     }
+}
+
+fn first_two_active_clips(clips: &[CameraClip], time_seconds: f64) -> [Option<&CameraClip>; 2] {
+    let mut active = [None, None];
+    for clip in clips {
+        if clip.is_active(time_seconds) {
+            insert_by_serialized_index(&mut active, clip);
+        }
+    }
+    active
 }
 
 #[derive(Clone, Copy)]
@@ -272,30 +535,32 @@ fn clip_factor(
     duration: f64,
     elapsed: f64,
     default: CurveDefault,
-) -> Result<f64, CameraEvaluationError> {
+) -> Result<f32, CameraEvaluationError> {
     if duration < 0.0 {
         return Ok(1.0);
     }
     if duration == 0.0 {
         return Ok(1.0);
     }
-    let normalized = (elapsed / duration).clamp(0.0, 1.0);
+    // TimelineClip performs its local-time division in double precision and
+    // narrows only the normalized sample passed to AnimationCurve.Evaluate.
+    let normalized = ((elapsed / duration) as f32).clamp(0.0, 1.0);
     let curve = curves
         .get(curve_name)
         .ok_or_else(|| CameraEvaluationError::MissingCurve(curve_name.to_owned()))?;
-    let value = evaluate_camera_curve(curve, normalized).unwrap_or_else(|| match default {
-        CurveDefault::MixIn => smoothstep(normalized),
-        CurveDefault::MixOut => 1.0 - smoothstep(normalized),
+    let value = evaluate_camera_curve_f32(curve, normalized).unwrap_or_else(|| match default {
+        CurveDefault::MixIn => smoothstep_f32(normalized),
+        CurveDefault::MixOut => 1.0 - smoothstep_f32(normalized),
     });
     Ok(value.clamp(0.0, 1.0))
 }
 
-fn solve_bezier_x(target: f64, first_control: f64, second_control: f64) -> f64 {
-    let mut lower = 0.0;
-    let mut upper = 1.0;
+fn solve_bezier_x_f32(target: f32, first_control: f32, second_control: f32) -> f32 {
+    let mut lower = 0.0_f32;
+    let mut upper = 1.0_f32;
     for _ in 0..40 {
         let midpoint = (lower + upper) * 0.5;
-        let value = cubic_bezier(0.0, first_control, second_control, 1.0, midpoint);
+        let value = cubic_bezier_f32(0.0, first_control, second_control, 1.0, midpoint);
         if value < target {
             lower = midpoint;
         } else {
@@ -305,7 +570,7 @@ fn solve_bezier_x(target: f64, first_control: f64, second_control: f64) -> f64 {
     (lower + upper) * 0.5
 }
 
-fn cubic_bezier(a: f64, b: f64, c: f64, d: f64, time: f64) -> f64 {
+fn cubic_bezier_f32(a: f32, b: f32, c: f32, d: f32, time: f32) -> f32 {
     let inverse = 1.0 - time;
     inverse * inverse * inverse * a
         + 3.0 * inverse * inverse * time * b
@@ -313,23 +578,25 @@ fn cubic_bezier(a: f64, b: f64, c: f64, d: f64, time: f64) -> f64 {
         + time * time * time * d
 }
 
-fn shortest_arc_slerp(mut a: [f64; 4], mut b: [f64; 4], amount: f64) -> [f64; 4] {
-    normalize_quaternion(&mut a);
-    normalize_quaternion(&mut b);
-    let mut dot = quaternion_dot(a, b);
+fn shortest_arc_slerp_f32(a: [f64; 4], b: [f64; 4], amount: f32) -> [f64; 4] {
+    let mut a = a.map(|component| component as f32);
+    let mut b = b.map(|component| component as f32);
+    normalize_quaternion_f32(&mut a);
+    normalize_quaternion_f32(&mut b);
+    let mut dot = quaternion_dot_f32(a, b);
     if dot < 0.0 {
         b = [-b[0], -b[1], -b[2], -b[3]];
         dot = -dot;
     }
     if dot > 0.9995 {
         let mut result = [
-            lerp(a[0], b[0], amount),
-            lerp(a[1], b[1], amount),
-            lerp(a[2], b[2], amount),
-            lerp(a[3], b[3], amount),
+            lerp_f32_values(a[0], b[0], amount),
+            lerp_f32_values(a[1], b[1], amount),
+            lerp_f32_values(a[2], b[2], amount),
+            lerp_f32_values(a[3], b[3], amount),
         ];
-        normalize_quaternion(&mut result);
-        return result;
+        normalize_quaternion_f32(&mut result);
+        return result.map(f64::from);
     }
     let theta = dot.clamp(-1.0, 1.0).acos();
     let sin_theta = theta.sin();
@@ -341,11 +608,12 @@ fn shortest_arc_slerp(mut a: [f64; 4], mut b: [f64; 4], amount: f64) -> [f64; 4]
         outgoing * a[2] + incoming * b[2],
         outgoing * a[3] + incoming * b[3],
     ]
+    .map(f64::from)
 }
 
-fn normalize_quaternion(value: &mut [f64; 4]) {
-    let magnitude = quaternion_dot(*value, *value).sqrt();
-    if magnitude > f64::EPSILON {
+fn normalize_quaternion_f32(value: &mut [f32; 4]) {
+    let magnitude = quaternion_dot_f32(*value, *value).sqrt();
+    if magnitude > f32::EPSILON {
         for component in value {
             *component /= magnitude;
         }
@@ -354,15 +622,19 @@ fn normalize_quaternion(value: &mut [f64; 4]) {
     }
 }
 
-const fn quaternion_dot(a: [f64; 4], b: [f64; 4]) -> f64 {
+const fn quaternion_dot_f32(a: [f32; 4], b: [f32; 4]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 }
 
-const fn smoothstep(time: f64) -> f64 {
+const fn smoothstep_f32(time: f32) -> f32 {
     time * time * (3.0 - 2.0 * time)
 }
 
-fn lerp(a: f64, b: f64, amount: f64) -> f64 {
+fn lerp_f32(a: f64, b: f64, amount: f32) -> f32 {
+    lerp_f32_values(a as f32, b as f32, amount)
+}
+
+fn lerp_f32_values(a: f32, b: f32, amount: f32) -> f32 {
     a + (b - a) * amount
 }
 
@@ -371,6 +643,9 @@ pub enum CameraEvaluationError {
     NonFiniteTime,
     MissingCamera(String),
     MissingCurve(String),
+    MissingIntroductionPositionCurve(&'static str),
+    MissingFinishCamera(String),
+    UnsupportedDirectorWrapMode(u8),
 }
 
 impl fmt::Display for CameraEvaluationError {
@@ -379,6 +654,13 @@ impl fmt::Display for CameraEvaluationError {
             Self::NonFiniteTime => formatter.write_str("camera time must be finite"),
             Self::MissingCamera(name) => write!(formatter, "missing camera: {name}"),
             Self::MissingCurve(name) => write!(formatter, "missing camera curve: {name}"),
+            Self::MissingIntroductionPositionCurve(axis) => {
+                write!(formatter, "missing introduction position curve: {axis}")
+            }
+            Self::MissingFinishCamera(name) => write!(formatter, "missing finish camera: {name}"),
+            Self::UnsupportedDirectorWrapMode(mode) => {
+                write!(formatter, "unsupported camera director wrap mode: {mode}")
+            }
         }
     }
 }
@@ -412,6 +694,44 @@ mod tests {
       }}
     }"#;
 
+    const INTRODUCTION_RESOURCE: &str = r#"{
+      "schema":"org.haneoka.caph.live-camera-timelines",
+      "curves":{"empty":[]},
+      "profiles":{},
+      "sequences":{"introduction":{
+        "type":"position-animation",
+        "durationSeconds":4,
+        "frameRate":60,
+        "wrapMode":2,
+        "inheritsOrientationAndLens":true,
+        "animation":{
+          "startSeconds":1,
+          "durationSeconds":3,
+          "sourceDurationSeconds":1,
+          "preExtrapolation":"hold",
+          "postExtrapolation":"hold",
+          "positionCurves":{
+            "x":[[0,0,0,2,10],[1,0,0,0,12]],
+            "y":[[0,1,0,0,20],[1,0,0,0,21]],
+            "z":[[0,0,3,0,30],[1,0,0,0,33]]
+          }
+        }
+      },"finish":{
+        "type":"camera-blend",
+        "durationSeconds":3,
+        "frameRate":60,
+        "wrapMode":2,
+        "cameras":{
+          "from":{"position":[0,0,-10],"rotation":[0,0,0,1],"verticalFovDegrees":40},
+          "to":{"position":[0,0,-10],"rotation":[0,0,0,1],"verticalFovDegrees":70}
+        },
+        "clips":[
+          ["from",0,3,-1,3,"empty","empty",0,0,0,1,0],
+          ["to",0,3,3,-1,"empty","empty",0,0,0,1,1]
+        ]
+      }}
+    }"#;
+
     #[test]
     fn compact_resource_deserializes_and_blends_two_inputs() {
         let resource: CameraTimelineResource = serde_json::from_str(RESOURCE).unwrap();
@@ -428,8 +748,15 @@ mod tests {
         }
         assert!((evaluated.state.vertical_fov_degrees - 50.0).abs() < 1e-10);
         assert!(
-            (quaternion_dot(evaluated.state.rotation, evaluated.state.rotation) - 1.0).abs()
-                < 1e-10
+            (evaluated
+                .state
+                .rotation
+                .into_iter()
+                .map(|component| component * component)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-6
         );
     }
 
@@ -499,5 +826,138 @@ mod tests {
         );
         let evaluated = profile.evaluate(&resource.curves, 1.5).unwrap().unwrap();
         assert_ne!(evaluated.state.position, [99.0; 3]);
+    }
+
+    #[test]
+    fn introduction_holds_before_and_after_its_non_looping_source() {
+        let resource: CameraTimelineResource = serde_json::from_str(INTRODUCTION_RESOURCE).unwrap();
+        let introduction = resource.introduction().unwrap();
+
+        for time in [0.0, 1.0] {
+            let evaluated = introduction.evaluate(time).unwrap().unwrap();
+            assert_eq!(evaluated.position, [10.0, 20.0, 30.0]);
+            assert!(evaluated.inherits_orientation_and_lens);
+        }
+
+        let animated = introduction.evaluate(1.5).unwrap().unwrap();
+        assert_eq!(animated.position, [11.0, 20.125, 30.75]);
+
+        for time in [2.0, 3.5, 4.0] {
+            assert_eq!(
+                introduction.evaluate(time).unwrap().unwrap().position,
+                [12.0, 21.0, 33.0]
+            );
+        }
+        assert!(introduction.evaluate(-f64::EPSILON).unwrap().is_none());
+        assert!(introduction.evaluate(4.0 + 1e-9).unwrap().is_none());
+        assert_eq!(
+            introduction.evaluate(f64::NAN),
+            Err(CameraEvaluationError::NonFiniteTime)
+        );
+        let mut unsupported = introduction.clone();
+        unsupported.wrap_mode = 0;
+        assert_eq!(
+            unsupported.evaluate(0.0),
+            Err(CameraEvaluationError::UnsupportedDirectorWrapMode(0))
+        );
+    }
+
+    #[test]
+    fn introduction_segment_selection_uses_the_latest_boundary() {
+        let segments = [
+            CameraCubicSegment(0.0, 0.0, 0.0, 2.0, 10.0),
+            CameraCubicSegment(1.0, 0.0, 0.0, 0.0, 12.0),
+        ];
+        assert_eq!(evaluate_camera_cubic_segments(&segments, -1.0), Some(10.0));
+        assert_eq!(evaluate_camera_cubic_segments(&segments, 0.5), Some(11.0));
+        assert_eq!(evaluate_camera_cubic_segments(&segments, 1.0), Some(12.0));
+        assert_eq!(evaluate_camera_cubic_segments(&segments, 2.0), Some(12.0));
+        assert_eq!(evaluate_camera_cubic_segments(&segments, f64::NAN), None);
+        assert_eq!(evaluate_camera_cubic_segments(&[], 0.0), None);
+    }
+
+    #[test]
+    fn finish_sequence_only_samples_its_bound_fov_blend() {
+        let resource: CameraTimelineResource = serde_json::from_str(INTRODUCTION_RESOURCE).unwrap();
+        let finish = resource.finish().unwrap();
+
+        let first = finish.evaluate(&resource.curves, 0.0).unwrap().unwrap();
+        assert_eq!(first.vertical_fov_degrees, 40.0);
+        assert_eq!(first.active_clips, 2);
+        assert_eq!(first.incoming_weight, 0.0);
+        assert_eq!(first.incoming_serialized_index, Some(1));
+
+        let middle = finish.evaluate(&resource.curves, 1.5).unwrap().unwrap();
+        assert_eq!(middle.vertical_fov_degrees, 55.0);
+        assert_eq!(middle.incoming_weight, 0.5);
+        assert!(finish.evaluate(&resource.curves, 3.0).unwrap().is_none());
+        assert_eq!(
+            finish.evaluate(&resource.curves, f64::NAN),
+            Err(CameraEvaluationError::NonFiniteTime)
+        );
+
+        let mut unsupported = finish.clone();
+        unsupported.wrap_mode = 1;
+        assert_eq!(
+            unsupported.evaluate(&resource.curves, 0.0),
+            Err(CameraEvaluationError::UnsupportedDirectorWrapMode(1))
+        );
+    }
+
+    #[test]
+    fn shorter_clip_is_incoming_when_active_clips_start_together() {
+        let mut resource: CameraTimelineResource = serde_json::from_str(RESOURCE).unwrap();
+        let profile = resource.profiles.get_mut("low").unwrap();
+        profile.cameras.insert(
+            "long".into(),
+            CameraState {
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                vertical_fov_degrees: 10.0,
+            },
+        );
+        profile.cameras.insert(
+            "short".into(),
+            CameraState {
+                position: [10.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                vertical_fov_degrees: 90.0,
+            },
+        );
+        profile.clips = vec![
+            CameraClip(
+                "short".into(),
+                0.0,
+                1.0,
+                1.0,
+                -1.0,
+                "linear".into(),
+                "linear".into(),
+                0,
+                0,
+                0.0,
+                1.0,
+                1,
+            ),
+            CameraClip(
+                "long".into(),
+                0.0,
+                2.0,
+                -1.0,
+                -1.0,
+                "linear".into(),
+                "linear".into(),
+                0,
+                0,
+                0.0,
+                1.0,
+                9,
+            ),
+        ];
+
+        let evaluated = profile.evaluate(&resource.curves, 0.5).unwrap().unwrap();
+        assert_eq!(evaluated.incoming_serialized_index, Some(1));
+        assert!((evaluated.incoming_weight - 0.5).abs() < 1e-10);
+        assert!((evaluated.state.vertical_fov_degrees - 50.0).abs() < 1e-10);
     }
 }

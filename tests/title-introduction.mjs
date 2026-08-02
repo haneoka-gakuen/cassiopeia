@@ -4,6 +4,10 @@ import {
   TitleIntroductionPresentation,
   sampleTitleIntroduction,
 } from "../dist/index.js";
+import {
+  DEFAULT_FINISH_DIRECTION_DURATION_MS,
+  PlayerFinishDirectionLifecycle,
+} from "../dist/player.js";
 
 const content = {
   title: "Starlight",
@@ -85,4 +89,43 @@ assert.throws(
   RangeError,
 );
 
-console.log("Title introduction: boundary, clock, reset, disable, and sampler checks passed");
+const finishDirection = new PlayerFinishDirectionLifecycle();
+assert.equal(finishDirection.durationMs, DEFAULT_FINISH_DIRECTION_DURATION_MS);
+assert.deepEqual(finishDirection.start(10_000), {
+  started: true,
+  timeSeconds: 0,
+});
+assert.equal(finishDirection.running, true);
+assert.equal(finishDirection.pending, true);
+assert.deepEqual(finishDirection.update(11_250), { timeSeconds: 1.25 });
+assert.deepEqual(finishDirection.pause(11_500), { timeSeconds: 1.5 });
+assert.equal(finishDirection.running, false);
+assert.equal(finishDirection.elapsedMs, 1_500);
+assert.deepEqual(finishDirection.update(50_000), {});
+assert.deepEqual(finishDirection.start(20_000), {});
+assert.deepEqual(finishDirection.update(21_499), { timeSeconds: 2.999 });
+assert.deepEqual(finishDirection.update(21_500), {
+  timeSeconds: 3,
+  completed: true,
+});
+assert.equal(finishDirection.running, false);
+assert.equal(finishDirection.pending, false);
+assert.equal(finishDirection.complete, true);
+assert.deepEqual(finishDirection.start(30_000), {});
+assert.deepEqual(finishDirection.reset(), {});
+assert.equal(finishDirection.elapsedMs, 0);
+assert.equal(finishDirection.complete, false);
+
+assert.deepEqual(finishDirection.start(40_000), {
+  started: true,
+  timeSeconds: 0,
+});
+assert.deepEqual(finishDirection.reset(), { cancelled: true });
+assert.equal(finishDirection.running, false);
+assert.equal(finishDirection.pending, false);
+assert.throws(() => finishDirection.start(Number.NaN), RangeError);
+assert.throws(() => finishDirection.update(Number.POSITIVE_INFINITY), RangeError);
+
+console.log(
+  "Title introduction and finish direction: boundary, pause, reset, disable, and sampler checks passed",
+);

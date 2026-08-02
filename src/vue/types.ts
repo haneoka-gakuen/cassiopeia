@@ -13,6 +13,13 @@ export interface ChartPlayerEvents {
   playing: [value: boolean];
   /** True only while chart media advances; title-introduction playback stays false. */
   "media-playing": [value: boolean];
+  "introduction-started": [];
+  "introduction-timeupdate": [seconds: number];
+  "introduction-completed": [];
+  "finish-direction-started": [];
+  "finish-direction-timeupdate": [seconds: number];
+  "finish-direction-completed": [];
+  "finish-direction-cancelled": [];
   timeupdate: [seconds: number];
   duration: [seconds: number];
   judgement: [event: JudgementEvent];

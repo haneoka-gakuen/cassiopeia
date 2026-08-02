@@ -8,6 +8,8 @@
 
 pub mod assist;
 pub mod camera;
+pub mod camera_chorus;
+pub mod camera_effects;
 pub mod chart;
 pub mod judgement;
 pub mod live;
@@ -18,8 +20,22 @@ pub mod timing;
 
 pub use assist::{ASSIST_LEVEL_COUNT, AssistLevel, TIMING_WINDOWS_PER_LEVEL};
 pub use camera::{
-    CameraClip, CameraCurve, CameraCurveKey, CameraEvaluation, CameraEvaluationError, CameraState,
-    CameraTimelineProfile, CameraTimelineResource, evaluate_camera_curve,
+    CameraClip, CameraCubicSegment, CameraCurve, CameraCurveKey, CameraEvaluation,
+    CameraEvaluationError, CameraExtrapolation, CameraFinishEvaluation, CameraFinishSequence,
+    CameraFinishType, CameraIntroductionEvaluation, CameraIntroductionSequence,
+    CameraIntroductionType, CameraPositionAnimation, CameraPositionCurves, CameraSequences,
+    CameraState, CameraTimelineProfile, CameraTimelineResource, evaluate_camera_cubic_segments,
+    evaluate_camera_curve,
+};
+pub use camera_chorus::{
+    CAMERA_CHORUS_SCHEMA, CAMERA_CHORUS_SCHEMA_VERSION, CameraChorusChannels,
+    CameraChorusCompletion, CameraChorusError, CameraChorusPlayback, CameraChorusResource,
+    CameraChorusVectorCurves,
+};
+pub use camera_effects::{
+    CAMERA_EFFECTS_SCHEMA, CAMERA_EFFECTS_SCHEMA_VERSION, CameraEffect, CameraEffectsError,
+    CameraEffectsProfile, CameraEffectsResource, CameraEffectsSampling, CameraNoiseChannel,
+    CameraNoiseOctave, CameraNoiseProfile, CameraPerlinEffect, CameraPerlinProfile,
 };
 pub use chart::{CassiopeiaChart, ChartEvent, ChartHeader, ChartNote, NoteKind};
 pub use judgement::{

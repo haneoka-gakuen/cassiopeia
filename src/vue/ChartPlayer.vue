@@ -42,6 +42,14 @@ import {
   normalizeExternalTimeMs,
   shouldResetExternalTimeline,
 } from "./externalClock";
+import {
+  PlayerFinishDirectionLifecycle,
+  type PlayerFinishDirectionTransition,
+} from "./PlayerFinishDirectionLifecycle";
+import {
+  PlayerIntroductionLifecycle,
+  type PlayerIntroductionTransition,
+} from "./PlayerIntroductionLifecycle";
 import type { ChartPlayerEvents, ChartPlayerExpose } from "./types";
 
 const props = withDefaults(
@@ -80,7 +88,7 @@ const props = withDefaults(
     effectSeed?: number;
     /** Song metadata shown by the opening title presentation. */
     titleIntroduction?: TitleIntroductionContent;
-    /** The opening presentation can be disabled without changing chart time. */
+    /** Hides the opening HUD without skipping its playback lifecycle. */
     titleIntroductionEnabled?: boolean;
     titleIntroductionTheme?: Partial<RenderTitleIntroductionTheme>;
     ariaLabel?: string;
@@ -120,8 +128,8 @@ let frameBuilder: RenderFrameBuilder | undefined;
 let noteSounds: NoteSoundPlayer | undefined;
 let titleIntroduction: TitleIntroductionPresentation | undefined;
 let titleIntroductionSnapshot: TitleIntroductionSnapshot | undefined;
-let titleIntroductionElapsedMs = 0;
-let titleIntroductionRunning = false;
+const introductionLifecycle = new PlayerIntroductionLifecycle();
+const finishDirectionLifecycle = new PlayerFinishDirectionLifecycle();
 let titleIntroductionStartPending = false;
 let titleIntroductionMediaPrimed = false;
 let titleIntroductionMediaResumeAtMs = 0;
@@ -161,15 +169,15 @@ const presentationTimeMs = () => {
 };
 const chartTimeMs = () => presentationTimeMs() - props.bgmOffsetMs;
 const titleIntroductionInFlight = () =>
-  titleIntroductionRunning || titleIntroductionStartPending;
+  introductionLifecycle.running || titleIntroductionStartPending;
 const gameplayIsPlaying = () =>
   externalClockControlled.value
     ? props.externalPlaying === true
     : clock?.playing === true && !titleIntroductionMediaPrimed;
 const playerIsPlaying = () =>
-  externalClockControlled.value
-    ? props.externalPlaying === true
-    : gameplayIsPlaying() || titleIntroductionInFlight();
+  gameplayIsPlaying() ||
+  titleIntroductionInFlight() ||
+  finishDirectionLifecycle.running;
 const presentationDurationMs = () =>
   Math.max(
     clock?.durationMs ?? 0,
@@ -394,9 +402,6 @@ function attachSession(): void {
 
 function attachTitleIntroduction(): void {
   const content = props.titleIntroduction;
-  titleIntroductionRunning = false;
-  titleIntroductionStartPending = false;
-  titleIntroductionElapsedMs = 0;
   if (!content?.title) {
     titleIntroduction = undefined;
     titleIntroductionSnapshot = undefined;
@@ -404,66 +409,102 @@ function attachTitleIntroduction(): void {
   }
   titleIntroduction = new TitleIntroductionPresentation({
     content,
-    enabled: props.titleIntroductionEnabled,
+    enabled: true,
   });
-  titleIntroductionSnapshot = titleIntroduction.reset();
+  titleIntroductionSnapshot = titleIntroduction.atElapsed(
+    introductionLifecycle.elapsedMs,
+  );
+}
+
+function emitIntroductionTransition(
+  transition: PlayerIntroductionTransition,
+): void {
+  if (transition.started) emit("introduction-started");
+  if (transition.timeSeconds !== undefined)
+    emit("introduction-timeupdate", transition.timeSeconds);
+  if (transition.completed) emit("introduction-completed");
 }
 
 function resumeTitleIntroduction(): void {
-  if (!titleIntroduction || titleIntroductionSnapshot?.state === "complete")
-    return;
-  titleIntroductionSnapshot = titleIntroduction.start(
-    performance.now() - titleIntroductionElapsedMs,
+  emitIntroductionTransition(
+    introductionLifecycle.start(performance.now()),
   );
-  titleIntroductionRunning = true;
+  titleIntroductionSnapshot = titleIntroduction?.atElapsed(
+    introductionLifecycle.elapsedMs,
+  );
 }
 
 function pauseTitleIntroduction(): void {
-  if (
-    !titleIntroductionRunning ||
-    !titleIntroduction ||
-    titleIntroductionSnapshot?.state === "complete"
-  )
-    return;
-  titleIntroductionSnapshot = titleIntroduction.update(performance.now());
-  titleIntroductionElapsedMs = titleIntroductionSnapshot.elapsedMs;
-  titleIntroductionRunning = false;
+  emitIntroductionTransition(
+    introductionLifecycle.pause(performance.now()),
+  );
+  titleIntroductionSnapshot = titleIntroduction?.atElapsed(
+    introductionLifecycle.elapsedMs,
+  );
 }
 
 function skipTitleIntroduction(): void {
-  if (!titleIntroduction) return;
-  titleIntroductionRunning = false;
+  emitIntroductionTransition(introductionLifecycle.skip());
   titleIntroductionStartPending = false;
-  titleIntroductionElapsedMs = titleIntroduction.timing.totalDurationMs;
-  titleIntroductionSnapshot = titleIntroduction.atElapsed(
-    titleIntroductionElapsedMs,
+  titleIntroductionSnapshot = titleIntroduction?.atElapsed(
+    introductionLifecycle.elapsedMs,
   );
 }
 
 function shouldPlayTitleIntroduction(): boolean {
-  return (
-    !externalClockControlled.value &&
-    Boolean(titleIntroduction) &&
-    titleIntroductionSnapshot?.enabled === true &&
-    titleIntroductionSnapshot.state !== "complete" &&
-    chartTimeMs() <= 0
+  return !externalClockControlled.value && !introductionLifecycle.complete;
+}
+
+function updateTitleIntroduction(realtimeMs: number): void {
+  const transition = introductionLifecycle.update(realtimeMs);
+  emitIntroductionTransition(transition);
+  titleIntroductionSnapshot = titleIntroduction?.atElapsed(
+    introductionLifecycle.elapsedMs,
+  );
+  if (transition.completed) titleIntroductionStartPending = true;
+}
+
+function emitFinishDirectionTransition(
+  transition: PlayerFinishDirectionTransition,
+): void {
+  if (transition.started) emit("finish-direction-started");
+  if (transition.timeSeconds !== undefined)
+    emit("finish-direction-timeupdate", transition.timeSeconds);
+  if (transition.completed) emit("finish-direction-completed");
+  if (transition.cancelled) emit("finish-direction-cancelled");
+}
+
+function updateFinishDirection(realtimeMs: number): void {
+  const transition = finishDirectionLifecycle.update(realtimeMs);
+  emitFinishDirectionTransition(transition);
+  if (!transition.completed) return;
+  dirty = true;
+  if (!gameplayIsPlaying() && !titleIntroductionInFlight())
+    emit("playing", false);
+}
+
+function pauseFinishDirection(): void {
+  emitFinishDirectionTransition(
+    finishDirectionLifecycle.pause(performance.now()),
   );
 }
 
-function applyTitleIntroduction(
-  frame: RenderFrame,
-  realtimeMs: number,
-): RenderFrame {
+function resetFinishDirection(): void {
+  emitFinishDirectionTransition(finishDirectionLifecycle.reset());
+}
+
+function applyTitleIntroduction(frame: RenderFrame): RenderFrame {
   const presentation = titleIntroduction;
   const hud = frame.hud;
   if (!presentation || !hud) return frame;
-  if (titleIntroductionRunning) {
-    titleIntroductionSnapshot = presentation.update(realtimeMs);
-    titleIntroductionElapsedMs = titleIntroductionSnapshot.elapsedMs;
-  }
+  titleIntroductionSnapshot = presentation.atElapsed(
+    introductionLifecycle.elapsedMs,
+  );
   const snapshot = titleIntroductionSnapshot;
   hud.titleIntroduction =
-    snapshot && snapshot.enabled && snapshot.state !== "complete"
+    props.titleIntroductionEnabled &&
+    snapshot &&
+    snapshot.state !== "complete"
       ? {
           ...snapshot.content,
           alpha: snapshot.alpha,
@@ -589,7 +630,13 @@ function attachInput(): void {
 
 function renderFrame(): void {
   if (!renderer || !session || !frameBuilder) return;
+  const realtimeMs = performance.now();
+  if (introductionLifecycle.running)
+    updateTitleIntroduction(realtimeMs);
+  if (finishDirectionLifecycle.running)
+    updateFinishDirection(realtimeMs);
   const playing = playerIsPlaying();
+  const gameplayPlaying = gameplayIsPlaying();
   if (!dirty && !playing) return;
   const timeMs = chartTimeMs();
   const simulationTimeMs = Math.floor(timeMs);
@@ -598,25 +645,33 @@ function renderFrame(): void {
   // A playing media element can report the same clock value for several rAFs
   // while buffering or while the platform audio clock advances at a lower
   // cadence. No simulator or visual state changes in those duplicate ticks.
-  if (!dirty && timeMs === lastRenderedTimeMs && !titleIntroductionRunning)
+  if (
+    !dirty &&
+    timeMs === lastRenderedTimeMs &&
+    !introductionLifecycle.running
+  )
     return;
-  const frameStarted = perfProbe ? performance.now() : 0;
+  const frameStarted = perfProbe ? realtimeMs : 0;
   const sessionStarted = frameStarted;
-  if (props.mode === "play" && playing && activePointerIds.size > 0) {
+  if (
+    props.mode === "play" &&
+    gameplayPlaying &&
+    activePointerIds.size > 0
+  ) {
     for (const point of input?.activePoints ?? []) {
       if (session.trace(point.lane, simulationTimeMs, point.pointerId))
         inputFeedbackClaimedPointerIds.add(point.pointerId);
     }
   }
   const snapshot =
-    timelineFinished && !playing
+    timelineFinished && !gameplayPlaying
       ? session.snapshot()
       : session.updateReusable(simulationTimeMs);
   const sessionFinished = perfProbe ? performance.now() : 0;
   if (props.noteSoundEnabled) {
     noteSounds?.flush(props.noteSoundVolume);
     noteSounds?.setLongLineActive(
-      playing && snapshot.activeLongLine,
+      gameplayPlaying && snapshot.activeLongLine,
       props.noteSoundVolume,
     );
   } else {
@@ -627,7 +682,6 @@ function renderFrame(): void {
     const buildStarted = performance.now();
     const frame = applyTitleIntroduction(
       frameBuilder.buildReusable(timeMs, snapshot, props.settings),
-      performance.now(),
     );
     const renderStarted = performance.now();
     renderer.render(frame);
@@ -645,7 +699,6 @@ function renderFrame(): void {
     renderer.render(
       applyTitleIntroduction(
         frameBuilder.buildReusable(timeMs, snapshot, props.settings),
-        performance.now(),
       ),
     );
   }
@@ -661,21 +714,17 @@ function renderFrame(): void {
 function animate(): void {
   animationFrame = 0;
   renderFrame();
-  if (
-    titleIntroductionRunning &&
-    titleIntroductionSnapshot?.state === "complete"
-  ) {
-    titleIntroductionRunning = false;
-    titleIntroductionStartPending = true;
-    requestFrame();
-    return;
-  }
   if (titleIntroductionStartPending) {
     titleIntroductionStartPending = false;
     void startMediaPlayback(false);
     return;
   }
-  if (clock?.playing || titleIntroductionRunning) requestFrame();
+  if (
+    clock?.playing ||
+    introductionLifecycle.running ||
+    finishDirectionLifecycle.running
+  )
+    requestFrame();
 }
 
 function requestFrame(): void {
@@ -697,6 +746,7 @@ function resize(): void {
 
 function resetTimeline(timeMs: number): void {
   if (!session || !frameBuilder) return;
+  resetFinishDirection();
   suppressEffects = true;
   activePointerIds.clear();
   inputFeedbackClaimedPointerIds.clear();
@@ -704,7 +754,6 @@ function resetTimeline(timeMs: number): void {
   noteSounds?.clearQueue();
   noteSounds?.stopLongLine();
   timelineFinished = false;
-  if (timeMs > 0) skipTitleIntroduction();
   try {
     frameBuilder.reset();
     session.reset(timeMs);
@@ -727,6 +776,9 @@ function finishTimeline(timeMs = chartTimeMs()): void {
   noteSounds?.stopLongLine();
   session.finish(Math.max(timeMs, props.chart.durationMs));
   timelineFinished = true;
+  emitFinishDirectionTransition(
+    finishDirectionLifecycle.start(performance.now()),
+  );
   lastRenderedTimeMs = Number.NaN;
   dirty = true;
   requestFrame();
@@ -789,7 +841,7 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
     requestFrame();
   } catch (reason) {
     if (!destroyed) {
-      titleIntroductionRunning = false;
+      pauseTitleIntroduction();
       titleIntroductionStartPending = false;
       restoreTitleIntroductionMedia(true);
       backgroundVideo.value?.pause();
@@ -803,6 +855,16 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
 
 async function play(): Promise<void> {
   if (externalClockControlled.value || titleIntroductionInFlight()) return;
+  if (finishDirectionLifecycle.pending) {
+    emitFinishDirectionTransition(
+      finishDirectionLifecycle.start(performance.now()),
+    );
+    dirty = true;
+    requestFrame();
+    emit("playing", true);
+    return;
+  }
+  if (timelineFinished && finishDirectionLifecycle.complete) seek(0);
   if (!shouldPlayTitleIntroduction()) {
     await startMediaPlayback();
     return;
@@ -826,7 +888,7 @@ async function play(): Promise<void> {
   try {
     await titleIntroductionUnlock;
   } catch (reason) {
-    titleIntroductionRunning = false;
+    pauseTitleIntroduction();
     restoreTitleIntroductionMedia(true);
     emit("playing", false);
     if (!destroyed) reportError(reason);
@@ -835,6 +897,7 @@ async function play(): Promise<void> {
 
 function pause(): void {
   const introductionWasPlaying = titleIntroductionInFlight();
+  const finishDirectionWasPlaying = finishDirectionLifecycle.running;
   if (activePointerIds.size > 0) {
     for (const point of input?.activePoints ?? [])
       session?.cancel(point.pointerId);
@@ -845,23 +908,30 @@ function pause(): void {
   noteSounds?.clearQueue();
   noteSounds?.stopLongLine();
   pauseTitleIntroduction();
+  pauseFinishDirection();
   titleIntroductionStartPending = false;
   backgroundVideo.value?.pause();
   if (titleIntroductionMediaPrimed) restoreTitleIntroductionMedia(true);
   else clock?.pause();
   emitMediaPlaying(false);
-  if (introductionWasPlaying && !clock?.playing) emit("playing", false);
+  if (
+    (introductionWasPlaying || finishDirectionWasPlaying) &&
+    !clock?.playing
+  )
+    emit("playing", false);
 }
 
 function seek(seconds: number, skipIntroduction = true): void {
   if (externalClockControlled.value || !clock || !session || !frameBuilder)
     return;
   const introductionWasPlaying = titleIntroductionInFlight();
+  const finishDirectionWasPlaying = finishDirectionLifecycle.running;
   if (titleIntroductionMediaPrimed) restoreTitleIntroductionMedia(true);
   if (skipIntroduction) skipTitleIntroduction();
   clock.seek(seconds * 1000);
   resetTimeline(chartTimeMs());
-  if (introductionWasPlaying) emit("playing", false);
+  if (introductionWasPlaying || finishDirectionWasPlaying)
+    emit("playing", false);
   if (introductionWasPlaying) emitMediaPlaying(false);
 }
 
@@ -906,7 +976,7 @@ function attachInternalAudio(): void {
     if (active()) {
       finishTimeline();
       emitMediaPlaying(false);
-      emit("playing", false);
+      if (!finishDirectionLifecycle.running) emit("playing", false);
     }
   });
   candidate.audio.addEventListener("durationchange", () => {
@@ -953,6 +1023,8 @@ async function initialize(): Promise<void> {
       return;
     }
     attachInternalAudio();
+    introductionLifecycle.reset();
+    titleIntroductionStartPending = false;
     attachSession();
     attachInput();
     resizeObserver = new ResizeObserver(resize);
@@ -1025,7 +1097,21 @@ watch(
     } else seek(0, false);
   },
 );
-watch([() => props.chart, () => props.effectSeed], () => {
+watch(
+  () => props.chart,
+  () => {
+    pause();
+    introductionLifecycle.reset();
+    titleIntroductionStartPending = false;
+    attachSession();
+    if (externalClockControlled.value) {
+      skipTitleIntroduction();
+      resetTimeline(chartTimeMs());
+    } else seek(0, false);
+    emit("duration", presentationDurationMs() / 1000);
+  },
+);
+watch(() => props.effectSeed, () => {
   pause();
   attachSession();
   if (externalClockControlled.value) {
@@ -1037,17 +1123,12 @@ watch([() => props.chart, () => props.effectSeed], () => {
 watch(
   [() => props.titleIntroduction, () => props.titleIntroductionEnabled],
   () => {
-    const introductionWasInFlight = titleIntroductionInFlight();
     attachTitleIntroduction();
     if (
       externalClockControlled.value ||
-      chartTimeMs() > 0 ||
       gameplayIsPlaying()
     )
       skipTitleIntroduction();
-    else if (introductionWasInFlight && props.titleIntroductionEnabled)
-      resumeTitleIntroduction();
-    else if (introductionWasInFlight) titleIntroductionStartPending = true;
     dirty = true;
     requestFrame();
   },
