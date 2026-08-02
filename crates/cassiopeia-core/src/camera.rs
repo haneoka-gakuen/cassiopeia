@@ -172,6 +172,42 @@ pub struct CameraEvaluation {
     pub incoming_serialized_index: Option<u32>,
 }
 
+/// One virtual-camera input selected by Timeline before the brain blends it.
+/// Effects are evaluated on these inputs independently, matching Cinemachine's
+/// pipeline order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraBlendInput<'a> {
+    pub camera_name: Option<&'a str>,
+    pub state: CameraState,
+}
+
+/// The raw virtual-camera inputs and weight selected for one Timeline sample.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraBlendEvaluation<'a> {
+    pub outgoing: CameraBlendInput<'a>,
+    pub incoming: Option<CameraBlendInput<'a>>,
+    pub active_clips: u8,
+    pub incoming_weight: f64,
+    pub incoming_serialized_index: Option<u32>,
+}
+
+impl CameraBlendEvaluation<'_> {
+    pub fn evaluate_raw(self) -> CameraEvaluation {
+        let state = self
+            .incoming
+            .map(|incoming| {
+                CameraState::interpolate(self.outgoing.state, incoming.state, self.incoming_weight)
+            })
+            .unwrap_or_else(|| self.outgoing.state.canonicalized());
+        CameraEvaluation {
+            state,
+            active_clips: self.active_clips,
+            incoming_weight: self.incoming_weight,
+            incoming_serialized_index: self.incoming_serialized_index,
+        }
+    }
+}
+
 impl CameraIntroductionSequence {
     /// Samples the bound position track without allocating. Orientation and lens
     /// remain owned by the host because this sequence does not bind either one.
@@ -322,6 +358,19 @@ impl CameraTimelineProfile {
         curves: &BTreeMap<String, CameraCurve>,
         time_seconds: f64,
     ) -> Result<Option<CameraEvaluation>, CameraEvaluationError> {
+        Ok(self
+            .evaluate_blend_inputs(curves, time_seconds)?
+            .map(CameraBlendEvaluation::evaluate_raw))
+    }
+
+    /// Resolves the virtual-camera inputs without blending their pipeline
+    /// corrections. Hosts that reproduce Cinemachine extensions use this to
+    /// sample each input first and blend raw pose and corrections separately.
+    pub fn evaluate_blend_inputs(
+        &self,
+        curves: &BTreeMap<String, CameraCurve>,
+        time_seconds: f64,
+    ) -> Result<Option<CameraBlendEvaluation<'_>>, CameraEvaluationError> {
         if !time_seconds.is_finite() {
             return Err(CameraEvaluationError::NonFiniteTime);
         }
@@ -334,12 +383,30 @@ impl CameraTimelineProfile {
         let first_state = self.camera(first)?;
         let Some(second) = active[1] else {
             let weight = first.weight(curves, time_seconds)?;
-            let state = self
+            let (outgoing, incoming) = self
                 .base_intro_camera
-                .map(|base| CameraState::interpolate(base, first_state, weight))
-                .unwrap_or_else(|| first_state.canonicalized());
-            return Ok(Some(CameraEvaluation {
-                state,
+                .map(|base| {
+                    (
+                        CameraBlendInput {
+                            camera_name: self.base_intro_camera_name.as_deref(),
+                            state: base,
+                        },
+                        Some(CameraBlendInput {
+                            camera_name: Some(first.camera()),
+                            state: first_state,
+                        }),
+                    )
+                })
+                .unwrap_or((
+                    CameraBlendInput {
+                        camera_name: Some(first.camera()),
+                        state: first_state,
+                    },
+                    None,
+                ));
+            return Ok(Some(CameraBlendEvaluation {
+                outgoing,
+                incoming,
                 active_clips: 1,
                 incoming_weight: weight,
                 incoming_serialized_index: Some(first.serialized_index()),
@@ -351,11 +418,16 @@ impl CameraTimelineProfile {
         } else {
             (second, first)
         };
-        let outgoing_state = self.camera(outgoing)?;
-        let incoming_state = self.camera(incoming)?;
         let incoming_weight = incoming.weight(curves, time_seconds)?;
-        Ok(Some(CameraEvaluation {
-            state: CameraState::interpolate(outgoing_state, incoming_state, incoming_weight),
+        Ok(Some(CameraBlendEvaluation {
+            outgoing: CameraBlendInput {
+                camera_name: Some(outgoing.camera()),
+                state: self.camera(outgoing)?,
+            },
+            incoming: Some(CameraBlendInput {
+                camera_name: Some(incoming.camera()),
+                state: self.camera(incoming)?,
+            }),
             active_clips: 2,
             incoming_weight,
             incoming_serialized_index: Some(incoming.serialized_index()),
@@ -578,7 +650,7 @@ fn cubic_bezier_f32(a: f32, b: f32, c: f32, d: f32, time: f32) -> f32 {
         + time * time * time * d
 }
 
-fn shortest_arc_slerp_f32(a: [f64; 4], b: [f64; 4], amount: f32) -> [f64; 4] {
+pub(crate) fn shortest_arc_slerp_f32(a: [f64; 4], b: [f64; 4], amount: f32) -> [f64; 4] {
     let mut a = a.map(|component| component as f32);
     let mut b = b.map(|component| component as f32);
     normalize_quaternion_f32(&mut a);
@@ -609,6 +681,28 @@ fn shortest_arc_slerp_f32(a: [f64; 4], b: [f64; 4], amount: f32) -> [f64; 4] {
         outgoing * a[3] + incoming * b[3],
     ]
     .map(f64::from)
+}
+
+pub(crate) fn unity_euler_zxy_quaternion_f32(euler_degrees: [f32; 3]) -> [f32; 4] {
+    let [x, y, z] = euler_degrees.map(|value| value.to_radians() * 0.5);
+    let (sin_x, cos_x) = x.sin_cos();
+    let (sin_y, cos_y) = y.sin_cos();
+    let (sin_z, cos_z) = z.sin_cos();
+    let qx = [sin_x, 0.0, 0.0, cos_x];
+    let qy = [0.0, sin_y, 0.0, cos_y];
+    let qz = [0.0, 0.0, sin_z, cos_z];
+    let mut result = quaternion_multiply_f32(quaternion_multiply_f32(qy, qx), qz);
+    normalize_quaternion_f32(&mut result);
+    result
+}
+
+pub(crate) const fn quaternion_multiply_f32(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    [
+        left[3] * right[0] + left[0] * right[3] + left[1] * right[2] - left[2] * right[1],
+        left[3] * right[1] - left[0] * right[2] + left[1] * right[3] + left[2] * right[0],
+        left[3] * right[2] + left[0] * right[1] - left[1] * right[0] + left[2] * right[3],
+        left[3] * right[3] - left[0] * right[0] - left[1] * right[1] - left[2] * right[2],
+    ]
 }
 
 fn normalize_quaternion_f32(value: &mut [f32; 4]) {

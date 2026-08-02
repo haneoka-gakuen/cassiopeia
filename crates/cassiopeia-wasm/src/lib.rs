@@ -184,6 +184,20 @@ impl WasmCameraTimeline {
         self.evaluate_frame(profile, time_seconds).map_err(js_error)
     }
 
+    /// Samples Unity-native Perlin with a pauseable scene uptime that is
+    /// independent of score time. Calling this after a seek must retain the
+    /// existing scene uptime instead of deriving it from the new score time.
+    #[wasm_bindgen(js_name = evaluateWithEffects)]
+    pub fn evaluate_with_effects(
+        &mut self,
+        profile: u8,
+        score_time_seconds: f64,
+        scene_uptime_seconds: f64,
+    ) -> Result<bool, JsError> {
+        self.evaluate_effects_frame(profile, score_time_seconds, scene_uptime_seconds)
+            .map_err(js_error)
+    }
+
     /// Samples the position-only introduction track into its stable frame region.
     #[wasm_bindgen(js_name = evaluateIntroduction)]
     pub fn evaluate_introduction(&mut self, time_seconds: f64) -> Result<bool, JsError> {
@@ -330,9 +344,19 @@ impl WasmCameraTimeline {
         self.effects.is_some()
     }
 
-    /// Remains false until Unity's native Perlin samples and inactive-camera phase are pinned.
+    /// Reports exact pure sampling and active Timeline blend support for this contract.
     #[wasm_bindgen(js_name = effectsSamplingSupported)]
     pub fn effects_sampling_supported(&self) -> bool {
+        self.effects
+            .as_ref()
+            .is_some_and(CameraEffectsResource::supports_exact_sampling)
+    }
+
+    /// Inactive virtual-camera StandbyUpdate/RoundRobin phase is not modeled by
+    /// this stateless boundary. Hosts currently provide continuously advancing
+    /// scene uptime for every selected input.
+    #[wasm_bindgen(js_name = effectsStandbyRoundRobinSupported)]
+    pub fn effects_standby_round_robin_supported(&self) -> bool {
         false
     }
 
@@ -435,6 +459,32 @@ impl WasmCameraTimeline {
         let evaluation = self
             .profile(profile)?
             .evaluate(&self.resource.curves, time_seconds)
+            .map_err(|error| error.to_string())?;
+        let Some(evaluation) = evaluation else {
+            return Ok(false);
+        };
+        write_camera_frame(&mut self.frame_words, evaluation);
+        Ok(true)
+    }
+
+    fn evaluate_effects_frame(
+        &mut self,
+        profile: u8,
+        score_time_seconds: f64,
+        scene_uptime_seconds: f64,
+    ) -> Result<bool, String> {
+        self.frame_words = empty_camera_frame();
+        let profile = CameraProfile::try_from(profile).map_err(|error| error.to_string())?;
+        let evaluation = self
+            .effects
+            .as_ref()
+            .ok_or_else(|| "camera-effects contract is unavailable".to_owned())?
+            .evaluate_timeline(
+                &self.resource,
+                profile,
+                score_time_seconds,
+                scene_uptime_seconds,
+            )
             .map_err(|error| error.to_string())?;
         let Some(evaluation) = evaluation else {
             return Ok(false);
@@ -1285,17 +1335,31 @@ mod tests {
 
     #[test]
     fn camera_boundary_accepts_a_validated_optional_effects_contract() {
-        let timeline = WasmCameraTimeline::from_json_with_effects(
+        let mut timeline = WasmCameraTimeline::from_json_with_effects(
             CAMERA_RESOURCE.as_bytes(),
             CAMERA_EFFECTS.as_bytes(),
         )
         .unwrap();
         assert!(timeline.has_effects_contract());
-        assert!(!timeline.effects_sampling_supported());
+        assert!(timeline.effects_sampling_supported());
+        assert!(!timeline.effects_standby_round_robin_supported());
         assert!(!timeline.camera_uses_custom_look_at(0, "a").unwrap());
         assert!(timeline.camera_uses_custom_look_at(0, "b").unwrap());
         assert!(timeline.camera_has_perlin(0, "b").unwrap());
         assert!(timeline.effect(0, "missing").is_err());
+
+        assert!(timeline.evaluate_effects_frame(0, 1.5, 1.0).unwrap());
+        let first = timeline.frame_words;
+        assert_eq!(first[CAMERA_FRAME_POSITION_X], 5.0);
+        assert_ne!(first[CAMERA_FRAME_ROTATION_X], 0.0);
+        assert!(timeline.evaluate_effects_frame(0, 0.5, 1.0).unwrap());
+        let after_seek = timeline.frame_words;
+        assert!(timeline.evaluate_effects_frame(0, 0.5, 1.0).unwrap());
+        assert_eq!(timeline.frame_words, after_seek);
+        assert!(timeline.evaluate_effects_frame(0, 0.5, 0.0).unwrap());
+        assert_ne!(timeline.frame_words, after_seek);
+        assert!(timeline.evaluate_effects_frame(0, 0.5, f64::NAN).is_err());
+        assert_eq!(timeline.frame_words, empty_camera_frame());
     }
 
     #[test]

@@ -20,12 +20,12 @@ pub mod timing;
 
 pub use assist::{ASSIST_LEVEL_COUNT, AssistLevel, TIMING_WINDOWS_PER_LEVEL};
 pub use camera::{
-    CameraClip, CameraCubicSegment, CameraCurve, CameraCurveKey, CameraEvaluation,
-    CameraEvaluationError, CameraExtrapolation, CameraFinishEvaluation, CameraFinishSequence,
-    CameraFinishType, CameraIntroductionEvaluation, CameraIntroductionSequence,
-    CameraIntroductionType, CameraPositionAnimation, CameraPositionCurves, CameraSequences,
-    CameraState, CameraTimelineProfile, CameraTimelineResource, evaluate_camera_cubic_segments,
-    evaluate_camera_curve,
+    CameraBlendEvaluation, CameraBlendInput, CameraClip, CameraCubicSegment, CameraCurve,
+    CameraCurveKey, CameraEvaluation, CameraEvaluationError, CameraExtrapolation,
+    CameraFinishEvaluation, CameraFinishSequence, CameraFinishType, CameraIntroductionEvaluation,
+    CameraIntroductionSequence, CameraIntroductionType, CameraPositionAnimation,
+    CameraPositionCurves, CameraSequences, CameraState, CameraTimelineProfile,
+    CameraTimelineResource, evaluate_camera_cubic_segments, evaluate_camera_curve,
 };
 pub use camera_chorus::{
     CAMERA_CHORUS_SCHEMA, CAMERA_CHORUS_SCHEMA_VERSION, CameraChorusChannels,
@@ -34,8 +34,9 @@ pub use camera_chorus::{
 };
 pub use camera_effects::{
     CAMERA_EFFECTS_SCHEMA, CAMERA_EFFECTS_SCHEMA_VERSION, CameraEffect, CameraEffectsError,
-    CameraEffectsProfile, CameraEffectsResource, CameraEffectsSampling, CameraNoiseChannel,
-    CameraNoiseOctave, CameraNoiseProfile, CameraPerlinEffect, CameraPerlinProfile,
+    CameraEffectsEvaluationError, CameraEffectsProfile, CameraEffectsResource,
+    CameraEffectsSampling, CameraNoiseChannel, CameraNoiseOctave, CameraNoiseProfile,
+    CameraPerlinEffect, CameraPerlinProfile, CameraPerlinSample, unity_mathf_perlin_noise,
 };
 pub use chart::{CassiopeiaChart, ChartEvent, ChartHeader, ChartNote, NoteKind};
 pub use judgement::{

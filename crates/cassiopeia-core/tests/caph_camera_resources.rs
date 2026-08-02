@@ -1,5 +1,5 @@
 use haneoka_cassiopeia_core::{
-    CameraChorusResource, CameraEffectsResource, CameraTimelineResource,
+    CameraChorusResource, CameraEffectsResource, CameraProfile, CameraTimelineResource,
 };
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,25 @@ fn retained_timeline_and_effects_contracts_match() {
     let timeline: CameraTimelineResource = parse(&timeline_path);
     let effects: CameraEffectsResource = parse(&effects_path);
     effects.validate_timeline_coverage(&timeline).unwrap();
+    assert!(effects.supports_exact_sampling());
+
+    let perlin = effects
+        .camera_effect(CameraProfile::Low, "intro_2")
+        .unwrap()
+        .perlin
+        .unwrap();
+    assert_eq!(perlin.amplitude_gain as f32, 1.0);
+    assert_eq!(perlin.frequency_gain as f32, 1.0);
+    for (time, expected_x, expected_y) in [
+        (0.0, 0x3f0c_05e8, 0xbe31_cd44),
+        (0.25, 0x3f4d_42e4, 0xbe31_cd44),
+        (1.0, 0x3f39_487e, 0xbe84_92c7),
+        (4.0, 0xbf49_37ca, 0xbecd_5bfa),
+    ] {
+        let sample = perlin.sample(time).unwrap();
+        assert_eq!((sample.orientation_degrees[0] as f32).to_bits(), expected_x);
+        assert_eq!((sample.orientation_degrees[1] as f32).to_bits(), expected_y);
+    }
 }
 
 #[test]

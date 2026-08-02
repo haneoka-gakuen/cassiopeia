@@ -1,7 +1,10 @@
 use serde::Deserialize;
 use std::fmt;
 
-use crate::{CameraCubicSegment, CameraState, evaluate_camera_cubic_segments};
+use crate::{
+    CameraCubicSegment, CameraState, camera::unity_euler_zxy_quaternion_f32,
+    evaluate_camera_cubic_segments,
+};
 
 pub const CAMERA_CHORUS_SCHEMA: &str = "org.haneoka.caph.live-chorus-camera";
 pub const CAMERA_CHORUS_SCHEMA_VERSION: u32 = 1;
@@ -151,38 +154,7 @@ impl CameraChorusResource {
 
 /// Unity applies Euler rotations around Z, then X, then Y.
 fn unity_euler_zxy_quaternion(euler_degrees: [f64; 3]) -> [f64; 4] {
-    let [x, y, z] = euler_degrees.map(|value| (value as f32).to_radians() * 0.5);
-    let (sin_x, cos_x) = x.sin_cos();
-    let (sin_y, cos_y) = y.sin_cos();
-    let (sin_z, cos_z) = z.sin_cos();
-    let qx = [sin_x, 0.0, 0.0, cos_x];
-    let qy = [0.0, sin_y, 0.0, cos_y];
-    let qz = [0.0, 0.0, sin_z, cos_z];
-    normalize(multiply(multiply(qy, qx), qz)).map(f64::from)
-}
-
-const fn multiply(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
-    [
-        left[3] * right[0] + left[0] * right[3] + left[1] * right[2] - left[2] * right[1],
-        left[3] * right[1] - left[0] * right[2] + left[1] * right[3] + left[2] * right[0],
-        left[3] * right[2] + left[0] * right[1] - left[1] * right[0] + left[2] * right[3],
-        left[3] * right[3] - left[0] * right[0] - left[1] * right[1] - left[2] * right[2],
-    ]
-}
-
-fn normalize(mut value: [f32; 4]) -> [f32; 4] {
-    let magnitude = value
-        .iter()
-        .map(|component| component * component)
-        .sum::<f32>()
-        .sqrt();
-    if magnitude <= f32::EPSILON {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    for component in &mut value {
-        *component /= magnitude;
-    }
-    value
+    unity_euler_zxy_quaternion_f32(euler_degrees.map(|value| value as f32)).map(f64::from)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

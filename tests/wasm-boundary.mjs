@@ -75,12 +75,40 @@ const cameraEffects = new TextEncoder().encode(
       noiseFunction: "unity-mathf-perlin-noise-2d",
       implementationStatus: "parameters-only",
     },
-    noiseProfiles: {},
+    noiseProfiles: {
+      handheld: {
+        positionOctaves: [],
+        orientationOctaves: [
+          [
+            [4, 0.2, false],
+            [2, 0.15, false],
+            [0, 0, false],
+          ],
+          [
+            [2, 0.4, false],
+            [2, 0.5, false],
+            [0, 0, false],
+          ],
+          [
+            [1, 0.7, false],
+            [1, 0.6, false],
+            [0, 0, false],
+          ],
+        ],
+      },
+    },
     profiles: {
       low: {
         cameraNames: ["a", "b"],
         customLookAtTarget: [],
-        perlin: null,
+        perlin: {
+          enabled: true,
+          noiseProfile: "handheld",
+          pivotOffset: [0, 0, 0],
+          noiseOffsets: [347.368896484375, 731.6524658203125, -17.897705078125],
+          defaultGain: [0.1, 1],
+          gainOverrides: { b: [0.2, 2] },
+        },
       },
     },
   }),
@@ -141,6 +169,8 @@ const chorusPointer = chorusTimeline.chorusFrameBufferPtr();
 assert.notEqual(scorePointer, chorusPointer);
 assert.equal(chorusTimeline.chorusFrameBufferLen(), 13);
 assert.equal(chorusTimeline.hasChorus(), true);
+assert.equal(chorusTimeline.effectsSamplingSupported(), true);
+assert.equal(chorusTimeline.effectsStandbyRoundRobinSupported(), false);
 assert.equal(chorusTimeline.chorusDurationSeconds(), 10);
 assert.equal(chorusTimeline.chorusFrameRate(), 60);
 
@@ -185,6 +215,19 @@ assert.equal(chorusTimeline.evaluateChorus(10), false);
 assert.equal(chorusFrame[CameraFrameWord.Available], 0);
 assert.equal(chorusTimeline.frameBufferPtr(), scorePointer);
 assert.equal(chorusTimeline.chorusFrameBufferPtr(), chorusPointer);
+
+assert.equal(chorusTimeline.evaluateWithEffects(0, 1.5, 1), true);
+const effectFrame = Array.from(scoreFrame);
+assert.equal(effectFrame[CameraFrameWord.PositionX], 5);
+assert.notEqual(effectFrame[CameraFrameWord.RotationX], 0);
+assert.equal(chorusTimeline.evaluateWithEffects(0, 0.5, 1), true);
+const effectAfterSeek = Array.from(scoreFrame);
+assert.equal(chorusTimeline.evaluateWithEffects(0, 0.5, 1), true);
+assert.deepEqual(Array.from(scoreFrame), effectAfterSeek);
+assert.equal(chorusTimeline.evaluateWithEffects(0, 0.5, 0), true);
+assert.notDeepEqual(Array.from(scoreFrame), effectAfterSeek);
+assert.throws(() => chorusTimeline.evaluateWithEffects(0, 0.5, Number.NaN));
+assert.equal(scoreFrame[CameraFrameWord.Available], 0);
 
 const clock = new CassiopeiaPerformanceClock(0n, 0n);
 clock.resume(0n);
