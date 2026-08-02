@@ -4,20 +4,18 @@
 **I**nfrastructure for **O**pen **P**layback, **E**ffects, **I**nterchange, and
 **A**daptation.
 
-Cassiopeia is an early-stage, embeddable, multi-platform rhythm-game engine.
-It provides a web parser, simulation, input system, Three.js renderer, Vue
-components, and a portable Rust kernel for deterministic timing, judgement
-primitives, and chart validation.
+Cassiopeia is an embeddable, multi-platform rhythm-game engine. Its Rust core
+provides deterministic timing, judgement, validation, and live-performance
+evaluation; the web package provides parsing, input, rendering, and Vue player
+components.
 
-## Packages and entry points
+Main entry points:
 
-The npm package is `@haneoka/cassiopeia`:
-
-- `@haneoka/cassiopeia/parser` parses and normalizes source scores.
-- `@haneoka/cassiopeia/player` embeds the interactive Vue player.
-- `@haneoka/cassiopeia/overview` renders a virtualized chart overview.
-- `@haneoka/cassiopeia/assets` resolves host-provided runtime assets.
-- `haneoka-cassiopeia-core` is the platform-neutral Rust crate.
+- `@haneoka/cassiopeia/parser`: chart parsing and normalization
+- `@haneoka/cassiopeia/player`: interactive player
+- `@haneoka/cassiopeia/overview`: chart overview
+- `@haneoka/cassiopeia/assets`: host-provided runtime assets
+- `@haneoka/cassiopeia/wasm`: lazy browser WebAssembly runtime
 
 ```ts
 import { buildChart, parseScore } from "@haneoka/cassiopeia/parser";
@@ -25,59 +23,13 @@ import { buildChart, parseScore } from "@haneoka/cassiopeia/parser";
 const chart = buildChart(parseScore(scorePayload));
 ```
 
-The engine does not ship runtime media. A host supplies chart, music, texture,
-effect, and font resources through the public asset contracts.
-
-Cassiopeia Chart Format is canonical. SS, SUS, USC, Sonolus `LevelData`, and
-source-specific formats are adapters with explicit loss reports. See the
-[format contract](docs/CASSIOPEIA_CHART_FORMAT.md).
-
-## WebAssembly
-
-Browsers can initialize the lazy entry directly:
-
-```ts
-const wasm = await import("@haneoka/cassiopeia/wasm");
-await wasm.default();
-```
-
-Node hosts initialize from the exported module bytes:
-
-```ts
-import { readFileSync } from "node:fs";
-import { initSync } from "@haneoka/cassiopeia/wasm";
-
-const url = import.meta.resolve("@haneoka/cassiopeia/wasm/module");
-initSync({ module: readFileSync(new URL(url)) });
-```
-
-`CassiopeiaCameraTimeline` parses one camera resource and reuses a fixed
-`Float64Array` frame region. `CameraFrameWord` provides its field indices.
-
-## Development
+Cassiopeia Chart Format is canonical. SS, SUS, USC, and Sonolus `LevelData`
+are supported through adapters with explicit loss reports. Applications supply
+music, textures, effects, fonts, and other runtime media.
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm check
 ```
 
-The Rust kernel can also be checked independently:
-
-```sh
-cargo test --workspace
-```
-
-From a source checkout, the conformance runner validates a CCF document and
-prints a versioned, deterministic timing summary:
-
-```sh
-cargo run -p haneoka-cassiopeia-cli -- conformance fixtures/conformance/basic.ccf.json
-```
-
-This command checks the chart and timing contract; it is not a full gameplay
-or replay verifier.
-
-## License
-
-Cassiopeia-authored source is available under MPL-2.0. Third-party components
-retain their own licenses. Runtime media is supplied by applications.
+License: MPL-2.0. Third-party components retain their own licenses.
