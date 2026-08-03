@@ -1,4 +1,4 @@
-import type { OurNotesAssetManifest } from "../assets/manifest";
+import type { OurNotesAssetManifest, TmpSdfFontAssetManifest } from "../assets/manifest";
 
 export type RenderNoteKind =
   "tap" | "flick" | "flick-left" | "flick-right" | "slide-start" | "slide-node" | "slide-end" | "trace" | "guide";
@@ -131,6 +131,18 @@ export interface RenderTitleIntroductionTheme {
   titleColor: string;
   artistColor: string;
   creditsColor: string;
+  assets?: {
+    /** Exact 1366x192 panel composite. Used unless an authored active-state mapping is supplied. */
+    panelRibbonUrl?: string;
+    /** Optional 1366x222 six-row composite retained for explicitly authored active states. */
+    activeRibbonUrl?: string;
+    normalHighScoreBaseUrl?: string;
+    normalHighScoreBaseAlpha?: number;
+    gekisouTitleUrl?: string;
+    gekisouMissionUrls?: Readonly<Partial<Record<"combo" | "luck" | "just", string>>>;
+    titleFont?: TmpSdfFontAssetManifest;
+    numericFont?: TmpSdfFontAssetManifest;
+  };
 }
 
 export interface RenderTitleIntroduction {
@@ -144,12 +156,14 @@ export interface RenderTitleIntroduction {
   difficultyIconUrl?: string;
   level?: string | number;
   highScore?: number;
+  ribbonVariant?: "panel" | "active";
   layoutMode?: "lightweight" | "normal";
   gekisou?: {
     enabled: boolean;
     performanceLabel?: string;
     missions?: ReadonlyArray<{
       label: string;
+      kind?: "combo" | "luck" | "just";
       iconUrl?: string;
     }>;
   };

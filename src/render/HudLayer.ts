@@ -117,10 +117,25 @@ export interface TitleIntroductionLayout {
   readonly normalMetadataLeft: number;
   readonly normalMetadataTop: number;
   readonly normalMetadataRight: number;
+  readonly normalMetadataHeight: number;
   readonly gekisouPanelRight: number;
   readonly gekisouPanelTop: number;
+  readonly gekisouTitleLeft: number;
+  readonly gekisouTitleTop: number;
+  readonly gekisouTitleWidth: number;
+  readonly gekisouTitleHeight: number;
   readonly gekisouMissionRowLeft: number;
   readonly gekisouMissionRowTop: number;
+}
+
+/** Active ribbon use is opt-in until a presentation state is explicitly authored for it. */
+export function resolveTitleIntroductionRibbonUrl(
+  theme: Pick<RenderTitleIntroductionTheme, "assets">,
+  variant: "panel" | "active" = "panel",
+): string | undefined {
+  return variant === "active"
+    ? theme.assets?.activeRibbonUrl ?? theme.assets?.panelRibbonUrl
+    : theme.assets?.panelRibbonUrl;
 }
 
 /** Resolves the authored bottom and centre anchors in CanvasScaler logical space. */
@@ -167,8 +182,13 @@ export function resolveTitleIntroductionLayout(
     normalMetadataLeft: normalPanelLeft + 151,
     normalMetadataTop: normalPanelTop + 72,
     normalMetadataRight: normalPanelLeft + 440,
+    normalMetadataHeight: 38,
     gekisouPanelRight,
     gekisouPanelTop,
+    gekisouTitleLeft: gekisouPanelRight - 313 - (117 * 0.800000011920929) / 2,
+    gekisouTitleTop: gekisouPanelTop + 32 - (79 * 0.800000011920929) / 2,
+    gekisouTitleWidth: 117 * 0.800000011920929,
+    gekisouTitleHeight: 79 * 0.800000011920929,
     gekisouMissionRowLeft: gekisouPanelRight - 377,
     gekisouMissionRowTop: gekisouPanelTop + 64,
   };
@@ -365,6 +385,16 @@ export class HudLayer {
   private readonly pendingTitleImages = new Set<string>();
   private readonly failedTitleImages = new Set<string>();
   private tmpSdfFont?: TmpSdfFont;
+  private titleSdfFont?: TmpSdfFont;
+  private numericSdfFont?: TmpSdfFont;
+  private titleSdfFontKey?: string;
+  private numericSdfFontKey?: string;
+  private readonly desiredIntroductionFontKeys: Record<"title" | "numeric", string | undefined> = {
+    title: undefined,
+    numeric: undefined,
+  };
+  private readonly pendingIntroductionFontKeys = new Set<string>();
+  private readonly failedIntroductionFontKeys = new Set<string>();
   private readonly staticSignature: HudStaticSignature = {
     score: undefined,
     scoreDelta: undefined,
@@ -1044,6 +1074,12 @@ export class HudLayer {
     const fontFamily = theme.fontFamilies
       .map((family) => (genericFamilies.has(family) ? family : JSON.stringify(family)))
       .join(", ");
+    const titleFontContract = theme.assets?.titleFont;
+    const numericFontContract = theme.assets?.numericFont;
+    const titleFont = this.introductionFont("title", titleFontContract);
+    const numericFont = this.introductionFont("numeric", numericFontContract);
+    const waitForTitleFont = this.shouldWaitForIntroductionFont("title", titleFontContract);
+    const waitForNumericFont = this.shouldWaitForIntroductionFont("numeric", numericFontContract);
     const drawCanvasText = (
       text: string,
       y: number,
@@ -1052,8 +1088,17 @@ export class HudLayer {
       color: string,
       x = centerX,
       maxWidth = 1000,
+      sdfFont = titleFont,
+      waitForSdf = waitForTitleFont,
     ): void => {
       if (!text) return;
+      if (sdfFont?.canRender(text)) {
+        const measured = sdfFont.measureText(text, size);
+        const fittedSize = measured && measured > maxWidth ? Math.max(12, size * (maxWidth / measured)) : size;
+        if (sdfFont.drawText(context, text, x, y, { align: "center", fontSize: fittedSize, color })) return;
+      } else if (waitForSdf && !sdfFont) {
+        return;
+      }
       context.fillStyle = color;
       context.font = `${weight} ${size}px ${fontFamily}`;
       const measured = context.measureText(text).width;
@@ -1082,19 +1127,47 @@ export class HudLayer {
           layout.normalJacketSize,
           layout.normalJacketSize,
         );
-      this.drawNormalTitleMetadata(introduction, layout, fontFamily);
+      this.drawNormalTitleMetadata(
+        introduction,
+        layout,
+        fontFamily,
+        numericFont,
+        waitForNumericFont,
+        theme,
+      );
       context.globalAlpha = rightAlpha;
-      this.drawGekisouIntroduction(introduction, layout, fontFamily);
+      this.drawGekisouIntroduction(
+        introduction,
+        layout,
+        fontFamily,
+        numericFont,
+        waitForNumericFont,
+        theme,
+      );
     } else {
       context.globalAlpha = simpleAlpha;
       if (jacket)
         context.drawImage(jacket, layout.jacketLeft, layout.jacketTop, layout.jacketSize, layout.jacketSize);
-      this.drawSimpleTitleMetadata(introduction, layout, fontFamily);
+      this.drawSimpleTitleMetadata(
+        introduction,
+        layout,
+        fontFamily,
+        numericFont,
+        waitForNumericFont,
+      );
     }
 
     context.globalAlpha = rootAlpha;
-    context.fillStyle = theme.panelBackground;
-    context.fillRect(left, top, panelWidth, panelHeight);
+    const ribbonVariant = introduction.ribbonVariant ?? "panel";
+    const ribbonUrl = resolveTitleIntroductionRibbonUrl(theme, ribbonVariant);
+    const ribbon = this.titleImage(ribbonUrl);
+    if (ribbon) {
+      const ribbonHeight = ribbonVariant === "active" && theme.assets?.activeRibbonUrl ? 222 : panelHeight;
+      context.drawImage(ribbon, left, centerY - ribbonHeight / 2, panelWidth, ribbonHeight);
+    } else if (!ribbonUrl) {
+      context.fillStyle = theme.panelBackground;
+      context.fillRect(left, top, panelWidth, panelHeight);
+    }
     if (theme.panelBorderWidthPx > 0) {
       context.strokeStyle = theme.panelBorderColor;
       context.lineWidth = theme.panelBorderWidthPx;
@@ -1106,8 +1179,16 @@ export class HudLayer {
     const lyricist = introduction.lyricist ? `作詞: ${introduction.lyricist}` : "";
     const composer = introduction.composer ? `作曲: ${introduction.composer}` : "";
     context.font = `700 22px ${fontFamily}`;
-    const lyricistWidth = lyricist ? context.measureText(lyricist).width : 0;
-    const composerWidth = composer ? context.measureText(composer).width : 0;
+    const lyricistWidth = lyricist
+      ? titleFont?.canRender(lyricist)
+        ? titleFont.measureText(lyricist, 22) ?? 0
+        : context.measureText(lyricist).width
+      : 0;
+    const composerWidth = composer
+      ? titleFont?.canRender(composer)
+        ? titleFont.measureText(composer, 22) ?? 0
+        : context.measureText(composer).width
+      : 0;
     const composerOverflows = Boolean(lyricist && composer && lyricistWidth + composerWidth > 960);
     if (!composerOverflows && lyricist && composer) {
       drawCanvasText(
@@ -1163,6 +1244,79 @@ export class HudLayer {
     return undefined;
   }
 
+  private introductionFont(
+    channel: "title" | "numeric",
+    manifest: NonNullable<RenderTitleIntroductionTheme["assets"]>["titleFont"],
+  ): TmpSdfFont | undefined {
+    if (!manifest) return undefined;
+    const key = `${channel}\u0000${manifest.atlasTextureUrl}\u0000${manifest.metadataUrl}`;
+    this.desiredIntroductionFontKeys[channel] = key;
+    const loadedKey = channel === "title" ? this.titleSdfFontKey : this.numericSdfFontKey;
+    const loaded = channel === "title" ? this.titleSdfFont : this.numericSdfFont;
+    if (loadedKey === key) return loaded;
+    if (this.pendingIntroductionFontKeys.has(key) || this.failedIntroductionFontKeys.has(key)) return undefined;
+    this.pendingIntroductionFontKeys.add(key);
+    void TmpSdfFont.load(manifest).then(
+      (font) => {
+        this.pendingIntroductionFontKeys.delete(key);
+        if (this.disposed || this.desiredIntroductionFontKeys[channel] !== key) {
+          font.dispose();
+          return;
+        }
+        if (channel === "title") {
+          this.titleSdfFont?.dispose();
+          this.titleSdfFont = font;
+          this.titleSdfFontKey = key;
+        } else {
+          this.numericSdfFont?.dispose();
+          this.numericSdfFont = font;
+          this.numericSdfFontKey = key;
+        }
+        this.forceRedraw = true;
+      },
+      () => {
+        this.pendingIntroductionFontKeys.delete(key);
+        this.failedIntroductionFontKeys.add(key);
+        this.forceRedraw = true;
+      },
+    );
+    return undefined;
+  }
+
+  private shouldWaitForIntroductionFont(
+    channel: "title" | "numeric",
+    manifest: NonNullable<RenderTitleIntroductionTheme["assets"]>["titleFont"],
+  ): boolean {
+    if (!manifest) return false;
+    const key = `${channel}\u0000${manifest.atlasTextureUrl}\u0000${manifest.metadataUrl}`;
+    return !this.failedIntroductionFontKeys.has(key);
+  }
+
+  private drawIntroductionText(
+    font: TmpSdfFont | undefined,
+    waitForFont: boolean,
+    text: string,
+    x: number,
+    y: number,
+    fontSize: number,
+    color: string,
+    align: "left" | "center" | "right",
+    fontFamily: string,
+  ): void {
+    if (!text) return;
+    if (font?.canRender(text)) {
+      if (font.drawText(this.context, text, x, y, { align, fontSize, color })) return;
+    } else if (waitForFont && !font) {
+      return;
+    }
+    const context = this.context;
+    context.fillStyle = color;
+    context.font = `400 ${fontSize}px ${fontFamily}`;
+    context.textAlign = align;
+    context.textBaseline = "middle";
+    context.fillText(text, x, y);
+  }
+
   private drawDifficultyFallback(
     introduction: NonNullable<RenderHudState["titleIntroduction"]>,
     fontFamily: string,
@@ -1188,6 +1342,8 @@ export class HudLayer {
     introduction: NonNullable<RenderHudState["titleIntroduction"]>,
     layout: TitleIntroductionLayout,
     fontFamily: string,
+    numericFont: TmpSdfFont | undefined,
+    waitForNumericFont: boolean,
   ): void {
     const context = this.context;
     const difficultyIcon = this.titleImage(introduction.difficultyIconUrl);
@@ -1209,24 +1365,23 @@ export class HudLayer {
         35.2,
       );
     if (introduction.level !== undefined) {
-      context.fillStyle = "#ffffff";
-      context.font = `400 30px ${fontFamily}`;
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(String(introduction.level), layout.metadataRight - 298, layout.metadataTop + 21.9);
+      this.drawIntroductionText(
+        numericFont,
+        waitForNumericFont,
+        String(introduction.level),
+        layout.metadataRight - 298,
+        layout.metadataTop + 21.9,
+        30,
+        "#ffffff",
+        "center",
+        fontFamily,
+      );
     }
     if (introduction.highScore !== undefined && Number.isFinite(introduction.highScore)) {
       const score = String(Math.max(0, Math.trunc(introduction.highScore)));
-      context.fillStyle = "#ffffff";
-      context.textBaseline = "middle";
-      context.font = `400 18px ${fontFamily}`;
-      context.textAlign = "left";
-      context.fillText("HIGH SCORE", layout.metadataRight - 257, layout.metadataTop + 19);
-      context.font = `400 22px ${fontFamily}`;
-      context.fillText(":", layout.metadataRight - 143, layout.metadataTop + 19);
-      context.font = `400 30px ${fontFamily}`;
-      context.textAlign = "right";
-      context.fillText(score, layout.metadataRight - 7, layout.metadataTop + 19);
+      this.drawIntroductionText(numericFont, waitForNumericFont, "HIGH SCORE", layout.metadataRight - 257, layout.metadataTop + 19, 18, "#ffffff", "left", fontFamily);
+      this.drawIntroductionText(numericFont, waitForNumericFont, ":", layout.metadataRight - 143, layout.metadataTop + 19, 22, "#ffffff", "left", fontFamily);
+      this.drawIntroductionText(numericFont, waitForNumericFont, score, layout.metadataRight - 7, layout.metadataTop + 19, 30, "#ffffff", "right", fontFamily);
     }
   }
 
@@ -1234,6 +1389,9 @@ export class HudLayer {
     introduction: NonNullable<RenderHudState["titleIntroduction"]>,
     layout: TitleIntroductionLayout,
     fontFamily: string,
+    numericFont: TmpSdfFont | undefined,
+    waitForNumericFont: boolean,
+    theme: RenderTitleIntroductionTheme,
   ): void {
     const context = this.context;
     const difficultyIcon = this.titleImage(introduction.difficultyIconUrl);
@@ -1256,26 +1414,23 @@ export class HudLayer {
       );
     }
     if (introduction.level !== undefined) {
-      context.fillStyle = "#ffffff";
-      context.font = `400 44px ${fontFamily}`;
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(String(introduction.level), layout.normalLevelCenterX, layout.normalLevelCenterY);
+      this.drawIntroductionText(numericFont, waitForNumericFont, String(introduction.level), layout.normalLevelCenterX, layout.normalLevelCenterY, 44, "#ffffff", "center", fontFamily);
     }
     if (introduction.highScore !== undefined && Number.isFinite(introduction.highScore)) {
       const score = String(Math.max(0, Math.trunc(introduction.highScore)));
       const baseLeft = layout.normalMetadataLeft;
       const baseRight = layout.normalMetadataRight;
       const centerY = layout.normalMetadataTop + 19;
-      context.fillStyle = "#ffffff";
-      context.textBaseline = "middle";
-      context.textAlign = "left";
-      context.font = `400 22px ${fontFamily}`;
-      context.fillText("HIGH SCORE", baseLeft + 8, centerY);
-      context.fillText(":", baseLeft + 147, centerY);
-      context.textAlign = "right";
-      context.font = `400 30px ${fontFamily}`;
-      context.fillText(score, baseRight - 7, centerY);
+      const base = this.titleImage(theme.assets?.normalHighScoreBaseUrl);
+      if (base) {
+        context.save();
+        context.globalAlpha *= clamp(theme.assets?.normalHighScoreBaseAlpha ?? 0.1921568661928177, 0, 1);
+        context.drawImage(base, baseLeft, layout.normalMetadataTop, baseRight - baseLeft, layout.normalMetadataHeight);
+        context.restore();
+      }
+      this.drawIntroductionText(numericFont, waitForNumericFont, "HIGH SCORE", baseLeft + 8, centerY, 22, "#ffffff", "left", fontFamily);
+      this.drawIntroductionText(numericFont, waitForNumericFont, ":", baseLeft + 147, centerY, 22, "#ffffff", "left", fontFamily);
+      this.drawIntroductionText(numericFont, waitForNumericFont, score, baseRight - 7, centerY, 30, "#ffffff", "right", fontFamily);
     }
   }
 
@@ -1283,33 +1438,38 @@ export class HudLayer {
     introduction: NonNullable<RenderHudState["titleIntroduction"]>,
     layout: TitleIntroductionLayout,
     fontFamily: string,
+    numericFont: TmpSdfFont | undefined,
+    waitForNumericFont: boolean,
+    theme: RenderTitleIntroductionTheme,
   ): void {
     const gekisou = introduction.gekisou;
     if (!gekisou?.enabled) return;
     const context = this.context;
-    context.fillStyle = "#ffffff";
-    context.font = `400 34px ${fontFamily}`;
-    context.textAlign = "right";
-    context.textBaseline = "top";
-    context.fillText(
+    const title = this.titleImage(theme.assets?.gekisouTitleUrl);
+    if (title) {
+      context.drawImage(title, layout.gekisouTitleLeft, layout.gekisouTitleTop, layout.gekisouTitleWidth, layout.gekisouTitleHeight);
+    }
+    this.drawIntroductionText(
+      numericFont,
+      waitForNumericFont,
       gekisou.performanceLabel || "PERFORMANCE",
       layout.gekisouPanelRight,
-      layout.gekisouPanelTop + 24,
+      layout.gekisouPanelTop + 41,
+      34,
+      "#ffffff",
+      "right",
+      fontFamily,
     );
     const missions = gekisou.missions?.slice(0, 3) ?? [];
     for (let index = 0; index < missions.length; index += 1) {
       const mission = missions[index]!;
       const slotCenterX = layout.gekisouMissionRowLeft + (index * 2 + 0.5) * 75.4000015258789;
-      const icon = this.titleImage(mission.iconUrl);
+      const icon = this.titleImage(mission.iconUrl ?? (mission.kind ? theme.assets?.gekisouMissionUrls?.[mission.kind] : undefined));
       if (icon)
         context.drawImage(icon, slotCenterX - 46.5, layout.gekisouMissionRowTop + 3.5, 93, 91);
       // Missing icon/arrow sprites intentionally fall back to the authored text
       // slot only; no generic shape is claimed to match the source artwork.
-      context.fillStyle = "#ffffff";
-      context.font = `400 24px ${fontFamily}`;
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(mission.label, slotCenterX, layout.gekisouMissionRowTop + 85);
+      this.drawIntroductionText(numericFont, waitForNumericFont, mission.label, slotCenterX, layout.gekisouMissionRowTop + 85, 24, "#ffffff", "center", fontFamily);
     }
   }
 
@@ -1322,6 +1482,12 @@ export class HudLayer {
     this.failedTitleImages.clear();
     this.tmpSdfFont?.dispose();
     this.tmpSdfFont = undefined;
+    this.titleSdfFont?.dispose();
+    this.titleSdfFont = undefined;
+    this.numericSdfFont?.dispose();
+    this.numericSdfFont = undefined;
+    this.pendingIntroductionFontKeys.clear();
+    this.failedIntroductionFontKeys.clear();
     this.context.setTransform(1, 0, 0, 1, 0, 0);
     this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.scratchCanvas.width = 1;

@@ -16,6 +16,8 @@ export interface TitleIntroductionContent {
   difficultyIconUrl?: string;
   level?: string | number;
   highScore?: number;
+  /** Defaults to the evidence-backed 1366x192 panel composite. */
+  ribbonVariant?: "panel" | "active";
   /** Selects the authored lightweight centre card or the normal corner HUD. */
   layoutMode?: "lightweight" | "normal";
   /** Optional normal-mode Gekisou mission presentation. */
@@ -24,6 +26,8 @@ export interface TitleIntroductionContent {
 
 export interface TitleIntroductionGekisouMission {
   label: string;
+  /** Selects the corresponding authored mission sprite when iconUrl is omitted. */
+  kind?: "combo" | "luck" | "just";
   iconUrl?: string;
 }
 

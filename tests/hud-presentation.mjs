@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   resolveJudgementTimingPresentation,
   resolveTitleIntroductionLayout,
+  resolveTitleIntroductionRibbonUrl,
   sampleJudgementPunchScale,
 } from "../dist/index.js";
 
@@ -46,12 +47,26 @@ assert.deepEqual(resolveTitleIntroductionLayout(1920, 1080), {
   normalMetadataLeft: 221,
   normalMetadataTop: 142,
   normalMetadataRight: 510,
+  normalMetadataHeight: 38,
   gekisouPanelRight: 1871,
   gekisouPanelTop: 26,
+  gekisouTitleLeft: 1511.1999993026257,
+  gekisouTitleTop: 26.399999529123306,
+  gekisouTitleWidth: 93.60000139474869,
+  gekisouTitleHeight: 63.20000094175339,
   gekisouMissionRowLeft: 1494,
   gekisouMissionRowTop: 90,
 });
 assert.equal(resolveTitleIntroductionLayout(1920, 1440).ribbonCenterY, 1201);
+const ribbonTheme = {
+  assets: {
+    panelRibbonUrl: "panel.png",
+    activeRibbonUrl: "active.png",
+  },
+};
+assert.equal(resolveTitleIntroductionRibbonUrl(ribbonTheme), "panel.png");
+assert.equal(resolveTitleIntroductionRibbonUrl(ribbonTheme, "active"), "active.png");
+assert.equal(resolveTitleIntroductionRibbonUrl({ assets: { panelRibbonUrl: "panel.png" } }, "active"), "panel.png");
 
 const timingDefaults = {
   showFastSlow: true,

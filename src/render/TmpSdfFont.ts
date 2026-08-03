@@ -59,6 +59,22 @@ interface UnityTmpFontAsset {
   };
 }
 
+interface PortableTmpFontAsset {
+  schemaVersion?: unknown;
+  delivery?: unknown;
+  atlas?: { height?: unknown; padding?: unknown; width?: unknown };
+  faceInfo?: UnityTmpFaceInfo;
+  characters?: ReadonlyArray<{ glyphIndex?: unknown; scale?: unknown; unicode?: unknown }>;
+  glyphs?: ReadonlyArray<{
+    atlasIndex?: unknown;
+    index?: unknown;
+    metrics?: UnityTmpGlyph["m_Metrics"];
+    rect?: UnityTmpGlyph["m_GlyphRect"];
+    scale?: unknown;
+  }>;
+  fontFeatures?: { m_GlyphPairAdjustmentRecords?: UnityTmpPairAdjustment[] };
+}
+
 interface GlyphRect {
   x: number;
   y: number;
@@ -158,10 +174,35 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-async function loadMetadata(url: string): Promise<UnityTmpFontAsset> {
+async function loadMetadata(url: string): Promise<UnityTmpFontAsset | PortableTmpFontAsset> {
   const response = await fetch(url, { cache: "force-cache" });
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-  return (await response.json()) as UnityTmpFontAsset;
+  return (await response.json()) as UnityTmpFontAsset | PortableTmpFontAsset;
+}
+
+function fontData(asset: UnityTmpFontAsset | PortableTmpFontAsset): UnityTmpFontAsset["data"] | undefined {
+  if ("data" in asset && asset.data) return asset.data;
+  const portable = asset as PortableTmpFontAsset;
+  if (portable.schemaVersion !== 1 || portable.delivery !== "sdf-atlas") return undefined;
+  return {
+    m_AtlasHeight: portable.atlas?.height,
+    m_AtlasPadding: portable.atlas?.padding,
+    m_AtlasWidth: portable.atlas?.width,
+    m_CharacterTable: portable.characters?.map((character) => ({
+      m_GlyphIndex: character.glyphIndex,
+      m_Scale: character.scale,
+      m_Unicode: character.unicode,
+    })),
+    m_FaceInfo: portable.faceInfo,
+    m_FontFeatureTable: portable.fontFeatures,
+    m_GlyphTable: portable.glyphs?.map((glyph) => ({
+      m_AtlasIndex: glyph.atlasIndex,
+      m_GlyphRect: glyph.rect,
+      m_Index: glyph.index,
+      m_Metrics: glyph.metrics,
+      m_Scale: glyph.scale,
+    })),
+  };
 }
 
 /**
@@ -215,7 +256,7 @@ export class TmpSdfFont {
       throw new Error("TMP SDF font rendering requires browser canvas APIs");
     }
     const [image, asset] = await Promise.all([loadImage(manifest.atlasTextureUrl), loadMetadata(manifest.metadataUrl)]);
-    const data = asset.data;
+    const data = fontData(asset);
     const face = data?.m_FaceInfo;
     const atlasWidth = integer(data?.m_AtlasWidth);
     const atlasHeight = integer(data?.m_AtlasHeight);
