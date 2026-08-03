@@ -144,8 +144,22 @@ export interface RenderTitleIntroduction {
   difficultyIconUrl?: string;
   level?: string | number;
   highScore?: number;
+  layoutMode?: "lightweight" | "normal";
+  gekisou?: {
+    enabled: boolean;
+    performanceLabel?: string;
+    missions?: ReadonlyArray<{
+      label: string;
+      iconUrl?: string;
+    }>;
+  };
   /** Root CanvasGroup opacity sampled from the presentation timeline. */
   alpha: number;
+  rootAlpha?: number;
+  centerAlpha?: number;
+  simpleAlpha?: number;
+  leftAlpha?: number;
+  rightAlpha?: number;
   /** Root-composited opacity of the centered song detail group. */
   contentAlpha?: number;
   theme?: Partial<RenderTitleIntroductionTheme>;

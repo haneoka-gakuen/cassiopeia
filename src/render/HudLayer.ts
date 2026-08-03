@@ -41,7 +41,7 @@ const DEFAULT_TITLE_THEME: RenderTitleIntroductionTheme = {
   fontFamilies: ["Noto Sans", "Noto Sans JP", "Noto Sans SC", "system-ui", "sans-serif"],
   titleColor: "#ffffff",
   artistColor: "#ffffff",
-  creditsColor: "rgba(255, 255, 255, 0.92)",
+  creditsColor: "#ffffff",
 };
 
 // UILiveNoteJudgeEffectView.Initialize assigns each Sprite and immediately
@@ -105,6 +105,22 @@ export interface TitleIntroductionLayout {
   readonly jacketSize: number;
   readonly metadataTop: number;
   readonly metadataRight: number;
+  readonly normalJacketLeft: number;
+  readonly normalJacketTop: number;
+  readonly normalJacketSize: number;
+  readonly normalDifficultyLeft: number;
+  readonly normalDifficultyTop: number;
+  readonly normalDifficultyWidth: number;
+  readonly normalDifficultyHeight: number;
+  readonly normalLevelCenterX: number;
+  readonly normalLevelCenterY: number;
+  readonly normalMetadataLeft: number;
+  readonly normalMetadataTop: number;
+  readonly normalMetadataRight: number;
+  readonly gekisouPanelRight: number;
+  readonly gekisouPanelTop: number;
+  readonly gekisouMissionRowLeft: number;
+  readonly gekisouMissionRowTop: number;
 }
 
 /** Resolves the authored bottom and centre anchors in CanvasScaler logical space. */
@@ -117,6 +133,18 @@ export function resolveTitleIntroductionLayout(
   const simplePanelLeft = contentCenterX - 220;
   const simplePanelTop = contentCenterY - 297;
   const jacketSize = 512 * 0.8600000143051147;
+  // ContentArea is inset 20 px horizontally, 20 px at the top and 40 px at
+  // the bottom in the authored 1920x1080 Expand canvas.
+  const contentLeft = 20;
+  const contentTop = 20;
+  const contentRight = logicalWidth - 20;
+  const normalPanelLeft = contentLeft + 50;
+  const normalPanelTop = contentTop + 50;
+  const normalJacketSize = 512 * 0.2460000067949295;
+  const normalDifficultyWidth = 151 * 0.8999999761581421;
+  const normalDifficultyHeight = 44 * 0.8999999761581421;
+  const gekisouPanelRight = contentRight - 29;
+  const gekisouPanelTop = contentTop + 6;
   return {
     ribbonCenterX: contentCenterX,
     // ContentArea has a 40 px lower inset. center_bottom is a zero-height
@@ -127,6 +155,22 @@ export function resolveTitleIntroductionLayout(
     jacketSize,
     metadataTop: simplePanelTop + 454,
     metadataRight: simplePanelLeft + 440,
+    normalJacketLeft: normalPanelLeft + 64 - normalJacketSize / 2,
+    normalJacketTop: normalPanelTop + 63 - normalJacketSize / 2,
+    normalJacketSize,
+    normalDifficultyLeft: normalPanelLeft + 219 - normalDifficultyWidth / 2,
+    normalDifficultyTop: normalPanelTop + 36 - normalDifficultyHeight / 2,
+    normalDifficultyWidth,
+    normalDifficultyHeight,
+    normalLevelCenterX: normalPanelLeft + 317,
+    normalLevelCenterY: normalPanelTop + 38,
+    normalMetadataLeft: normalPanelLeft + 151,
+    normalMetadataTop: normalPanelTop + 72,
+    normalMetadataRight: normalPanelLeft + 440,
+    gekisouPanelRight,
+    gekisouPanelTop,
+    gekisouMissionRowLeft: gekisouPanelRight - 377,
+    gekisouMissionRowTop: gekisouPanelTop + 64,
   };
 }
 
@@ -1000,28 +1044,55 @@ export class HudLayer {
     const fontFamily = theme.fontFamilies
       .map((family) => (genericFamilies.has(family) ? family : JSON.stringify(family)))
       .join(", ");
-    const drawCanvasText = (text: string, y: number, size: number, weight: number, color: string): void => {
+    const drawCanvasText = (
+      text: string,
+      y: number,
+      size: number,
+      weight: number,
+      color: string,
+      x = centerX,
+      maxWidth = 1000,
+    ): void => {
       if (!text) return;
       context.fillStyle = color;
       context.font = `${weight} ${size}px ${fontFamily}`;
       const measured = context.measureText(text).width;
-      const fittedSize = measured > 1000 ? Math.max(12, size * (1000 / measured)) : size;
+      const fittedSize = measured > maxWidth ? Math.max(12, size * (maxWidth / measured)) : size;
       context.font = `${weight} ${fittedSize}px ${fontFamily}`;
       context.textAlign = "center";
       context.textBaseline = "middle";
-      context.fillText(text, centerX, y);
+      context.fillText(text, x, y);
     };
 
     context.save();
-    const detailAlpha = clamp(introduction.contentAlpha ?? introduction.alpha, 0, 1);
-    context.globalAlpha = detailAlpha;
+    const rootAlpha = clamp(introduction.rootAlpha ?? introduction.alpha, 0, 1);
+    const centerAlpha = clamp(introduction.centerAlpha ?? introduction.contentAlpha ?? rootAlpha, 0, 1);
+    const simpleAlpha = clamp(introduction.simpleAlpha ?? introduction.contentAlpha ?? centerAlpha, 0, 1);
+    const leftAlpha = clamp(introduction.leftAlpha ?? introduction.contentAlpha ?? centerAlpha, 0, 1);
+    const rightAlpha = clamp(introduction.rightAlpha ?? introduction.contentAlpha ?? centerAlpha, 0, 1);
+    const layoutMode = introduction.layoutMode ?? "lightweight";
     const jacket = this.titleImage(introduction.jacketUrl);
-    if (jacket) {
-      context.drawImage(jacket, layout.jacketLeft, layout.jacketTop, layout.jacketSize, layout.jacketSize);
+    if (layoutMode === "normal") {
+      context.globalAlpha = leftAlpha;
+      if (jacket)
+        context.drawImage(
+          jacket,
+          layout.normalJacketLeft,
+          layout.normalJacketTop,
+          layout.normalJacketSize,
+          layout.normalJacketSize,
+        );
+      this.drawNormalTitleMetadata(introduction, layout, fontFamily);
+      context.globalAlpha = rightAlpha;
+      this.drawGekisouIntroduction(introduction, layout, fontFamily);
+    } else {
+      context.globalAlpha = simpleAlpha;
+      if (jacket)
+        context.drawImage(jacket, layout.jacketLeft, layout.jacketTop, layout.jacketSize, layout.jacketSize);
+      this.drawSimpleTitleMetadata(introduction, layout, fontFamily);
     }
-    this.drawTitleMetadata(introduction, layout, fontFamily);
 
-    context.globalAlpha = clamp(introduction.alpha, 0, 1);
+    context.globalAlpha = rootAlpha;
     context.fillStyle = theme.panelBackground;
     context.fillRect(left, top, panelWidth, panelHeight);
     if (theme.panelBorderWidthPx > 0) {
@@ -1029,15 +1100,37 @@ export class HudLayer {
       context.lineWidth = theme.panelBorderWidthPx;
       context.strokeRect(left, top, panelWidth, panelHeight);
     }
-    context.globalAlpha = detailAlpha;
+    context.globalAlpha = centerAlpha;
     drawCanvasText(introduction.title, centerY - 48, 48, 700, theme.titleColor);
     drawCanvasText(introduction.artist ?? "", centerY + 8, 24, 700, theme.artistColor);
     const lyricist = introduction.lyricist ? `作詞: ${introduction.lyricist}` : "";
     const composer = introduction.composer ? `作曲: ${introduction.composer}` : "";
-    const inlineCredits = [lyricist, composer].filter(Boolean).join("　");
     context.font = `700 22px ${fontFamily}`;
-    const composerOverflows = Boolean(lyricist && composer && context.measureText(inlineCredits).width > 960);
-    drawCanvasText(composerOverflows ? lyricist : inlineCredits, centerY + 44, 22, 700, theme.creditsColor);
+    const lyricistWidth = lyricist ? context.measureText(lyricist).width : 0;
+    const composerWidth = composer ? context.measureText(composer).width : 0;
+    const composerOverflows = Boolean(lyricist && composer && lyricistWidth + composerWidth > 960);
+    if (!composerOverflows && lyricist && composer) {
+      drawCanvasText(
+        lyricist,
+        centerY + 44,
+        22,
+        700,
+        theme.creditsColor,
+        centerX - composerWidth / 2,
+        960,
+      );
+      drawCanvasText(
+        composer,
+        centerY + 44,
+        22,
+        700,
+        theme.creditsColor,
+        centerX + lyricistWidth / 2,
+        960,
+      );
+    } else {
+      drawCanvasText(lyricist || composer, centerY + 44, 22, 700, theme.creditsColor, centerX, 960);
+    }
     if (composerOverflows) drawCanvasText(composer, centerY + 68, 22, 700, theme.creditsColor);
     drawCanvasText(
       introduction.arranger ? `編曲: ${introduction.arranger}` : "",
@@ -1070,7 +1163,28 @@ export class HudLayer {
     return undefined;
   }
 
-  private drawTitleMetadata(
+  private drawDifficultyFallback(
+    introduction: NonNullable<RenderHudState["titleIntroduction"]>,
+    fontFamily: string,
+    left: number,
+    top: number,
+    width: number,
+    height: number,
+  ): void {
+    if (!introduction.difficulty) return;
+    const context = this.context;
+    // Explicit resource fallback: this preserves readable metadata but is not
+    // presented as the authored difficulty sprite.
+    context.fillStyle = "rgba(236, 67, 92, 0.94)";
+    context.fillRect(left, top, width, height);
+    context.fillStyle = "#ffffff";
+    context.font = `700 18px ${fontFamily}`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(introduction.difficulty.toLocaleUpperCase(), left + width / 2, top + height / 2);
+  }
+
+  private drawSimpleTitleMetadata(
     introduction: NonNullable<RenderHudState["titleIntroduction"]>,
     layout: TitleIntroductionLayout,
     fontFamily: string,
@@ -1085,19 +1199,15 @@ export class HudLayer {
         120.8,
         35.2,
       );
-    } else if (introduction.difficulty) {
-      context.fillStyle = "rgba(236, 67, 92, 0.94)";
-      context.fillRect(layout.metadataRight - 441, layout.metadataTop + 3, 120.8, 35.2);
-      context.fillStyle = "#ffffff";
-      context.font = `700 18px ${fontFamily}`;
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(
-        introduction.difficulty.toLocaleUpperCase(),
-        layout.metadataRight - 380.6,
-        layout.metadataTop + 20.6,
+    } else
+      this.drawDifficultyFallback(
+        introduction,
+        fontFamily,
+        layout.metadataRight - 441,
+        layout.metadataTop + 3,
+        120.8,
+        35.2,
       );
-    }
     if (introduction.level !== undefined) {
       context.fillStyle = "#ffffff";
       context.font = `400 30px ${fontFamily}`;
@@ -1111,10 +1221,95 @@ export class HudLayer {
       context.textBaseline = "middle";
       context.font = `400 18px ${fontFamily}`;
       context.textAlign = "left";
-      context.fillText("HIGH SCORE :", layout.metadataRight - 257, layout.metadataTop + 19);
+      context.fillText("HIGH SCORE", layout.metadataRight - 257, layout.metadataTop + 19);
+      context.font = `400 22px ${fontFamily}`;
+      context.fillText(":", layout.metadataRight - 143, layout.metadataTop + 19);
       context.font = `400 30px ${fontFamily}`;
       context.textAlign = "right";
       context.fillText(score, layout.metadataRight - 7, layout.metadataTop + 19);
+    }
+  }
+
+  private drawNormalTitleMetadata(
+    introduction: NonNullable<RenderHudState["titleIntroduction"]>,
+    layout: TitleIntroductionLayout,
+    fontFamily: string,
+  ): void {
+    const context = this.context;
+    const difficultyIcon = this.titleImage(introduction.difficultyIconUrl);
+    if (difficultyIcon) {
+      context.drawImage(
+        difficultyIcon,
+        layout.normalDifficultyLeft,
+        layout.normalDifficultyTop,
+        layout.normalDifficultyWidth,
+        layout.normalDifficultyHeight,
+      );
+    } else {
+      this.drawDifficultyFallback(
+        introduction,
+        fontFamily,
+        layout.normalDifficultyLeft,
+        layout.normalDifficultyTop,
+        layout.normalDifficultyWidth,
+        layout.normalDifficultyHeight,
+      );
+    }
+    if (introduction.level !== undefined) {
+      context.fillStyle = "#ffffff";
+      context.font = `400 44px ${fontFamily}`;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(String(introduction.level), layout.normalLevelCenterX, layout.normalLevelCenterY);
+    }
+    if (introduction.highScore !== undefined && Number.isFinite(introduction.highScore)) {
+      const score = String(Math.max(0, Math.trunc(introduction.highScore)));
+      const baseLeft = layout.normalMetadataLeft;
+      const baseRight = layout.normalMetadataRight;
+      const centerY = layout.normalMetadataTop + 19;
+      context.fillStyle = "#ffffff";
+      context.textBaseline = "middle";
+      context.textAlign = "left";
+      context.font = `400 22px ${fontFamily}`;
+      context.fillText("HIGH SCORE", baseLeft + 8, centerY);
+      context.fillText(":", baseLeft + 147, centerY);
+      context.textAlign = "right";
+      context.font = `400 30px ${fontFamily}`;
+      context.fillText(score, baseRight - 7, centerY);
+    }
+  }
+
+  private drawGekisouIntroduction(
+    introduction: NonNullable<RenderHudState["titleIntroduction"]>,
+    layout: TitleIntroductionLayout,
+    fontFamily: string,
+  ): void {
+    const gekisou = introduction.gekisou;
+    if (!gekisou?.enabled) return;
+    const context = this.context;
+    context.fillStyle = "#ffffff";
+    context.font = `400 34px ${fontFamily}`;
+    context.textAlign = "right";
+    context.textBaseline = "top";
+    context.fillText(
+      gekisou.performanceLabel || "PERFORMANCE",
+      layout.gekisouPanelRight,
+      layout.gekisouPanelTop + 24,
+    );
+    const missions = gekisou.missions?.slice(0, 3) ?? [];
+    for (let index = 0; index < missions.length; index += 1) {
+      const mission = missions[index]!;
+      const slotCenterX = layout.gekisouMissionRowLeft + (index * 2 + 0.5) * 75.4000015258789;
+      const icon = this.titleImage(mission.iconUrl);
+      if (icon)
+        context.drawImage(icon, slotCenterX - 46.5, layout.gekisouMissionRowTop + 3.5, 93, 91);
+      // Missing icon/arrow sprites intentionally fall back to the authored text
+      // slot only; no generic shape is claimed to match the source artwork.
+      context.fillStyle = "#ffffff";
+      context.font = `400 24px ${fontFamily}`;
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(mission.label, slotCenterX, layout.gekisouMissionRowTop + 85);
     }
   }
 

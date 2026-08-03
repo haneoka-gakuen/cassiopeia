@@ -7,6 +7,7 @@ import {
 import {
   DEFAULT_FINISH_DIRECTION_DURATION_MS,
   PlayerFinishDirectionLifecycle,
+  PlayerIntroductionHandoff,
   PlayerIntroductionLifecycle,
   PlayerPlaybackGate,
   shouldStartPlayerIntroduction,
@@ -28,6 +29,11 @@ assert.deepEqual(at(0), {
   enabled: true,
   state: "hidden",
   alpha: 0,
+  rootAlpha: 0,
+  centerAlpha: 0,
+  simpleAlpha: 0,
+  leftAlpha: 0,
+  rightAlpha: 0,
   contentAlpha: 0,
   elapsedMs: 0,
   content,
@@ -46,6 +52,15 @@ assert.equal(at(timing.holdStartMs).alpha, 1);
 assert.equal(at(timing.holdStartMs).contentAlpha, 0);
 assert.equal(at((timing.holdStartMs + timing.contentShowEndMs) / 2).contentAlpha, 0.5);
 assert.equal(at(timing.contentShowEndMs).contentAlpha, 1);
+assert.equal(at(timing.normalShowStartMs).leftAlpha, 0);
+assert.equal(
+  at((timing.normalShowStartMs + timing.normalShowEndMs) / 2).leftAlpha,
+  0.5,
+);
+assert.equal(at(timing.normalShowEndMs).leftAlpha, 1);
+assert.equal(at(timing.normalShowEndMs).rightAlpha, 1);
+assert.equal(at(timing.normalShowEndMs).centerAlpha, 1);
+assert.equal(at(timing.normalShowEndMs).simpleAlpha, 1);
 assert.equal(at(timing.showClipEndMs - epsilon).state, "holding");
 assert.equal(at(timing.showClipEndMs).state, "hiding");
 assert.equal(at(timing.showClipEndMs).alpha, 1);
@@ -73,7 +88,7 @@ assert.equal(presentation.update(20_000 + timing.holdStartMs).alpha, 0);
 assert.equal(presentation.setEnabled(true).state, "hidden");
 
 assert.equal(shouldStartPlayerIntroduction(false, true, true, false), true);
-assert.equal(shouldStartPlayerIntroduction(true, true, true, false), false);
+assert.equal(shouldStartPlayerIntroduction(true, true, true, false), true);
 assert.equal(shouldStartPlayerIntroduction(false, false, true, false), false);
 assert.equal(shouldStartPlayerIntroduction(false, true, false, false), false);
 assert.equal(shouldStartPlayerIntroduction(false, true, true, true), false);
@@ -93,6 +108,27 @@ assert.deepEqual(introductionLifecycle.start(10_000), {
 });
 
 const playbackGate = new PlayerPlaybackGate();
+const handoff = new PlayerIntroductionHandoff();
+assert.equal(handoff.phase, "idle");
+handoff.request();
+assert.equal(handoff.phase, "update-frame");
+assert.equal(handoff.afterAnimationFrame(), false);
+assert.equal(handoff.phase, "next-frame");
+assert.equal(handoff.afterAnimationFrame(), true);
+assert.equal(handoff.phase, "idle");
+handoff.request();
+handoff.cancel();
+assert.equal(handoff.afterAnimationFrame(), false);
+
+const cancelledBetweenFramesGeneration = playbackGate.begin();
+handoff.request();
+assert.equal(handoff.afterAnimationFrame(), false);
+assert.equal(handoff.phase, "next-frame");
+playbackGate.cancel();
+handoff.cancel();
+assert.equal(handoff.afterAnimationFrame(), false);
+assert.equal(playbackGate.beginHandoff(cancelledBetweenFramesGeneration), false);
+
 const staleGeneration = playbackGate.begin();
 assert.equal(playbackGate.playbackRequested, true);
 assert.equal(playbackGate.beginHandoff(staleGeneration), true);

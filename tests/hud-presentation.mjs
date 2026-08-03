@@ -34,6 +34,22 @@ assert.deepEqual(resolveTitleIntroductionLayout(1920, 1080), {
   jacketSize: 440.32000732421875,
   metadataTop: 687,
   metadataRight: 1180,
+  normalJacketLeft: 71.02399826049805,
+  normalJacketTop: 70.02399826049805,
+  normalJacketSize: 125.9520034790039,
+  normalDifficultyLeft: 221.05000180006027,
+  normalDifficultyTop: 86.20000052452087,
+  normalDifficultyWidth: 135.89999639987946,
+  normalDifficultyHeight: 39.59999895095825,
+  normalLevelCenterX: 387,
+  normalLevelCenterY: 108,
+  normalMetadataLeft: 221,
+  normalMetadataTop: 142,
+  normalMetadataRight: 510,
+  gekisouPanelRight: 1871,
+  gekisouPanelTop: 26,
+  gekisouMissionRowLeft: 1494,
+  gekisouMissionRowTop: 90,
 });
 assert.equal(resolveTitleIntroductionLayout(1920, 1440).ribbonCenterY, 1201);
 

@@ -6,6 +6,8 @@ export {
 export type { PlayerFinishDirectionTransition } from "./vue/PlayerFinishDirectionLifecycle";
 export { PlayerIntroductionLifecycle } from "./vue/PlayerIntroductionLifecycle";
 export type { PlayerIntroductionTransition } from "./vue/PlayerIntroductionLifecycle";
+export { PlayerIntroductionHandoff } from "./vue/PlayerIntroductionHandoff";
+export type { PlayerIntroductionHandoffPhase } from "./vue/PlayerIntroductionHandoff";
 export {
   PlayerPlaybackGate,
   shouldStartPlayerIntroduction,

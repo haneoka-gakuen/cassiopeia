@@ -42,6 +42,7 @@ assert.match(
 const restart = functionBody(player, "restart");
 assert.match(restart, /beginPerformanceEpoch\(\)/);
 assert.match(restart, /introductionLifecycle\.reset\(\)/);
+assert.match(restart, /skipTitleIntroduction\(\)/);
 assert.match(restart, /seek\(0, false\)/);
 for (const transportOrVisualOperation of ["seek", "pause", "resize"]) {
   assert.doesNotMatch(
@@ -76,8 +77,24 @@ assert.match(
   /await introductionUnlock;[\s\S]*playbackGate\.isCurrent\(generation\)/,
   "an obsolete unlock continuation must not start media",
 );
+assert.match(
+  functionBody(player, "animate"),
+  /introductionHandoff\.afterAnimationFrame\(\)/,
+  "music handoff must cross the explicit UpdateFrame/NextFrame lifecycle",
+);
+assert.match(
+  functionBody(player, "finishExternalPlaybackHandoff"),
+  /emit\("external-playback-requested",/,
+  "owner clocks must receive an explicit post-introduction playback request",
+);
+assert.doesNotMatch(
+  functionBody(player, "initialize"),
+  /externalClockControlled\.value[\s\S]*skipTitleIntroduction\(\)/,
+  "an idle owner clock must not silently consume a fresh opening",
+);
 
 assert.match(types, /restart\(\): void/);
+assert.match(types, /"external-playback-requested": \[presentationTimeMs: number\]/);
 assert.match(
   types,
   /frame:\s*\[\s*presentationTimeMs: number,\s*chartTimeMs: number,\s*performanceEpoch: number,\s*combo: number,\s*processed: number,\s*total: number,\s*comboUpdated: boolean,\s*addedCombo: number,?\s*\]/s,

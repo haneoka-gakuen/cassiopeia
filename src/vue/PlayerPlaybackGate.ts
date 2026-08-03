@@ -52,10 +52,13 @@ export class PlayerPlaybackGate {
 }
 
 export function shouldStartPlayerIntroduction(
-  externalClockControlled: boolean,
+  _externalClockControlled: boolean,
   enabled: boolean,
   hasDisplayableTitle: boolean,
   complete: boolean,
 ): boolean {
-  return !externalClockControlled && enabled && hasDisplayableTitle && !complete;
+  // An owner-controlled media clock cannot be mutated here, but the opening
+  // presentation is still locally clocked. Completion is handed back through
+  // the explicit external-playback-requested event.
+  return enabled && hasDisplayableTitle && !complete;
 }

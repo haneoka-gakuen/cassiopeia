@@ -51,6 +51,7 @@ import {
   PlayerIntroductionLifecycle,
   type PlayerIntroductionTransition,
 } from "./PlayerIntroductionLifecycle";
+import { PlayerIntroductionHandoff } from "./PlayerIntroductionHandoff";
 import {
   PlayerPlaybackGate,
   shouldStartPlayerIntroduction,
@@ -134,9 +135,9 @@ let noteSounds: NoteSoundPlayer | undefined;
 let titleIntroduction: TitleIntroductionPresentation | undefined;
 let titleIntroductionSnapshot: TitleIntroductionSnapshot | undefined;
 const introductionLifecycle = new PlayerIntroductionLifecycle();
+const introductionHandoff = new PlayerIntroductionHandoff();
 const finishDirectionLifecycle = new PlayerFinishDirectionLifecycle();
 const playbackGate = new PlayerPlaybackGate();
-let titleIntroductionStartPending = false;
 let titleIntroductionPlaybackGeneration: number | undefined;
 let titleIntroductionMediaGeneration: number | undefined;
 let titleIntroductionMediaPreparing = false;
@@ -182,12 +183,12 @@ const presentationTimeMs = () => {
 const chartTimeMs = () => presentationTimeMs() - props.bgmOffsetMs;
 const titleIntroductionInFlight = () =>
   introductionLifecycle.running ||
-  titleIntroductionStartPending ||
+  introductionHandoff.pending ||
   playbackGate.handoffPending;
 const gameplayIsPlaying = () =>
   externalClockControlled.value
     ? props.externalPlaying === true
-    : clock?.playing === true &&
+    : clock?.advancing === true &&
       !titleIntroductionMediaPreparing &&
       !titleIntroductionMediaPrimed;
 const playerIsPlaying = () =>
@@ -475,7 +476,7 @@ function pauseTitleIntroduction(): void {
 
 function skipTitleIntroduction(): void {
   emitIntroductionTransition(introductionLifecycle.skip());
-  titleIntroductionStartPending = false;
+  introductionHandoff.cancel();
   titleIntroductionSnapshot = titleIntroduction?.atElapsed(
     introductionLifecycle.elapsedMs,
   );
@@ -496,7 +497,7 @@ function updateTitleIntroduction(realtimeMs: number): void {
   titleIntroductionSnapshot = titleIntroduction?.atElapsed(
     introductionLifecycle.elapsedMs,
   );
-  if (transition.completed) titleIntroductionStartPending = true;
+  if (transition.completed) introductionHandoff.request();
 }
 
 function emitFinishDirectionTransition(
@@ -543,6 +544,11 @@ function applyTitleIntroduction(frame: RenderFrame): RenderFrame {
       ? {
           ...snapshot.content,
           alpha: snapshot.alpha,
+          rootAlpha: snapshot.rootAlpha,
+          centerAlpha: snapshot.centerAlpha,
+          simpleAlpha: snapshot.simpleAlpha,
+          leftAlpha: snapshot.leftAlpha,
+          rightAlpha: snapshot.rightAlpha,
           contentAlpha: snapshot.contentAlpha,
           theme: props.titleIntroductionTheme,
         }
@@ -764,19 +770,22 @@ function renderFrame(): void {
 function animate(): void {
   animationFrame = 0;
   renderFrame();
-  if (titleIntroductionStartPending) {
-    titleIntroductionStartPending = false;
+  if (introductionHandoff.afterAnimationFrame()) {
     const generation = titleIntroductionPlaybackGeneration;
     if (
       generation !== undefined &&
       playbackGate.beginHandoff(generation)
-    )
-      void startMediaPlayback(generation, false);
+    ) {
+      if (externalClockControlled.value)
+        finishExternalPlaybackHandoff(generation);
+      else void startMediaPlayback(generation, false);
+    }
     return;
   }
   if (
-    clock?.playing ||
+    clock?.advancing ||
     introductionLifecycle.running ||
+    introductionHandoff.pending ||
     finishDirectionLifecycle.running
   )
     requestFrame();
@@ -933,7 +942,7 @@ async function startMediaPlayback(
         : undefined;
     restoreTitleIntroductionMedia(false);
     if (!playbackGate.isCurrent(generation)) return;
-    const musicPlay = clock?.playing ? undefined : clock?.play();
+    const musicPlay = clock?.advancing ? undefined : clock?.play();
     syncBackgroundVideo(true);
     const videoPlay = backgroundVideoIsSelected()
       ? backgroundVideo.value
@@ -953,7 +962,7 @@ async function startMediaPlayback(
       titleIntroductionPlaybackGeneration = undefined;
       titleIntroductionUnlock = undefined;
       pauseTitleIntroduction();
-      titleIntroductionStartPending = false;
+      introductionHandoff.cancel();
       restoreTitleIntroductionMedia(true);
       backgroundVideo.value?.pause();
       clock?.pause();
@@ -964,8 +973,16 @@ async function startMediaPlayback(
   }
 }
 
+function finishExternalPlaybackHandoff(generation: number): void {
+  if (!playbackGate.finish(generation)) return;
+  if (titleIntroductionPlaybackGeneration === generation)
+    titleIntroductionPlaybackGeneration = undefined;
+  emit("playing", false);
+  emit("external-playback-requested", Math.max(0, props.bgmOffsetMs));
+}
+
 async function play(): Promise<void> {
-  if (externalClockControlled.value || titleIntroductionInFlight()) return;
+  if (titleIntroductionInFlight()) return;
   if (finishDirectionLifecycle.pending) {
     emitFinishDirectionTransition(
       finishDirectionLifecycle.start(performance.now()),
@@ -979,6 +996,10 @@ async function play(): Promise<void> {
   if (!shouldPlayTitleIntroduction()) {
     skipTitleIntroduction();
     const generation = playbackGate.begin();
+    if (externalClockControlled.value) {
+      finishExternalPlaybackHandoff(generation);
+      return;
+    }
     await startMediaPlayback(generation);
     return;
   }
@@ -987,10 +1008,10 @@ async function play(): Promise<void> {
   titleIntroductionPlaybackGeneration = generation;
   // Note-audio and media priming are both invoked synchronously from the
   // click. The title clock then runs independently while chart/music time is 0.
-  const noteSoundUnlock = props.noteSoundEnabled
+  const noteSoundUnlock = !externalClockControlled.value && props.noteSoundEnabled
     ? noteSounds?.unlock()
     : undefined;
-  const mediaPrime = titleIntroductionMediaPrimed
+  const mediaPrime = externalClockControlled.value || titleIntroductionMediaPrimed
     ? undefined
     : primeMediaForTitleIntroduction(generation);
   const introductionUnlock = Promise.all([noteSoundUnlock, mediaPrime]).then(
@@ -1032,7 +1053,7 @@ function pause(): void {
   noteSounds?.stopLongLine();
   pauseTitleIntroduction();
   pauseFinishDirection();
-  titleIntroductionStartPending = false;
+  introductionHandoff.cancel();
   backgroundVideo.value?.pause();
   if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
     restoreTitleIntroductionMedia(true);
@@ -1046,7 +1067,11 @@ function pause(): void {
 }
 
 function seek(seconds: number, skipIntroduction = true): void {
-  if (externalClockControlled.value || !clock || !session || !frameBuilder)
+  if (externalClockControlled.value) {
+    if (skipIntroduction) skipTitleIntroduction();
+    return;
+  }
+  if (!clock || !session || !frameBuilder)
     return;
   const introductionWasPlaying = titleIntroductionInFlight();
   const finishDirectionWasPlaying = finishDirectionLifecycle.running;
@@ -1079,12 +1104,14 @@ function restart(): void {
   }
   beginPerformanceEpoch();
   introductionLifecycle.reset();
-  titleIntroductionStartPending = false;
+  introductionHandoff.cancel();
   attachTitleIntroduction();
+  // Retry/restart returns through the live-start state, not the fresh opening
+  // animation state. A distinct chart change resets this consumption instead.
+  skipTitleIntroduction();
   if (externalClockControlled.value) {
     // The owner moves its controlled clock to the beginning. Reconstruct now
     // so the new epoch cannot retain judgement/effect state from the old run.
-    skipTitleIntroduction();
     resetTimeline(chartTimeMs());
     return;
   }
@@ -1104,6 +1131,9 @@ function attachInternalAudio(): void {
   void noteSounds.load();
   const active = () => !destroyed && clock === candidate;
   candidate.audio.addEventListener("play", () => {
+    if (active()) requestFrame();
+  });
+  candidate.audio.addEventListener("playing", () => {
     if (
       active() &&
       suppressInternalMediaEvents === 0 &&
@@ -1116,6 +1146,18 @@ function attachInternalAudio(): void {
       emit("playing", true);
     }
   });
+  const onBuffering = () => {
+    if (
+      active() &&
+      suppressInternalMediaEvents === 0 &&
+      !titleIntroductionInFlight()
+    ) {
+      emitMediaPlaying(false);
+      emit("playing", false);
+    }
+  };
+  candidate.audio.addEventListener("waiting", onBuffering);
+  candidate.audio.addEventListener("stalled", onBuffering);
   candidate.audio.addEventListener("pause", () => {
     if (
       active() &&
@@ -1186,7 +1228,7 @@ async function initialize(): Promise<void> {
     }
     attachInternalAudio();
     introductionLifecycle.reset();
-    titleIntroductionStartPending = false;
+    introductionHandoff.cancel();
     attachSession();
     beginPerformanceEpoch();
     attachInput();
@@ -1194,10 +1236,8 @@ async function initialize(): Promise<void> {
     resizeObserver.observe(root.value);
     ready.value = true;
     resize();
-    if (externalClockControlled.value) {
-      skipTitleIntroduction();
-      resetTimeline(chartTimeMs());
-    } else requestFrame();
+    if (externalClockControlled.value) resetTimeline(chartTimeMs());
+    requestFrame();
     if (
       externalClockControlled.value &&
       props.externalPlaying &&
@@ -1265,7 +1305,7 @@ watch(
   () => {
     pause();
     introductionLifecycle.reset();
-    titleIntroductionStartPending = false;
+    introductionHandoff.cancel();
     attachSession();
     if (ready.value) beginPerformanceEpoch();
     if (externalClockControlled.value) {
@@ -1288,7 +1328,7 @@ watch(
   [() => props.titleIntroduction, () => props.titleIntroductionEnabled],
   ([content, enabled], [previousContent, previousEnabled]) => {
     const introductionWasRunning =
-      introductionLifecycle.running || titleIntroductionStartPending;
+      introductionLifecycle.running || introductionHandoff.pending;
     const generation = titleIntroductionPlaybackGeneration;
     const becameAvailable =
       Boolean(enabled && content?.title) &&
@@ -1302,8 +1342,11 @@ watch(
         introductionWasRunning &&
         generation !== undefined &&
         playbackGate.beginHandoff(generation)
-      )
-        void startMediaPlayback(generation, false);
+      ) {
+        if (externalClockControlled.value)
+          finishExternalPlaybackHandoff(generation);
+        else void startMediaPlayback(generation, false);
+      }
     } else if (
       becameAvailable &&
       !titleIntroductionInFlight() &&
@@ -1337,11 +1380,16 @@ watch(
 watch(externalClockControlled, (controlled) => {
   if (!renderer) return;
   playbackGate.cancel();
+  introductionHandoff.cancel();
   titleIntroductionPlaybackGeneration = undefined;
   titleIntroductionUnlock = undefined;
   if (controlled) detachInternalAudio();
   else attachInternalAudio();
-  if (controlled) skipTitleIntroduction();
+  if (
+    controlled &&
+    (props.externalPlaying === true || chartTimeMs() > 0)
+  )
+    skipTitleIntroduction();
   resetTimeline(chartTimeMs());
   emit("duration", presentationDurationMs() / 1000);
   emitMediaPlaying(
@@ -1467,6 +1515,7 @@ onMounted(() => nextTick(initialize));
 onBeforeUnmount(() => {
   destroyed = true;
   playbackGate.cancel();
+  introductionHandoff.cancel();
   titleIntroductionPlaybackGeneration = undefined;
   titleIntroductionUnlock = undefined;
   activePointerIds.clear();

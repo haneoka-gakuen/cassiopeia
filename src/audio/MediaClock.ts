@@ -5,6 +5,8 @@ export interface MediaClockOptions {
   volume?: number;
   playbackRate?: number;
   loop?: boolean;
+  /** Test/host injection point; production defaults to a new Audio element. */
+  audioElement?: HTMLAudioElement;
 }
 
 /** Audio-element backed clock. Rendering always reads the media clock, never frame deltas. */
@@ -14,14 +16,25 @@ export class MediaClock extends EventTarget {
 
   constructor(source?: string, options: MediaClockOptions = {}) {
     super();
-    this.audio = new Audio();
+    this.audio = options.audioElement ?? new Audio();
     this.audio.preload = "auto";
     this.audio.crossOrigin = "anonymous";
     this.audio.volume = options.volume ?? 0.8;
     this.audio.playbackRate = normalizePlaybackRate(options.playbackRate ?? 1);
     this.audio.loop = options.loop ?? false;
     if (source) this.source = source;
-    for (const type of ["play", "pause", "ended", "timeupdate", "durationchange", "error"] as const) {
+    for (const type of [
+      "play",
+      "playing",
+      "pause",
+      "waiting",
+      "stalled",
+      "canplay",
+      "ended",
+      "timeupdate",
+      "durationchange",
+      "error",
+    ] as const) {
       this.audio.addEventListener(type, () => {
         if ((type === "pause" || type === "ended" || type === "timeupdate") && Number.isFinite(this.audio.currentTime)) {
           this.syncTime.read(true, this.audio.currentTime * 1000);
@@ -44,12 +57,7 @@ export class MediaClock extends EventTarget {
   }
 
   get timeMs(): number {
-    const playbackUsable =
-      !this.audio.paused &&
-      !this.audio.ended &&
-      !this.audio.seeking &&
-      this.audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-      Number.isFinite(this.audio.currentTime);
+    const playbackUsable = this.advancing && Number.isFinite(this.audio.currentTime);
     return this.syncTime.read(playbackUsable, this.audio.currentTime * 1000);
   }
 
@@ -59,6 +67,18 @@ export class MediaClock extends EventTarget {
 
   get playing(): boolean {
     return !this.audio.paused && !this.audio.ended;
+  }
+
+  /** True only when the media clock can currently advance gameplay time. */
+  get advancing(): boolean {
+    return (
+      !this.audio.paused &&
+      !this.audio.ended &&
+      !this.audio.seeking &&
+      // HAVE_CURRENT_DATA is 2. Keeping the numeric threshold makes injected
+      // test media usable outside a browser global environment.
+      this.audio.readyState >= 2
+    );
   }
 
   get volume(): number {

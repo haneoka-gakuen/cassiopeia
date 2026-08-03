@@ -16,6 +16,21 @@ export interface TitleIntroductionContent {
   difficultyIconUrl?: string;
   level?: string | number;
   highScore?: number;
+  /** Selects the authored lightweight centre card or the normal corner HUD. */
+  layoutMode?: "lightweight" | "normal";
+  /** Optional normal-mode Gekisou mission presentation. */
+  gekisou?: TitleIntroductionGekisouContent;
+}
+
+export interface TitleIntroductionGekisouMission {
+  label: string;
+  iconUrl?: string;
+}
+
+export interface TitleIntroductionGekisouContent {
+  enabled: boolean;
+  performanceLabel?: string;
+  missions?: ReadonlyArray<TitleIntroductionGekisouMission>;
 }
 
 export interface TitleIntroductionTiming {
@@ -25,6 +40,10 @@ export interface TitleIntroductionTiming {
   holdStartMs: number;
   /** Center title/artist/credit group reaches alpha 1 at this boundary. */
   contentShowEndMs: number;
+  /** Normal-mode left/right corner groups begin their independent fade. */
+  normalShowStartMs?: number;
+  /** Normal-mode left/right corner groups reach alpha 1. */
+  normalShowEndMs?: number;
   showClipEndMs: number;
   hideEndMs: number;
 }
@@ -42,6 +61,17 @@ export interface TitleIntroductionSnapshot {
   enabled: boolean;
   state: TitleIntroductionState;
   alpha: number;
+  /** Alias of `alpha`, retained as an explicit root CanvasGroup channel. */
+  rootAlpha: number;
+  /** Root-composited centre detail opacity. */
+  centerAlpha: number;
+  /** Root-composited lightweight jacket/metadata opacity. */
+  simpleAlpha: number;
+  /** Root-composited normal-mode left group opacity. */
+  leftAlpha: number;
+  /** Root-composited normal-mode right group opacity. */
+  rightAlpha: number;
+  /** Backward-compatible alias of `centerAlpha`/`simpleAlpha`. */
   contentAlpha: number;
   elapsedMs: number;
   content: Readonly<TitleIntroductionContent>;
@@ -60,6 +90,8 @@ export const DEFAULT_TITLE_INTRODUCTION_TIMING: Readonly<TitleIntroductionTiming
   displayStartMs: 1483.3333333333333,
   holdStartMs: 1650.0000049670537,
   contentShowEndMs: 1983.3333333333333,
+  normalShowStartMs: 2150.000019868215,
+  normalShowEndMs: 2816.6667064030967,
   showClipEndMs: 3766.6666666666665,
   hideEndMs: 4433.333353201548,
 });
@@ -92,6 +124,8 @@ function validateTiming(timing: TitleIntroductionTiming): TitleIntroductionTimin
     timing.displayStartMs,
     timing.holdStartMs,
     timing.contentShowEndMs,
+    timing.normalShowStartMs ?? timing.contentShowEndMs,
+    timing.normalShowEndMs ?? timing.contentShowEndMs,
     timing.showClipEndMs,
     timing.hideEndMs,
   ];
@@ -103,6 +137,12 @@ function validateTiming(timing: TitleIntroductionTiming): TitleIntroductionTimin
     timing.displayStartMs >= timing.holdStartMs ||
     timing.holdStartMs >= timing.contentShowEndMs ||
     timing.contentShowEndMs > timing.showClipEndMs ||
+    (timing.normalShowStartMs !== undefined &&
+      (timing.normalShowStartMs < timing.contentShowEndMs ||
+        timing.normalShowStartMs > timing.showClipEndMs)) ||
+    (timing.normalShowEndMs !== undefined &&
+      (timing.normalShowEndMs < (timing.normalShowStartMs ?? timing.contentShowEndMs) ||
+        timing.normalShowEndMs > timing.showClipEndMs)) ||
     timing.showClipEndMs >= timing.hideEndMs ||
     timing.hideEndMs > timing.totalDurationMs
   ) {
@@ -149,7 +189,19 @@ export function sampleTitleIntroduction(
     Math.max(0, finiteRealtime(elapsedMs, "elapsedMs")),
   );
   if (!enabled) {
-    return { enabled: false, state: "complete", alpha: 0, contentAlpha: 0, elapsedMs: checkedElapsed, content };
+    return {
+      enabled: false,
+      state: "complete",
+      alpha: 0,
+      rootAlpha: 0,
+      centerAlpha: 0,
+      simpleAlpha: 0,
+      leftAlpha: 0,
+      rightAlpha: 0,
+      contentAlpha: 0,
+      elapsedMs: checkedElapsed,
+      content,
+    };
   }
 
   const state = resolveState(checkedElapsed, checkedTiming);
@@ -167,8 +219,29 @@ export function sampleTitleIntroduction(
       Math.max(Number.EPSILON, checkedTiming.contentShowEndMs - checkedTiming.holdStartMs),
   );
   const contentSmooth = contentProgress * contentProgress * (3 - 2 * contentProgress);
-  const contentAlpha = checkedElapsed >= checkedTiming.hideEndMs ? 0 : clampUnit(alpha * contentSmooth);
-  return { enabled: true, state, alpha, contentAlpha, elapsedMs: checkedElapsed, content };
+  const normalShowStartMs = checkedTiming.normalShowStartMs ?? checkedTiming.contentShowEndMs;
+  const normalShowEndMs = checkedTiming.normalShowEndMs ?? normalShowStartMs;
+  const normalProgress =
+    normalShowEndMs <= normalShowStartMs
+      ? Number(checkedElapsed >= normalShowEndMs)
+      : clampUnit((checkedElapsed - normalShowStartMs) / (normalShowEndMs - normalShowStartMs));
+  const normalSmooth = normalProgress * normalProgress * (3 - 2 * normalProgress);
+  const visible = checkedElapsed < checkedTiming.hideEndMs;
+  const contentAlpha = visible ? clampUnit(alpha * contentSmooth) : 0;
+  const normalAlpha = visible ? clampUnit(alpha * normalSmooth) : 0;
+  return {
+    enabled: true,
+    state,
+    alpha,
+    rootAlpha: alpha,
+    centerAlpha: contentAlpha,
+    simpleAlpha: contentAlpha,
+    leftAlpha: normalAlpha,
+    rightAlpha: normalAlpha,
+    contentAlpha,
+    elapsedMs: checkedElapsed,
+    content,
+  };
 }
 
 /** Realtime-driven title introduction with explicit reset and retry behavior. */
