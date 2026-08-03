@@ -7,6 +7,9 @@ import {
 import {
   DEFAULT_FINISH_DIRECTION_DURATION_MS,
   PlayerFinishDirectionLifecycle,
+  PlayerIntroductionLifecycle,
+  PlayerPlaybackGate,
+  shouldStartPlayerIntroduction,
 } from "../dist/player.js";
 
 const content = {
@@ -68,6 +71,57 @@ assert.equal(presentation.retry().state, "complete");
 assert.equal(presentation.setEnabled(false).state, "complete");
 assert.equal(presentation.update(20_000 + timing.holdStartMs).alpha, 0);
 assert.equal(presentation.setEnabled(true).state, "hidden");
+
+assert.equal(shouldStartPlayerIntroduction(false, true, true, false), true);
+assert.equal(shouldStartPlayerIntroduction(true, true, true, false), false);
+assert.equal(shouldStartPlayerIntroduction(false, false, true, false), false);
+assert.equal(shouldStartPlayerIntroduction(false, true, false, false), false);
+assert.equal(shouldStartPlayerIntroduction(false, true, true, true), false);
+
+const introductionLifecycle = new PlayerIntroductionLifecycle();
+assert.deepEqual(introductionLifecycle.start(1_000), {
+  started: true,
+  timeSeconds: 0,
+});
+introductionLifecycle.update(1_000 + introductionLifecycle.durationMs);
+assert.equal(introductionLifecycle.complete, true);
+introductionLifecycle.reset();
+assert.equal(introductionLifecycle.complete, false);
+assert.deepEqual(introductionLifecycle.start(10_000), {
+  started: true,
+  timeSeconds: 0,
+});
+
+const playbackGate = new PlayerPlaybackGate();
+const staleGeneration = playbackGate.begin();
+assert.equal(playbackGate.playbackRequested, true);
+assert.equal(playbackGate.beginHandoff(staleGeneration), true);
+assert.equal(playbackGate.handoffPending, true);
+let releaseHandoff;
+const deferredHandoff = new Promise((resolve) => {
+  releaseHandoff = resolve;
+});
+let lateMediaStarts = 0;
+const staleContinuation = (async () => {
+  await deferredHandoff;
+  if (!playbackGate.isCurrent(staleGeneration)) return;
+  lateMediaStarts += 1;
+  playbackGate.finish(staleGeneration);
+})();
+playbackGate.cancel();
+assert.equal(playbackGate.handoffPending, false);
+assert.equal(playbackGate.playbackRequested, false);
+releaseHandoff();
+await staleContinuation;
+assert.equal(lateMediaStarts, 0);
+
+const currentGeneration = playbackGate.begin();
+assert.notEqual(currentGeneration, staleGeneration);
+assert.equal(playbackGate.beginHandoff(staleGeneration), false);
+assert.equal(playbackGate.beginHandoff(currentGeneration), true);
+assert.equal(playbackGate.finish(currentGeneration), true);
+assert.equal(playbackGate.handoffPending, false);
+assert.equal(playbackGate.playbackRequested, true);
 
 let customSamplerCalls = 0;
 const custom = new TitleIntroductionPresentation({

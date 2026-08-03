@@ -41,7 +41,8 @@ assert.match(
 
 const restart = functionBody(player, "restart");
 assert.match(restart, /beginPerformanceEpoch\(\)/);
-assert.match(restart, /seek\(0\)/);
+assert.match(restart, /introductionLifecycle\.reset\(\)/);
+assert.match(restart, /seek\(0, false\)/);
 for (const transportOrVisualOperation of ["seek", "pause", "resize"]) {
   assert.doesNotMatch(
     functionBody(player, transportOrVisualOperation),
@@ -53,6 +54,27 @@ assert.match(
   functionBody(player, "play"),
   /timelineFinished && finishDirectionLifecycle\.complete\) restart\(\)/,
   "replaying a completed performance must begin a new epoch",
+);
+assert.match(
+  functionBody(player, "shouldPlayTitleIntroduction"),
+  /shouldStartPlayerIntroduction\([\s\S]*props\.titleIntroductionEnabled[\s\S]*titleIntroduction !== undefined/,
+  "a disabled or absent title introduction must not delay media playback",
+);
+assert.match(
+  player,
+  /const titleIntroductionInFlight = \(\) =>[\s\S]*playbackGate\.handoffPending/,
+  "the asynchronous media handoff must remain part of presentation playback",
+);
+assert.match(functionBody(player, "pause"), /playbackGate\.cancel\(\)/);
+assert.match(
+  functionBody(player, "seek"),
+  /if \(introductionWasPlaying\)[\s\S]*playbackGate\.cancel\(\)/,
+  "seeking out of the introduction must invalidate its pending media handoff",
+);
+assert.match(
+  functionBody(player, "startMediaPlayback"),
+  /await introductionUnlock;[\s\S]*playbackGate\.isCurrent\(generation\)/,
+  "an obsolete unlock continuation must not start media",
 );
 
 assert.match(types, /restart\(\): void/);

@@ -51,6 +51,10 @@ import {
   PlayerIntroductionLifecycle,
   type PlayerIntroductionTransition,
 } from "./PlayerIntroductionLifecycle";
+import {
+  PlayerPlaybackGate,
+  shouldStartPlayerIntroduction,
+} from "./PlayerPlaybackGate";
 import type { ChartPlayerEvents, ChartPlayerExpose } from "./types";
 
 const props = withDefaults(
@@ -89,7 +93,7 @@ const props = withDefaults(
     effectSeed?: number;
     /** Song metadata shown by the opening title presentation. */
     titleIntroduction?: TitleIntroductionContent;
-    /** Hides the opening HUD without skipping its playback lifecycle. */
+    /** Skips the opening title presentation when disabled. */
     titleIntroductionEnabled?: boolean;
     titleIntroductionTheme?: Partial<RenderTitleIntroductionTheme>;
     ariaLabel?: string;
@@ -131,12 +135,16 @@ let titleIntroduction: TitleIntroductionPresentation | undefined;
 let titleIntroductionSnapshot: TitleIntroductionSnapshot | undefined;
 const introductionLifecycle = new PlayerIntroductionLifecycle();
 const finishDirectionLifecycle = new PlayerFinishDirectionLifecycle();
+const playbackGate = new PlayerPlaybackGate();
 let titleIntroductionStartPending = false;
+let titleIntroductionPlaybackGeneration: number | undefined;
+let titleIntroductionMediaGeneration: number | undefined;
+let titleIntroductionMediaPreparing = false;
 let titleIntroductionMediaPrimed = false;
 let titleIntroductionMediaResumeAtMs = 0;
 let titleIntroductionMediaPreviousVolume = 0.8;
 let titleIntroductionUnlock: Promise<void> | undefined;
-let suppressInternalMediaEvents = false;
+let suppressInternalMediaEvents = 0;
 let input: OurNotesInput | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let animationFrame = 0;
@@ -173,11 +181,15 @@ const presentationTimeMs = () => {
 };
 const chartTimeMs = () => presentationTimeMs() - props.bgmOffsetMs;
 const titleIntroductionInFlight = () =>
-  introductionLifecycle.running || titleIntroductionStartPending;
+  introductionLifecycle.running ||
+  titleIntroductionStartPending ||
+  playbackGate.handoffPending;
 const gameplayIsPlaying = () =>
   externalClockControlled.value
     ? props.externalPlaying === true
-    : clock?.playing === true && !titleIntroductionMediaPrimed;
+    : clock?.playing === true &&
+      !titleIntroductionMediaPreparing &&
+      !titleIntroductionMediaPrimed;
 const playerIsPlaying = () =>
   gameplayIsPlaying() ||
   titleIntroductionInFlight() ||
@@ -470,7 +482,12 @@ function skipTitleIntroduction(): void {
 }
 
 function shouldPlayTitleIntroduction(): boolean {
-  return !externalClockControlled.value && !introductionLifecycle.complete;
+  return shouldStartPlayerIntroduction(
+    externalClockControlled.value,
+    props.titleIntroductionEnabled,
+    titleIntroduction !== undefined,
+    introductionLifecycle.complete,
+  );
 }
 
 function updateTitleIntroduction(realtimeMs: number): void {
@@ -749,7 +766,12 @@ function animate(): void {
   renderFrame();
   if (titleIntroductionStartPending) {
     titleIntroductionStartPending = false;
-    void startMediaPlayback(false);
+    const generation = titleIntroductionPlaybackGeneration;
+    if (
+      generation !== undefined &&
+      playbackGate.beginHandoff(generation)
+    )
+      void startMediaPlayback(generation, false);
     return;
   }
   if (
@@ -819,51 +841,98 @@ function finishTimeline(timeMs = chartTimeMs()): void {
   requestFrame();
 }
 
-async function primeMediaForTitleIntroduction(): Promise<void> {
+async function primeMediaForTitleIntroduction(
+  generation: number,
+): Promise<void> {
   const target = clock;
   if (!target?.source) return;
-  titleIntroductionMediaResumeAtMs = target.timeMs;
-  titleIntroductionMediaPreviousVolume = target.volume;
-  suppressInternalMediaEvents = true;
+  const resumeAtMs = target.timeMs;
+  const previousVolume = target.volume;
+  titleIntroductionMediaResumeAtMs = resumeAtMs;
+  titleIntroductionMediaPreviousVolume = previousVolume;
+  titleIntroductionMediaGeneration = generation;
+  titleIntroductionMediaPreparing = true;
+  suppressInternalMediaEvents += 1;
   target.volume = 0;
   try {
     // Keep this same authorized playback alive. Pausing here and calling play
     // again after the introduction is rejected by strict autoplay policies.
     if (!target.playing) await target.play();
+    if (!playbackGate.isCurrent(generation)) {
+      if (!playbackGate.playbackRequested) target.pause();
+      if (
+        !playbackGate.playbackRequested &&
+        titleIntroductionMediaGeneration === generation
+      ) {
+        target.seek(resumeAtMs);
+        target.volume = previousVolume;
+        titleIntroductionMediaGeneration = undefined;
+        titleIntroductionMediaPreparing = false;
+        titleIntroductionMediaPrimed = false;
+      }
+      return;
+    }
+    if (titleIntroductionMediaGeneration !== generation) return;
+    titleIntroductionMediaPreparing = false;
     titleIntroductionMediaPrimed = true;
   } catch (reason) {
-    target.volume = titleIntroductionMediaPreviousVolume;
-    titleIntroductionMediaPrimed = false;
+    const ownsMediaState =
+      titleIntroductionMediaGeneration === generation;
+    if (ownsMediaState) {
+      target.volume = previousVolume;
+      titleIntroductionMediaGeneration = undefined;
+      titleIntroductionMediaPreparing = false;
+      titleIntroductionMediaPrimed = false;
+    }
+    if (!playbackGate.isCurrent(generation)) return;
     throw reason;
   } finally {
-    suppressInternalMediaEvents = false;
+    suppressInternalMediaEvents = Math.max(
+      0,
+      suppressInternalMediaEvents - 1,
+    );
   }
 }
 
 function restoreTitleIntroductionMedia(pauseMedia: boolean): void {
   const target = clock;
-  if (!titleIntroductionMediaPrimed || !target) return;
-  suppressInternalMediaEvents = true;
+  if (
+    (!titleIntroductionMediaPreparing && !titleIntroductionMediaPrimed) ||
+    !target
+  )
+    return;
+  suppressInternalMediaEvents += 1;
   try {
     if (pauseMedia) target.pause();
     target.seek(titleIntroductionMediaResumeAtMs);
     target.volume = titleIntroductionMediaPreviousVolume;
+    titleIntroductionMediaGeneration = undefined;
+    titleIntroductionMediaPreparing = false;
     titleIntroductionMediaPrimed = false;
     titleIntroductionUnlock = undefined;
   } finally {
-    suppressInternalMediaEvents = false;
+    suppressInternalMediaEvents = Math.max(
+      0,
+      suppressInternalMediaEvents - 1,
+    );
   }
 }
 
-async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
+async function startMediaPlayback(
+  generation: number,
+  unlockNoteSounds = true,
+): Promise<void> {
   if (externalClockControlled.value) return;
+  const introductionUnlock = titleIntroductionUnlock;
   try {
-    if (titleIntroductionUnlock) await titleIntroductionUnlock;
+    if (introductionUnlock) await introductionUnlock;
+    if (!playbackGate.isCurrent(generation)) return;
     const noteSoundUnlock =
       unlockNoteSounds && props.noteSoundEnabled
         ? noteSounds?.unlock()
         : undefined;
     restoreTitleIntroductionMedia(false);
+    if (!playbackGate.isCurrent(generation)) return;
     const musicPlay = clock?.playing ? undefined : clock?.play();
     syncBackgroundVideo(true);
     const videoPlay = backgroundVideoIsSelected()
@@ -872,10 +941,17 @@ async function startMediaPlayback(unlockNoteSounds = true): Promise<void> {
           .catch((reason) => renderer?.reportAssetError(reason))
       : undefined;
     await Promise.all([noteSoundUnlock, musicPlay, videoPlay]);
+    if (!playbackGate.finish(generation)) return;
+    if (titleIntroductionPlaybackGeneration === generation)
+      titleIntroductionPlaybackGeneration = undefined;
+    titleIntroductionUnlock = undefined;
     emitMediaPlaying(gameplayIsPlaying());
     requestFrame();
   } catch (reason) {
-    if (!destroyed) {
+    if (!destroyed && playbackGate.isCurrent(generation)) {
+      playbackGate.cancel();
+      titleIntroductionPlaybackGeneration = undefined;
+      titleIntroductionUnlock = undefined;
       pauseTitleIntroduction();
       titleIntroductionStartPending = false;
       restoreTitleIntroductionMedia(true);
@@ -901,10 +977,14 @@ async function play(): Promise<void> {
   }
   if (timelineFinished && finishDirectionLifecycle.complete) restart();
   if (!shouldPlayTitleIntroduction()) {
-    await startMediaPlayback();
+    skipTitleIntroduction();
+    const generation = playbackGate.begin();
+    await startMediaPlayback(generation);
     return;
   }
 
+  const generation = playbackGate.begin();
+  titleIntroductionPlaybackGeneration = generation;
   // Note-audio and media priming are both invoked synchronously from the
   // click. The title clock then runs independently while chart/music time is 0.
   const noteSoundUnlock = props.noteSoundEnabled
@@ -912,17 +992,22 @@ async function play(): Promise<void> {
     : undefined;
   const mediaPrime = titleIntroductionMediaPrimed
     ? undefined
-    : primeMediaForTitleIntroduction();
-  titleIntroductionUnlock = Promise.all([noteSoundUnlock, mediaPrime]).then(
+    : primeMediaForTitleIntroduction(generation);
+  const introductionUnlock = Promise.all([noteSoundUnlock, mediaPrime]).then(
     () => undefined,
   );
+  titleIntroductionUnlock = introductionUnlock;
   resumeTitleIntroduction();
   dirty = true;
   requestFrame();
   emit("playing", true);
   try {
-    await titleIntroductionUnlock;
+    await introductionUnlock;
   } catch (reason) {
+    if (!playbackGate.isCurrent(generation)) return;
+    playbackGate.cancel();
+    titleIntroductionPlaybackGeneration = undefined;
+    titleIntroductionUnlock = undefined;
     pauseTitleIntroduction();
     restoreTitleIntroductionMedia(true);
     emit("playing", false);
@@ -933,6 +1018,9 @@ async function play(): Promise<void> {
 function pause(): void {
   const introductionWasPlaying = titleIntroductionInFlight();
   const finishDirectionWasPlaying = finishDirectionLifecycle.running;
+  playbackGate.cancel();
+  titleIntroductionPlaybackGeneration = undefined;
+  titleIntroductionUnlock = undefined;
   if (activePointerIds.size > 0) {
     for (const point of input?.activePoints ?? [])
       session?.cancel(point.pointerId);
@@ -946,7 +1034,8 @@ function pause(): void {
   pauseFinishDirection();
   titleIntroductionStartPending = false;
   backgroundVideo.value?.pause();
-  if (titleIntroductionMediaPrimed) restoreTitleIntroductionMedia(true);
+  if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
+    restoreTitleIntroductionMedia(true);
   else clock?.pause();
   emitMediaPlaying(false);
   if (
@@ -961,7 +1050,13 @@ function seek(seconds: number, skipIntroduction = true): void {
     return;
   const introductionWasPlaying = titleIntroductionInFlight();
   const finishDirectionWasPlaying = finishDirectionLifecycle.running;
-  if (titleIntroductionMediaPrimed) restoreTitleIntroductionMedia(true);
+  if (introductionWasPlaying) {
+    playbackGate.cancel();
+    titleIntroductionPlaybackGeneration = undefined;
+    titleIntroductionUnlock = undefined;
+  }
+  if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
+    restoreTitleIntroductionMedia(true);
   if (skipIntroduction) skipTitleIntroduction();
   clock.seek(seconds * 1000);
   resetTimeline(chartTimeMs());
@@ -972,14 +1067,29 @@ function seek(seconds: number, skipIntroduction = true): void {
 
 function restart(): void {
   if (!session || !frameBuilder) return;
+  const resumeAfterRestart =
+    !externalClockControlled.value && playerIsPlaying();
+  if (resumeAfterRestart) pause();
+  else {
+    playbackGate.cancel();
+    titleIntroductionPlaybackGeneration = undefined;
+    titleIntroductionUnlock = undefined;
+    if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
+      restoreTitleIntroductionMedia(true);
+  }
   beginPerformanceEpoch();
+  introductionLifecycle.reset();
+  titleIntroductionStartPending = false;
+  attachTitleIntroduction();
   if (externalClockControlled.value) {
     // The owner moves its controlled clock to the beginning. Reconstruct now
     // so the new epoch cannot retain judgement/effect state from the old run.
+    skipTitleIntroduction();
     resetTimeline(chartTimeMs());
     return;
   }
-  seek(0);
+  seek(0, false);
+  if (resumeAfterRestart) void play();
 }
 
 function attachInternalAudio(): void {
@@ -996,7 +1106,7 @@ function attachInternalAudio(): void {
   candidate.audio.addEventListener("play", () => {
     if (
       active() &&
-      !suppressInternalMediaEvents &&
+      suppressInternalMediaEvents === 0 &&
       !titleIntroductionInFlight()
     ) {
       if (candidate.timeMs + props.bgmOffsetMs < presentationDurationMs())
@@ -1009,7 +1119,7 @@ function attachInternalAudio(): void {
   candidate.audio.addEventListener("pause", () => {
     if (
       active() &&
-      !suppressInternalMediaEvents &&
+      suppressInternalMediaEvents === 0 &&
       !titleIntroductionInFlight()
     ) {
       pauseTitleIntroduction();
@@ -1039,7 +1149,12 @@ function attachInternalAudio(): void {
 
 function detachInternalAudio(): void {
   const previousClock = clock;
+  if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
+    restoreTitleIntroductionMedia(true);
   clock = undefined;
+  titleIntroductionMediaGeneration = undefined;
+  titleIntroductionMediaPreparing = false;
+  titleIntroductionMediaPrimed = false;
   if (previousClock?.playing) emitMediaPlaying(false);
   previousClock?.destroy();
   noteSounds?.dispose();
@@ -1171,13 +1286,32 @@ watch(() => props.effectSeed, () => {
 });
 watch(
   [() => props.titleIntroduction, () => props.titleIntroductionEnabled],
-  () => {
+  ([content, enabled], [previousContent, previousEnabled]) => {
+    const introductionWasRunning =
+      introductionLifecycle.running || titleIntroductionStartPending;
+    const generation = titleIntroductionPlaybackGeneration;
+    const becameAvailable =
+      Boolean(enabled && content?.title) &&
+      !Boolean(previousEnabled && previousContent?.title);
     attachTitleIntroduction();
-    if (
-      externalClockControlled.value ||
-      gameplayIsPlaying()
-    )
+    if (externalClockControlled.value || gameplayIsPlaying()) {
       skipTitleIntroduction();
+    } else if (!enabled || !titleIntroduction) {
+      skipTitleIntroduction();
+      if (
+        introductionWasRunning &&
+        generation !== undefined &&
+        playbackGate.beginHandoff(generation)
+      )
+        void startMediaPlayback(generation, false);
+    } else if (
+      becameAvailable &&
+      !titleIntroductionInFlight() &&
+      chartTimeMs() <= 0
+    ) {
+      introductionLifecycle.reset();
+      titleIntroductionSnapshot = titleIntroduction.atElapsed(0);
+    }
     dirty = true;
     requestFrame();
   },
@@ -1202,6 +1336,9 @@ watch(
 );
 watch(externalClockControlled, (controlled) => {
   if (!renderer) return;
+  playbackGate.cancel();
+  titleIntroductionPlaybackGeneration = undefined;
+  titleIntroductionUnlock = undefined;
   if (controlled) detachInternalAudio();
   else attachInternalAudio();
   if (controlled) skipTitleIntroduction();
@@ -1293,7 +1430,8 @@ watch(
   () => props.volume,
   (value) => {
     if (!clock) return;
-    if (titleIntroductionMediaPrimed) titleIntroductionMediaPreviousVolume = value;
+    if (titleIntroductionMediaPreparing || titleIntroductionMediaPrimed)
+      titleIntroductionMediaPreviousVolume = value;
     else clock.volume = value;
   },
 );
@@ -1328,6 +1466,9 @@ defineExpose<ChartPlayerExpose>({ play, pause, seek, restart, resize });
 onMounted(() => nextTick(initialize));
 onBeforeUnmount(() => {
   destroyed = true;
+  playbackGate.cancel();
+  titleIntroductionPlaybackGeneration = undefined;
+  titleIntroductionUnlock = undefined;
   activePointerIds.clear();
   inputFeedbackClaimedPointerIds.clear();
   lastLaneInputEffect.clear();
