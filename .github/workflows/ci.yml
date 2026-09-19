@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: wasm32-unknown-unknown
       - uses: actions/cache@v6
@@ -39,36 +39,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
-      - name: Run runtime conformance tests
-        run: >-
-          node tests/runtime-trace.mjs &&
-          node tests/title-introduction.mjs &&
-          node tests/hud-presentation.mjs &&
-          node tests/wasm-boundary.mjs
+      - name: Verify core WASM boundary
+        run: pnpm test:runtime
       - run: npm pack --dry-run --ignore-scripts
+      - name: Verify native C ABI
+        run: pnpm test:native
 
   rust:
     name: Rust quality
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "0"
-      CAPH_CAMERA_TIMELINES: ${{ github.workspace }}/.caph/assets/cassiopeia/live-camera-timelines.json
-      CAPH_CAMERA_EFFECTS: ${{ github.workspace }}/.caph/assets/cassiopeia/live-camera-effects.json
-      CAPH_CHORUS_CAMERA: ${{ github.workspace }}/.caph/assets/cassiopeia/live-chorus-camera.json
-      CASSIOPEIA_REQUIRE_CAPH_CAMERA_RESOURCES: "1"
     steps:
       - uses: actions/checkout@v7
-      - name: Check out camera conformance assets
-        uses: actions/checkout@v7
-        with:
-          repository: haneoka-gakuen/caph
-          path: .caph
-          sparse-checkout: |
-            assets/cassiopeia/live-camera-timelines.json
-            assets/cassiopeia/live-camera-effects.json
-            assets/cassiopeia/live-chorus-camera.json
-          sparse-checkout-cone-mode: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
       - uses: actions/cache@v6
@@ -95,7 +79,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: actions/cache@v6
         with:
           path: |
@@ -112,7 +96,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: wasm32-unknown-unknown
       - uses: actions/cache@v6

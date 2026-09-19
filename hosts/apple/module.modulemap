@@ -1,0 +1,4 @@
+module CassiopeiaNative {
+  header "../../crates/cassiopeia-native/include/cassiopeia.h"
+  export *
+}

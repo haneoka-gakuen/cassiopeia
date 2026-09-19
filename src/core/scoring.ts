@@ -1,4 +1,4 @@
-import { NoteOperateType, NoteSimulateJudgement } from "./enums";
+import { NoteOperateType, NoteSimulateJudgement } from "./enums.js";
 
 const TEN_PERCENT_TYPES = new Set<NoteOperateType>([
   NoteOperateType.SlideConnection,
@@ -67,8 +67,6 @@ export function breaksCombo(judgement: NoteSimulateJudgement): boolean {
 /** Whether the current counter survives this result, including ignored results. */
 export function preservesCombo(judgement: NoteSimulateJudgement): boolean {
   return (
-    judgement === NoteSimulateJudgement.Wait ||
-    judgement === NoteSimulateJudgement.Pass ||
-    incrementsCombo(judgement)
+    judgement === NoteSimulateJudgement.Wait || judgement === NoteSimulateJudgement.Pass || incrementsCombo(judgement)
   );
 }

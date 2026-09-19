@@ -1,5 +1,5 @@
-import { JudgeTiming, NoteDirection, NoteJudgementType, NoteSimulateJudgement } from "./enums";
-import { DEFAULT_ASSIST_LEVEL, getAssistTimingTable, type AssistLevel } from "./assist";
+import { JudgeTiming, NoteDirection, NoteJudgementType, NoteSimulateJudgement } from "./enums.js";
+import { DEFAULT_ASSIST_LEVEL, getAssistTimingTable, type AssistLevel } from "./assist.js";
 
 export interface JudgeWindow {
   judgement: NoteSimulateJudgement;

@@ -1,12 +1,13 @@
 {
   "name": "@haneoka/cassiopeia",
   "version": "0.1.0",
-  "description": "Portable rhythm-game runtime with an Our Notes compatible web renderer",
+  "description": "Portable rhythm-game kernel and typed plugin contracts",
   "keywords": [
     "rhythm-game",
-    "chart",
-    "three.js",
-    "vue"
+    "kernel",
+    "wasm",
+    "native",
+    "plugins"
   ],
   "license": "MPL-2.0",
   "repository": {
@@ -26,7 +27,6 @@
     "dist",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
-    "docs/CASSIOPEIA_CHART_FORMAT.md",
     "README.md"
   ],
   "exports": {
@@ -35,45 +35,29 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./assets": {
-      "types": "./dist/assets-entry.d.ts",
-      "import": "./dist/assets.js",
-      "default": "./dist/assets.js"
-    },
-    "./overview": {
-      "types": "./dist/overview-entry.d.ts",
-      "import": "./dist/overview.js",
-      "default": "./dist/overview.js"
-    },
-    "./parser": {
-      "types": "./dist/parser-entry.d.ts",
-      "import": "./dist/parser.js",
-      "default": "./dist/parser.js"
-    },
-    "./player": {
-      "types": "./dist/player-entry.d.ts",
-      "import": "./dist/player.js",
-      "default": "./dist/player.js"
-    },
     "./wasm": {
       "types": "./dist/wasm/cassiopeia_wasm.d.ts",
       "import": "./dist/wasm/cassiopeia_wasm.js",
       "default": "./dist/wasm/cassiopeia_wasm.js"
     },
     "./wasm/module": "./dist/wasm/cassiopeia_wasm_bg.wasm",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    }
   },
   "scripts": {
     "build": "pnpm run build:web && pnpm run build:wasm",
-    "build:web": "vite build && vue-tsc -p tsconfig.build.json",
+    "build:web": "vite build && tsc -p tsconfig.build.json",
     "build:wasm": "node scripts/build-wasm.mjs",
-    "benchmark": "pnpm run build && node benchmarks/runtime.mjs && node benchmarks/effects.mjs",
-    "test:runtime": "pnpm run build && node tests/runtime-trace.mjs && node tests/title-introduction.mjs && node tests/hud-presentation.mjs && node tests/title-visual-consumption.mjs && node tests/media-clock.mjs && node tests/background-media.mjs && node tests/particle-emission.mjs && node tests/note-mark.mjs && node tests/wasm-boundary.mjs && node tests/vue-frame-clock.mjs",
-    "typecheck": "vue-tsc -p tsconfig.json --noEmit",
+    "test:runtime": "node tests/wasm-boundary.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "rust:check": "cargo check --workspace --all-targets",
     "rust:test": "cargo test --workspace",
-    "check": "pnpm run typecheck && pnpm run test:runtime && pnpm run rust:check && pnpm run rust:test",
-    "prepack": "pnpm run check"
+    "check": "pnpm typecheck && pnpm build && pnpm test:runtime && pnpm rust:check && pnpm rust:test",
+    "prepack": "pnpm run check",
+    "test:native": "cargo test -p haneoka-cassiopeia-native"
   },
   "publishConfig": {
     "access": "public",
@@ -83,20 +67,10 @@
     "node": ">=20"
   },
   "packageManager": "pnpm@11.14.0",
-  "peerDependencies": {
-    "three": ">=0.184.0 <0.185.0",
-    "vue": ">=3.5.0 <4"
-  },
   "devDependencies": {
     "@types/node": "^26.1.0",
-    "@types/three": "^0.184.1",
-    "@vitejs/plugin-vue": "^6.0.7",
-    "@vue/compiler-sfc": "^3.5.39",
-    "three": "0.184.0",
     "typescript": "^6.0.3",
     "vite": "^7.3.6",
-    "vue": "3.5.39",
-    "vue-tsc": "^3.3.6",
     "wasm-pack": "0.15.0"
   }
 }

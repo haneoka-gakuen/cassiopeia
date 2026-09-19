@@ -23,7 +23,12 @@ impl RandomRangeTape {
             return Err(RandomRangeTapeError::InvalidWordCount { words: words.len() });
         }
 
-        for (index, entry) in words.chunks_exact(RANDOM_RANGE_TAPE_STRIDE).enumerate() {
+        for (index, entry) in words
+            .as_chunks::<RANDOM_RANGE_TAPE_STRIDE>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let min_inclusive = entry[0];
             let max_exclusive = entry[1];
             let result = entry[2];

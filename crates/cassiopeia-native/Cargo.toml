@@ -1,0 +1,16 @@
+[package]
+name = "haneoka-cassiopeia-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cassiopeia_native"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+haneoka-cassiopeia-core = { path = "../cassiopeia-core" }
+serde.workspace = true
+serde_json.workspace = true

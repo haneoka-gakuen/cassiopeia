@@ -17,10 +17,10 @@ fn emits_the_versioned_fixture_summary() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        std::fs::read_to_string(root.join("fixtures/conformance/basic.summary.json")).unwrap()
-    );
+    let expected = std::fs::read_to_string(root.join("fixtures/conformance/basic.summary.json"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
 }
 
 #[test]

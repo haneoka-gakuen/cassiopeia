@@ -687,7 +687,10 @@ fn parse_lottery_sources(
 
     let mut common_source =
         Vec::with_capacity(common_words.len() / COMBO_CHARACTER_COMMON_INPUT_STRIDE);
-    for words in common_words.chunks_exact(COMBO_CHARACTER_COMMON_INPUT_STRIDE) {
+    for words in common_words
+        .as_chunks::<COMBO_CHARACTER_COMMON_INPUT_STRIDE>()
+        .0
+    {
         let role = match words[0] {
             1 => ComboCharacterDialogueRole::Call,
             2 => ComboCharacterDialogueRole::Response,
@@ -705,7 +708,10 @@ fn parse_lottery_sources(
 
     let mut fixed_source =
         Vec::with_capacity(fixed_words.len() / COMBO_CHARACTER_FIXED_INPUT_STRIDE);
-    for words in fixed_words.chunks_exact(COMBO_CHARACTER_FIXED_INPUT_STRIDE) {
+    for words in fixed_words
+        .as_chunks::<COMBO_CHARACTER_FIXED_INPUT_STRIDE>()
+        .0
+    {
         fixed_source.push(ComboCharacterFixedPair {
             dialogue_id: words[0],
             first: ComboCharacterVoice {

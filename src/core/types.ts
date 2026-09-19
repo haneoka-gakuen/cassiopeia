@@ -7,7 +7,7 @@ import type {
   NoteLineEaseType,
   NoteOperateType,
   NoteSimulateJudgement,
-} from "./enums";
+} from "./enums.js";
 
 export interface SsBpm {
   t: number;

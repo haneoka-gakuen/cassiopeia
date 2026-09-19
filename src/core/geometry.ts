@@ -1,5 +1,5 @@
-import { NoteLineEaseType } from "./enums";
-import type { ChartNote } from "./types";
+import { NoteLineEaseType } from "./enums.js";
+import type { ChartNote } from "./types.js";
 
 export const LANE_COUNT = 24;
 

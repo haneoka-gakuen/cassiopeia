@@ -2,6 +2,7 @@
 members = [
     "crates/cassiopeia-cli",
     "crates/cassiopeia-core",
+    "crates/cassiopeia-native",
     "crates/cassiopeia-wasm",
 ]
 resolver = "2"

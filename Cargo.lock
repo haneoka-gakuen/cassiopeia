@@ -32,6 +32,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "haneoka-cassiopeia-native"
+version = "0.1.0"
+dependencies = [
+ "haneoka-cassiopeia-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "haneoka-cassiopeia-wasm"
 version = "0.1.0"
 dependencies = [

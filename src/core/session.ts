@@ -5,21 +5,16 @@ import {
   NoteJudgementType,
   NoteOperateType,
   NoteSimulateJudgement,
-} from "./enums";
-import type { ChartMode } from "./enums";
-import {
-  DEFAULT_ASSIST_LEVEL,
-  getAssistJudgementAreaOffset,
-  requireAssistLevel,
-  type AssistLevel,
-} from "./assist";
-import { isTargetLane, LANE_COUNT } from "./geometry";
+} from "./enums.js";
+import type { ChartMode } from "./enums.js";
+import { DEFAULT_ASSIST_LEVEL, getAssistJudgementAreaOffset, requireAssistLevel, type AssistLevel } from "./assist.js";
+import { isTargetLane, LANE_COUNT } from "./geometry.js";
 import {
   isTargetDirectionFlick,
   judge,
   maximumEarlyWindow as calculateMaximumEarlyWindow,
   maximumLateWindow as calculateMaximumLateWindow,
-} from "./judgement";
+} from "./judgement.js";
 import {
   breaksCombo,
   contribution,
@@ -28,7 +23,7 @@ import {
   lifeDamage,
   normalizeScore,
   perfectCeiling,
-} from "./scoring";
+} from "./scoring.js";
 import type {
   ChartCallChangeEvent,
   ChartDocument,
@@ -40,7 +35,7 @@ import type {
   SessionLineState,
   SessionNoteState,
   SessionSnapshot,
-} from "./types";
+} from "./types.js";
 
 export interface SessionOptions {
   mode?: ChartMode;
@@ -97,7 +92,8 @@ export function nativeJudgementAreaOffsetX(
   noteLaneWidth: number,
   assistLevel: AssistLevel = DEFAULT_ASSIST_LEVEL,
 ): number {
-  if (type === JudgementAreaOffsetType.EnumMax) return getAssistJudgementAreaOffset(JudgementAreaOffsetType.Default, noteLaneWidth, assistLevel).x;
+  if (type === JudgementAreaOffsetType.EnumMax)
+    return getAssistJudgementAreaOffset(JudgementAreaOffsetType.Default, noteLaneWidth, assistLevel).x;
   return getAssistJudgementAreaOffset(type, noteLaneWidth, assistLevel).x;
 }
 
@@ -319,10 +315,7 @@ export class ChartSession {
       this.advance(Math.max(this.timeMs, terminalTimeMs));
     } else if (this.mode === "play") {
       const lastNoteTimeMs = this.playableNotes.at(-1)?.timeMs ?? terminalTimeMs;
-      const updateCeilingMs = Math.min(
-        Number.MAX_SAFE_INTEGER,
-        Math.max(terminalTimeMs, lastNoteTimeMs + 2_000),
-      );
+      const updateCeilingMs = Math.min(Number.MAX_SAFE_INTEGER, Math.max(terminalTimeMs, lastNoteTimeMs + 2_000));
       const settleTimeMs = Math.max(this.timeMs, updateCeilingMs);
       this.advance(settleTimeMs);
       if (this.pendingLastTiming.size > 0) this.advance(settleTimeMs);
@@ -356,13 +349,7 @@ export class ChartSession {
       for (const [noteId, note] of this.pendingLastTiming) {
         this.pendingLastTiming.delete(noteId);
         if (!this.processed.has(noteId)) {
-          this.apply(
-            note,
-            NoteSimulateJudgement.Miss,
-            JudgeTiming.LastTiming,
-            2_147_483_647,
-            this.timeMs,
-          );
+          this.apply(note, NoteSimulateJudgement.Miss, JudgeTiming.LastTiming, 2_147_483_647, this.timeMs);
         }
       }
 
@@ -604,11 +591,7 @@ export class ChartSession {
     )
       return -1;
     if (
-      !isTargetLane(
-        note,
-        lane,
-        nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size, this.assistLevel),
-      )
+      !isTargetLane(note, lane, nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size, this.assistLevel))
     )
       return -1;
     if (!this.isAvailableToPointer(note, pointer)) return -1;

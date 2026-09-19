@@ -41,7 +41,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
     serde_json::to_writer_pretty(&mut output, &summary)?;
-    writeln!(output)?;
+    output.write_all(b"\n")?;
     Ok(())
 }
 

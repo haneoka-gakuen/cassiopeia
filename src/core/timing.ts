@@ -1,4 +1,4 @@
-import type { ChartTimeScaleChange, SsBpm, SsSig } from "./types";
+import type { ChartTimeScaleChange, SsBpm, SsSig } from "./types.js";
 
 export const PPQ = 480;
 const MAX_SUPPORTED_BPM = 10_000;

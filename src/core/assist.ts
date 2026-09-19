@@ -1,8 +1,4 @@
-import {
-  JudgementAreaOffsetType,
-  NoteJudgementType,
-  NoteSimulateJudgement,
-} from "./enums";
+import { JudgementAreaOffsetType, NoteJudgementType, NoteSimulateJudgement } from "./enums.js";
 
 export const ASSIST_LEVELS = [0, 1, 2, 3, 4, 5] as const;
 export type AssistLevel = (typeof ASSIST_LEVELS)[number];
@@ -27,12 +23,8 @@ export interface AssistJudgementAreaOffset {
   readonly y: number;
 }
 
-export type AssistTimingTable = Readonly<
-  Partial<Record<NoteJudgementType, readonly AssistJudgeWindow[]>>
->;
-export type AssistAreaOffsetTable = Readonly<
-  Partial<Record<JudgementAreaOffsetType, AssistJudgementAreaOffset>>
->;
+export type AssistTimingTable = Readonly<Partial<Record<NoteJudgementType, readonly AssistJudgeWindow[]>>>;
+export type AssistAreaOffsetTable = Readonly<Partial<Record<JudgementAreaOffsetType, AssistJudgementAreaOffset>>>;
 
 export const SLIDE_OFFSET_MIN_NOTE_WIDTH = 4;
 export const SLIDE_OFFSET_MAX_NOTE_WIDTH = 5;
@@ -106,10 +98,7 @@ function easyWindows(perfectBefore: number, perfectAfter: number): readonly Assi
 }
 
 function traceWindows(perfectBefore: number, perfectAfter: number, missAfter: number): readonly AssistJudgeWindow[] {
-  return windows(
-    window(2, J.Perfect, perfectBefore, perfectAfter),
-    window(6, J.Miss, 58, missAfter),
-  );
+  return windows(window(2, J.Perfect, perfectBefore, perfectAfter), window(6, J.Miss, 58, missAfter));
 }
 
 function timingTable(
@@ -281,8 +270,7 @@ export function getAssistJudgementAreaOffset(
   const maximum = table[A.SlideMax]!;
   const width = Math.fround(noteWidth);
   const span = Math.fround(SLIDE_OFFSET_MAX_NOTE_WIDTH - SLIDE_OFFSET_MIN_NOTE_WIDTH);
-  const unclamped =
-    span === 0 ? 0 : Math.fround(Math.fround(width - SLIDE_OFFSET_MIN_NOTE_WIDTH) / span);
+  const unclamped = span === 0 ? 0 : Math.fround(Math.fround(width - SLIDE_OFFSET_MIN_NOTE_WIDTH) / span);
   const factor = Math.max(0, Math.min(1, unclamped));
   const delta = Math.fround(maximum.x - minimum.x);
   const x = Math.fround(minimum.x + Math.fround(delta * factor));
