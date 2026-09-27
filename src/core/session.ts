@@ -371,7 +371,7 @@ export class ChartSession {
   }
 
   tap(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
-    this.rememberPointer(this.pointerToken(pointerId), lane);
+    this.rememberPointer(this.pointerToken(pointerId), lane, true);
     return this.consume(lane, timeMs, isTap, pointerId);
   }
 
@@ -672,12 +672,12 @@ export class ChartSession {
     return pointerId ?? DEFAULT_POINTER;
   }
 
-  private rememberPointer(pointer: PointerToken, lane: number): void {
+  private rememberPointer(pointer: PointerToken, lane: number, pressed = false): void {
     if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return;
     const state = this.activePointers.get(pointer);
     if (state) {
       state.lane = lane;
-      state.fresh = true;
+      state.fresh ||= pressed;
     } else if (this.activePointers.size < MAX_ACTIVE_POINTERS) {
       this.activePointers.set(pointer, { lane, fresh: true });
     }

@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(runtime.tap(1, 1_000_000, 10_000_000, 7).unwrap(), 1);
         assert_eq!(runtime.event_words.len(), EVENT_STRIDE);
         assert_eq!(runtime.event_words[0], 4_000_000_001);
-        assert_eq!(runtime.event_words[1], Judgement::Just as i8 as i64);
+        assert_eq!(runtime.event_words[1], Judgement::Perfect as i8 as i64);
         assert_eq!(runtime.event_words[3], 0);
         assert_eq!(runtime.event_words[5], 1);
         assert_eq!(runtime.event_words[6], 1);

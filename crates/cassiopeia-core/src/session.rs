@@ -352,14 +352,14 @@ impl RuntimeState {
         self.pointer_states.clear();
     }
 
-    fn remember_pointer(&mut self, pointer: PointerToken, lane: LanePosition) {
+    fn remember_pointer(&mut self, pointer: PointerToken, lane: LanePosition, pressed: bool) {
         if let Some((_, state)) = self
             .pointer_states
             .iter_mut()
             .find(|(candidate, _)| *candidate == pointer)
         {
             state.lane = lane;
-            state.fresh = true;
+            state.fresh |= pressed;
         } else if self.pointer_states.len() < MAX_ACTIVE_POINTERS {
             self.pointer_states
                 .push((pointer, RuntimePointerState { lane, fresh: true }));
@@ -699,7 +699,7 @@ impl GameplaySession {
             self.runtime
                 .as_mut()
                 .expect("runtime presence was checked")
-                .remember_pointer(pointer, input.lane);
+                .remember_pointer(pointer, input.lane, input.action == InputAction::Tap);
         }
 
         let adjusted_time = input
