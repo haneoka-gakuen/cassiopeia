@@ -10,7 +10,6 @@ import type { ChartMode } from "./enums.js";
 import { DEFAULT_ASSIST_LEVEL, getAssistJudgementAreaOffset, requireAssistLevel, type AssistLevel } from "./assist.js";
 import { isTargetLane, LANE_COUNT } from "./geometry.js";
 import {
-  isTargetDirectionFlick,
   judge,
   maximumEarlyWindow as calculateMaximumEarlyWindow,
   maximumLateWindow as calculateMaximumLateWindow,
@@ -50,8 +49,14 @@ export interface InputVector {
 
 type PointerToken = number | typeof DEFAULT_POINTER;
 
+interface ActivePointerState {
+  lane: number;
+  fresh: boolean;
+}
+
 const DEFAULT_POINTER = Symbol("default-pointer");
 const EMPTY_LINE_IDS: readonly number[] = Object.freeze([]);
+const MAX_ACTIVE_POINTERS = 16;
 
 function integerTimeMs(value: number): number {
   return Number.isFinite(value) ? Math.floor(value) : 0;
@@ -130,10 +135,6 @@ function isLineEnd(note: ChartNote): boolean {
   );
 }
 
-function notesOverlap(left: ChartNote, right: ChartNote): boolean {
-  return left.pos <= right.pos + right.size && right.pos <= left.pos + left.size;
-}
-
 export class ChartSession {
   mode: ChartMode;
   private readonly listeners = new Map<keyof ChartSessionEventMap, Set<(event: never) => void>>();
@@ -156,6 +157,8 @@ export class ChartSession {
   private readonly maximumLateMs: number;
   private readonly pointerLines = new Map<PointerToken, number>();
   private readonly linePointers = new Map<number, PointerToken>();
+  /** Current lane for active native fingers; entries are cleared on lift/cancel. */
+  private readonly activePointers = new Map<PointerToken, ActivePointerState>();
   private readonly ceiling: number;
   private readonly reusableSnapshot: SessionSnapshot;
   private readonly executedSkills: Uint8Array;
@@ -354,6 +357,7 @@ export class ChartSession {
       }
 
       const adjustedTimeMs = this.timeMs + this.judgementOffsetMs;
+      this.advanceHeldSlideEnds(adjustedTimeMs);
       for (let index = this.updateCursor; index < this.playableNotes.length; index++) {
         const note = this.playableNotes[index]!;
         if (note.timeMs >= adjustedTimeMs) break;
@@ -367,6 +371,7 @@ export class ChartSession {
   }
 
   tap(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
+    this.rememberPointer(this.pointerToken(pointerId), lane);
     return this.consume(lane, timeMs, isTap, pointerId);
   }
 
@@ -375,15 +380,18 @@ export class ChartSession {
     const result = this.consume(lane, timeMs, isRelease, pointerId);
     // A lifted finger no longer maintains its long-note line even when the
     // release happened before the end judgment window.
+    this.activePointers.delete(pointer);
     this.unbindPointer(pointer);
     return result;
   }
 
-  flick(lane: number, vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
-    return this.consume(lane, timeMs, isFlick, pointerId, vector);
+  flick(lane: number, _vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
+    this.rememberPointer(this.pointerToken(pointerId), lane);
+    return this.consume(lane, timeMs, isFlick, pointerId);
   }
 
   trace(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
+    this.rememberPointer(this.pointerToken(pointerId), lane);
     return this.consume(lane, timeMs, isTrace, pointerId);
   }
 
@@ -416,7 +424,9 @@ export class ChartSession {
   }
 
   cancel(pointerId?: number): void {
-    this.unbindPointer(this.pointerToken(pointerId));
+    const pointer = this.pointerToken(pointerId);
+    this.activePointers.delete(pointer);
+    this.unbindPointer(pointer);
   }
 
   reset(timeMs = 0): SessionSnapshot {
@@ -444,6 +454,7 @@ export class ChartSession {
     this.callChangeCursor = 0;
     this.pointerLines.clear();
     this.linePointers.clear();
+    this.activePointers.clear();
     if (nextTimeMs > 0) this.rebuildTimeline(nextTimeMs);
     if (this.mode === "watch" && nextTimeMs > 0) {
       // Rebuild watch state without replaying every historical judgement into
@@ -515,7 +526,6 @@ export class ChartSession {
     inputTimeMs: number,
     predicate: (note: ChartNote) => boolean,
     pointerId?: number,
-    flickVector?: InputVector,
   ): JudgementEvent | null {
     if (this.mode !== "play") return null;
     if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return null;
@@ -530,14 +540,12 @@ export class ChartSession {
       if (this.playableNotes[middle]!.timeMs < earliestCandidateTime) low = middle + 1;
       else high = middle;
     }
-    let end = this.playableNotes.length;
     let candidate: ChartNote | undefined;
     let candidateDistance = Number.POSITIVE_INFINITY;
     for (let index = low; index < this.playableNotes.length; index++) {
       const note = this.playableNotes[index]!;
       const diff = adjustedTime - note.timeMs;
       if (diff < -this.maximumEarlyMs) {
-        end = index;
         break;
       }
       const distance = this.candidateDistance(note, diff, lane, pointer, predicate);
@@ -549,23 +557,6 @@ export class ChartSession {
     }
     if (!candidate) return null;
 
-    if (flickVector) {
-      // The native caller uses IsTargetDirectionFlick only to select a higher
-      // priority input unit. Mirror that as a tie-break among coincident,
-      // overlapping candidates; a failed direction check never rejects the
-      // fallback candidate or changes its judgment.
-      let directional: ChartNote | undefined;
-      for (let index = low; index < end; index++) {
-        const note = this.playableNotes[index]!;
-        const diff = adjustedTime - note.timeMs;
-        if (this.candidateDistance(note, diff, lane, pointer, predicate) !== candidateDistance) continue;
-        if (note.timeMs !== candidate.timeMs || !notesOverlap(note, candidate)) continue;
-        if (!isTargetDirectionFlick(note.direction, flickVector)) continue;
-        if (!directional) directional = note;
-      }
-      if (directional) candidate = directional;
-    }
-
     const diffMs = adjustedTime - candidate.timeMs;
     const result = judge(candidate.judgementType, diffMs, this.assistLevel);
     const event = this.apply(candidate, result.judgement, result.timing, diffMs, judgedAtMs);
@@ -575,6 +566,38 @@ export class ChartSession {
     }
     if (isLineEnd(candidate)) this.unbindEndingLines(candidate);
     return event;
+  }
+
+  /**
+   * Applies the maintained Press state used by the native updater. A pointer
+   * is not synthesized on the same update that first received its press or
+   * movement; the next update observes the retained lane instead.
+   */
+  private advanceHeldSlideEnds(adjustedTimeMs: number): void {
+    for (const [pointer, state] of this.activePointers) {
+      if (state.fresh) {
+        state.fresh = false;
+        continue;
+      }
+      let candidate: ChartNote | undefined;
+      let candidateDistance = Number.POSITIVE_INFINITY;
+      for (const note of this.playableNotes) {
+        if (!isRelease(note) || this.processed.has(note.id) || this.pendingLastTiming.has(note.id)) continue;
+        const diff = adjustedTimeMs - note.timeMs;
+        if (diff < 0) continue;
+        if (this.candidateDistance(note, diff, state.lane, pointer, isRelease) < 0) continue;
+        const distance = Math.abs(diff);
+        if (distance < candidateDistance) {
+          candidate = note;
+          candidateDistance = distance;
+        }
+      }
+      if (!candidate) continue;
+
+      const result = judge(candidate.judgementType, 0, this.assistLevel);
+      this.apply(candidate, result.judgement, result.timing, 0, candidate.timeMs);
+      this.unbindEndingLines(candidate);
+    }
   }
 
   private candidateDistance(
@@ -594,7 +617,10 @@ export class ChartSession {
       !isTargetLane(note, lane, nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size, this.assistLevel))
     )
       return -1;
-    if (!this.isAvailableToPointer(note, pointer)) return -1;
+    // Native field state is global. An active pointer still needs the lane
+    // hitbox and note availability above, but SlideEnd does not get an extra
+    // successful long-head claim requirement at this gate.
+    if (!this.isAvailableToPointer(note, pointer) && !(isRelease(note) && this.activePointers.has(pointer))) return -1;
     return Math.abs(diff);
   }
 
@@ -644,6 +670,17 @@ export class ChartSession {
 
   private pointerToken(pointerId: number | undefined): PointerToken {
     return pointerId ?? DEFAULT_POINTER;
+  }
+
+  private rememberPointer(pointer: PointerToken, lane: number): void {
+    if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return;
+    const state = this.activePointers.get(pointer);
+    if (state) {
+      state.lane = lane;
+      state.fresh = true;
+    } else if (this.activePointers.size < MAX_ACTIVE_POINTERS) {
+      this.activePointers.set(pointer, { lane, fresh: true });
+    }
   }
 
   private advanceUpdateCursor(): void {

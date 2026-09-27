@@ -8,8 +8,8 @@ use crate::judgement::{
     judge_with_assist, maximum_early_ms_with_assist, maximum_late_ms_with_assist,
 };
 use crate::runtime::{
-    LanePosition, NoteDirection, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1,
-    RuntimeNoteV1, is_target_lane_with_assist, notes_overlap,
+    LanePosition, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1, RuntimeNoteV1,
+    is_target_lane_with_assist,
 };
 use crate::scoring::{
     ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
@@ -17,7 +17,11 @@ use crate::scoring::{
 };
 use crate::timing::TimeMicros;
 
+#[cfg(test)]
+use crate::runtime::NoteDirection;
+
 const REWIND_RESET_TOLERANCE_MICROS: i64 = 5_000;
+const MAX_ACTIVE_POINTERS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,6 +228,12 @@ impl PointerToken {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RuntimePointerState {
+    lane: LanePosition,
+    fresh: bool,
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeNoteState {
     note: RuntimeNoteV1,
@@ -245,6 +255,7 @@ struct RuntimeState {
     lines: Vec<RuntimeLineState>,
     line_owners: Vec<Option<PointerToken>>,
     pointer_bindings: Vec<(PointerToken, usize)>,
+    pointer_states: Vec<(PointerToken, RuntimePointerState)>,
     maximum_early_micros: i64,
     maximum_late_micros: i64,
 }
@@ -329,6 +340,7 @@ impl RuntimeState {
             lines,
             line_owners: vec![None; line_count],
             pointer_bindings: Vec::with_capacity(line_count),
+            pointer_states: Vec::with_capacity(MAX_ACTIVE_POINTERS),
             maximum_early_micros,
             maximum_late_micros,
         }
@@ -337,6 +349,49 @@ impl RuntimeState {
     fn clear_ownership(&mut self) {
         self.line_owners.fill(None);
         self.pointer_bindings.clear();
+        self.pointer_states.clear();
+    }
+
+    fn remember_pointer(&mut self, pointer: PointerToken, lane: LanePosition) {
+        if let Some((_, state)) = self
+            .pointer_states
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == pointer)
+        {
+            state.lane = lane;
+            state.fresh = true;
+        } else if self.pointer_states.len() < MAX_ACTIVE_POINTERS {
+            self.pointer_states
+                .push((pointer, RuntimePointerState { lane, fresh: true }));
+        }
+    }
+
+    fn clear_pointer(&mut self, pointer: PointerToken) {
+        if let Some(index) = self
+            .pointer_states
+            .iter()
+            .position(|(candidate, _)| *candidate == pointer)
+        {
+            self.pointer_states.swap_remove(index);
+        }
+    }
+
+    fn has_pointer_state(&self, pointer: PointerToken) -> bool {
+        self.pointer_states
+            .iter()
+            .any(|(candidate, _)| *candidate == pointer)
+    }
+
+    fn ready_held_pointers(&mut self) -> Vec<(PointerToken, LanePosition)> {
+        let mut ready = Vec::with_capacity(self.pointer_states.len());
+        for (pointer, state) in &mut self.pointer_states {
+            if state.fresh {
+                state.fresh = false;
+            } else {
+                ready.push((*pointer, state.lane));
+            }
+        }
+        ready
     }
 
     fn pointer_line_index(&self, pointer: PointerToken) -> Option<usize> {
@@ -633,12 +688,18 @@ impl GameplaySession {
         }
         let pointer = PointerToken::from_id(input.pointer_id);
         if input.action == InputAction::Cancel {
+            let runtime = self.runtime.as_mut().expect("runtime presence was checked");
+            runtime.clear_pointer(pointer);
+            runtime.unbind_pointer(pointer);
+            self.last_input_sequence = Some(input.sequence);
+            return Ok(None);
+        }
+
+        if input.action != InputAction::Release {
             self.runtime
                 .as_mut()
                 .expect("runtime presence was checked")
-                .unbind_pointer(pointer);
-            self.last_input_sequence = Some(input.sequence);
-            return Ok(None);
+                .remember_pointer(pointer, input.lane);
         }
 
         let adjusted_time = input
@@ -651,10 +712,9 @@ impl GameplaySession {
             self.select_runtime_candidate(input.lane, adjusted_time, pointer, Some(input.action))?;
         let Some(index) = selection else {
             if input.action == InputAction::Release {
-                self.runtime
-                    .as_mut()
-                    .expect("runtime presence was checked")
-                    .unbind_pointer(pointer);
+                let runtime = self.runtime.as_mut().expect("runtime presence was checked");
+                runtime.clear_pointer(pointer);
+                runtime.unbind_pointer(pointer);
             }
             self.last_input_sequence = Some(input.sequence);
             return Ok(None);
@@ -687,6 +747,7 @@ impl GameplaySession {
             runtime.unbind_ending_lines(index);
         }
         if input.action == InputAction::Release {
+            runtime.clear_pointer(pointer);
             runtime.unbind_pointer(pointer);
         }
         self.last_input_sequence = Some(input.sequence);
@@ -751,7 +812,6 @@ impl GameplaySession {
             }
         }
 
-        let mut end = runtime.notes.len();
         let mut candidate = None;
         let mut candidate_distance = i64::MAX;
         for index in low..runtime.notes.len() {
@@ -761,7 +821,6 @@ impl GameplaySession {
                 .checked_sub(note.time.0)
                 .ok_or(SessionError::TimeOverflow)?;
             if difference < -runtime.maximum_early_micros {
-                end = index;
                 break;
             }
             let Some(distance) =
@@ -779,28 +838,6 @@ impl GameplaySession {
         let Some(fallback) = candidate else {
             return Ok(None);
         };
-        let Some(InputAction::Flick { movement }) = action else {
-            return Ok(Some(fallback));
-        };
-        for index in low..end {
-            let note = &runtime.notes[index].note;
-            let difference = adjusted_time
-                .0
-                .checked_sub(note.time.0)
-                .ok_or(SessionError::TimeOverflow)?;
-            if self.runtime_candidate_distance(runtime, index, difference, lane, pointer, action)
-                != Some(candidate_distance)
-            {
-                continue;
-            }
-            if note.time != runtime.notes[fallback].note.time
-                || !notes_overlap(note, &runtime.notes[fallback].note)
-                || !is_target_direction_flick(note.direction, movement)
-            {
-                continue;
-            }
-            return Ok(Some(index));
-        }
         Ok(Some(fallback))
     }
 
@@ -823,7 +860,9 @@ impl GameplaySession {
                 TimeMicros(difference),
             )
             || !is_target_lane_with_assist(self.assist_level, note, lane)
-            || !runtime.is_available_to_pointer(index, pointer)
+            || (!runtime.is_available_to_pointer(index, pointer)
+                && !(note.operate_type == NoteOperateType::SlideEnd
+                    && runtime.has_pointer_state(pointer)))
         {
             return None;
         }
@@ -951,6 +990,7 @@ impl GameplaySession {
                     .checked_add(self.judgement_offset.0)
                     .map(TimeMicros)
                     .ok_or(SessionError::TimeOverflow)?;
+                events.extend(self.advance_held_slide_ends(adjusted_time)?);
                 for index in self.update_cursor..self.notes.len() {
                     if self.notes[index].time >= adjusted_time {
                         break;
@@ -973,6 +1013,106 @@ impl GameplaySession {
             SessionMode::Chart => {}
         }
         Ok(events)
+    }
+
+    /// Applies maintained Press state without inventing a fresh press event.
+    /// The held path uses the current lane hitbox and grades at exact note
+    /// time; an explicit Release continues to use its actual input time.
+    fn advance_held_slide_ends(
+        &mut self,
+        adjusted_time: TimeMicros,
+    ) -> Result<Vec<JudgementEvent>, SessionError> {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let pointers = runtime.ready_held_pointers();
+        let mut events = Vec::new();
+        for (pointer, lane) in pointers {
+            let Some(index) = self.select_runtime_held_candidate(lane, adjusted_time, pointer)?
+            else {
+                continue;
+            };
+            let (result, note_time, line_end) = {
+                let runtime = self.runtime.as_ref().expect("runtime presence was checked");
+                let note = &runtime.notes[index].note;
+                (
+                    judge_with_assist(self.assist_level, note.judgement_type, TimeMicros(0)),
+                    note.time,
+                    is_line_end(note.operate_type),
+                )
+            };
+            let event = self.apply_judgement(index, result, TimeMicros(0), note_time, None)?;
+            if line_end {
+                self.runtime
+                    .as_mut()
+                    .expect("runtime presence was checked")
+                    .unbind_ending_lines(index);
+            }
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn select_runtime_held_candidate(
+        &self,
+        lane: LanePosition,
+        adjusted_time: TimeMicros,
+        _pointer: PointerToken,
+    ) -> Result<Option<usize>, SessionError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SessionError::RuntimeUnavailable)?;
+        if !runtime.has_pointer_state(_pointer) {
+            return Ok(None);
+        }
+        let earliest_candidate = adjusted_time
+            .0
+            .checked_sub(runtime.maximum_late_micros)
+            .ok_or(SessionError::TimeOverflow)?;
+        let mut low = 0;
+        let mut high = runtime.notes.len();
+        while low < high {
+            let middle = (low + high) / 2;
+            if runtime.notes[middle].note.time.0 < earliest_candidate {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+
+        let mut candidate = None;
+        let mut candidate_distance = i64::MAX;
+        for index in low..runtime.notes.len() {
+            let note = &runtime.notes[index].note;
+            let difference = adjusted_time
+                .0
+                .checked_sub(note.time.0)
+                .ok_or(SessionError::TimeOverflow)?;
+            if difference < 0 {
+                break;
+            }
+            // The native maintained field is global; do not add a successful
+            // long-head requirement to this ordinary SlideEnd gate.
+            if note.operate_type != NoteOperateType::SlideEnd
+                || self.processed[index]
+                || self.pending_last_timing[index]
+                || !is_within_window_with_assist(
+                    self.assist_level,
+                    note.judgement_type,
+                    TimeMicros(difference),
+                )
+                || !is_target_lane_with_assist(self.assist_level, note, lane)
+            {
+                continue;
+            }
+            let distance = difference.checked_abs().ok_or(SessionError::TimeOverflow)?;
+            if distance < candidate_distance {
+                candidate = Some(index);
+                candidate_distance = distance;
+            }
+        }
+        Ok(candidate)
     }
 
     /// Settles exact-tail and post-music note states without skipping the
@@ -1207,13 +1347,6 @@ const fn is_line_end(note_type: NoteOperateType) -> bool {
     )
 }
 
-/// The current compatibility profile uses 180 degrees and compares the unit
-/// dot product against `atan(pi)`, which is greater than one. Directional
-/// candidates therefore cannot satisfy it; Normal remains unconditional.
-const fn is_target_direction_flick(direction: NoteDirection, _movement: InputVector) -> bool {
-    matches!(direction, NoteDirection::Normal)
-}
-
 const fn is_flick(note_type: NoteOperateType) -> bool {
     matches!(
         note_type,
@@ -1386,7 +1519,7 @@ mod tests {
         assert!(session.snapshot().full_combo);
 
         let great = session
-            .apply_input(&input(2, "great", 2_043_000))
+            .apply_input(&input(2, "great", 2_083_000))
             .unwrap()
             .unwrap();
         assert_eq!(great.judgement, Judgement::Great);
@@ -1396,7 +1529,7 @@ mod tests {
         assert!(session.snapshot().full_combo);
 
         let good = session
-            .apply_input(&input(3, "good", 3_084_000))
+            .apply_input(&input(3, "good", 3_100_000))
             .unwrap()
             .unwrap();
         assert_eq!(good.judgement, Judgement::Good);
@@ -1405,7 +1538,7 @@ mod tests {
         assert!(session.snapshot().full_combo);
 
         let bad = session
-            .apply_input(&input(4, "bad", 4_109_000))
+            .apply_input(&input(4, "bad", 4_125_000))
             .unwrap()
             .unwrap();
         assert_eq!(bad.judgement, Judgement::Bad);
@@ -1413,7 +1546,7 @@ mod tests {
         assert!(!session.snapshot().full_combo);
 
         let miss = session
-            .apply_input(&input(5, "miss", 5_126_000))
+            .apply_input(&input(5, "miss", 5_130_000))
             .unwrap()
             .unwrap();
         assert_eq!(miss.judgement, Judgement::Miss);
@@ -1893,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_flick_direction_is_a_stable_tie_break_not_a_rejection() {
+    fn runtime_flick_direction_is_ignored_and_traversal_order_is_stable() {
         let mut left = runtime_note(
             9,
             1_000_000,
@@ -1927,7 +2060,7 @@ mod tests {
             .consume_runtime_input(&runtime_input(1, 1_000_000, 10_000_000, None, action))
             .unwrap()
             .unwrap();
-        assert_eq!(event.note_id, "2");
+        assert_eq!(event.note_id, "9");
 
         let mut session = GameplaySession::from_runtime_chart(
             runtime_chart(vec![left], vec![]),

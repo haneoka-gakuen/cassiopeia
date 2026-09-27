@@ -48,8 +48,8 @@ function windows(...entries: AssistJudgeWindow[]): readonly AssistJudgeWindow[] 
 
 function normalWindows(good: number, bad: number, miss: number): readonly AssistJudgeWindow[] {
   return windows(
-    window(1, J.Just, 1, 1),
-    window(2, J.Perfect, 42, 42),
+    window(1, J.Just, 2, 2),
+    window(2, J.Perfect, 50, 50),
     window(3, J.Great, 83, 83),
     window(4, J.Good, good, good),
     window(5, J.Bad, bad, bad),
@@ -59,13 +59,14 @@ function normalWindows(good: number, bad: number, miss: number): readonly Assist
 
 function flickWindows(
   perfectBefore: number,
+  perfectAfter: number,
   goodAfter: number,
   badAfter: number,
   missAfter: number,
 ): readonly AssistJudgeWindow[] {
   return windows(
-    window(1, J.Just, 1, 1),
-    window(2, J.Perfect, perfectBefore, 58),
+    window(1, J.Just, 2, 2),
+    window(2, J.Perfect, perfectBefore, perfectAfter),
     window(3, J.Great, 0, 83),
     window(4, J.Good, 0, goodAfter),
     window(5, J.Bad, 0, badAfter),
@@ -74,36 +75,35 @@ function flickWindows(
 }
 
 function slideEndWindows(
-  goodBefore: number,
   goodAfter: number,
-  badBefore: number,
   badAfter: number,
   miss: number,
 ): readonly AssistJudgeWindow[] {
   return windows(
-    window(2, J.Perfect, 42, 66),
-    window(3, J.Great, 99, 166),
-    window(4, J.Good, goodBefore, goodAfter),
-    window(5, J.Bad, badBefore, badAfter),
-    window(6, J.Miss, miss, miss),
+    window(2, J.Perfect, 84, 66),
+    window(3, J.Great, 0, 166),
+    window(4, J.Good, 0, goodAfter),
+    window(5, J.Bad, 0, badAfter),
+    window(6, J.Miss, 0, miss),
   );
 }
 
-function easyWindows(perfectBefore: number, perfectAfter: number): readonly AssistJudgeWindow[] {
+function easyWindows(perfect: number, missAfter: number): readonly AssistJudgeWindow[] {
   return windows(
-    window(1, J.Just, 1, 1),
-    window(2, J.Perfect, perfectBefore, perfectAfter),
-    window(6, J.Miss, 58, 130),
+    window(1, J.Just, 2, 2),
+    window(2, J.Perfect, perfect, perfect),
+    window(6, J.Miss, 58, missAfter),
   );
 }
 
-function traceWindows(perfectBefore: number, perfectAfter: number, missAfter: number): readonly AssistJudgeWindow[] {
-  return windows(window(2, J.Perfect, perfectBefore, perfectAfter), window(6, J.Miss, 58, missAfter));
+function traceWindows(perfect: number, missAfter: number): readonly AssistJudgeWindow[] {
+  return windows(window(2, J.Perfect, perfect, perfect), window(6, J.Miss, 0, missAfter));
 }
 
 function timingTable(
   normal: readonly AssistJudgeWindow[],
   flick: readonly AssistJudgeWindow[],
+  slideEndFlick: readonly AssistJudgeWindow[],
   slideEnd: readonly AssistJudgeWindow[],
   easy: readonly AssistJudgeWindow[],
   trace: readonly AssistJudgeWindow[],
@@ -115,56 +115,64 @@ function timingTable(
     [N.Flick]: flick,
     [N.SlideBegin]: slideBegin,
     [N.SlideEnd]: slideEnd,
-    [N.SlideEndFlick]: flick,
+    [N.SlideEndFlick]: slideEndFlick,
     [N.SlideBeginEasy]: easy,
     [N.Trace]: trace,
     [N.SlideEndTrace]: trace,
   });
 }
 
-const NORMAL_0 = normalWindows(108, 125, 130);
+const NORMAL_0 = normalWindows(100, 125, 130);
 const NORMAL_1 = normalWindows(111, 128, 133);
 const NORMAL_2 = normalWindows(114, 132, 137);
 const NORMAL_3 = normalWindows(118, 137, 143);
 const NORMAL_4 = normalWindows(124, 143, 149);
 const NORMAL_5 = normalWindows(129, 150, 156);
 
-const FLICK_0 = flickWindows(83, 108, 125, 130);
-const FLICK_1 = flickWindows(85, 111, 128, 133);
-const FLICK_2 = flickWindows(87, 114, 132, 137);
-const FLICK_3 = flickWindows(89, 118, 137, 143);
-const FLICK_4 = flickWindows(91, 124, 143, 149);
-const FLICK_5 = flickWindows(93, 129, 150, 156);
+const FLICK_0 = flickWindows(83, 67, 117, 125, 130);
+const FLICK_1 = flickWindows(88, 67, 120, 130, 135);
+const FLICK_2 = flickWindows(93, 67, 124, 135, 140);
+const FLICK_3 = flickWindows(98, 67, 128, 140, 146);
+const FLICK_4 = flickWindows(103, 67, 133, 146, 152);
+const FLICK_5 = flickWindows(108, 67, 139, 153, 159);
 
-const SLIDE_END_0 = slideEndWindows(124, 191, 141, 208, 150);
-const SLIDE_END_1 = slideEndWindows(128, 196, 145, 214, 154);
-const SLIDE_END_2 = slideEndWindows(132, 202, 150, 220, 159);
-const SLIDE_END_3 = slideEndWindows(137, 210, 155, 229, 165);
-const SLIDE_END_4 = slideEndWindows(143, 219, 162, 239, 172);
-const SLIDE_END_5 = slideEndWindows(149, 229, 169, 249, 180);
+const SLIDE_END_0 = slideEndWindows(191, 208, 150);
+const SLIDE_END_1 = slideEndWindows(196, 214, 216);
+const SLIDE_END_2 = slideEndWindows(202, 220, 222);
+const SLIDE_END_3 = slideEndWindows(210, 229, 231);
+const SLIDE_END_4 = slideEndWindows(219, 239, 241);
+const SLIDE_END_5 = slideEndWindows(229, 249, 251);
 
-const EASY_0 = easyWindows(58, 66);
-const EASY_1 = easyWindows(60, 68);
-const EASY_2 = easyWindows(62, 66);
-const EASY_3 = easyWindows(64, 66);
-const EASY_4 = easyWindows(66, 66);
-const EASY_5 = easyWindows(68, 66);
+const EASY_0 = easyWindows(67, 130);
+const EASY_1 = easyWindows(72, 133);
+const EASY_2 = easyWindows(77, 137);
+const EASY_3 = easyWindows(82, 143);
+const EASY_4 = easyWindows(87, 149);
+const EASY_5 = easyWindows(92, 156);
 
-const TRACE_0 = traceWindows(58, 66, 130);
-const TRACE_1 = traceWindows(60, 68, 133);
-const TRACE_2 = traceWindows(62, 66, 137);
-const TRACE_3 = traceWindows(64, 66, 143);
-const TRACE_4 = traceWindows(66, 66, 149);
-const TRACE_5 = traceWindows(68, 66, 156);
+const TRACE_0 = traceWindows(67, 130);
+const TRACE_1 = traceWindows(72, 133);
+const TRACE_2 = traceWindows(77, 137);
+const TRACE_3 = traceWindows(82, 143);
+const TRACE_4 = traceWindows(87, 149);
+const TRACE_5 = traceWindows(92, 156);
+
+// Type 12 keeps the current native level-3 Perfect late edge at +58 ms.
+const SLIDE_END_FLICK_0 = FLICK_0;
+const SLIDE_END_FLICK_1 = FLICK_1;
+const SLIDE_END_FLICK_2 = FLICK_2;
+const SLIDE_END_FLICK_3 = flickWindows(98, 58, 128, 140, 146);
+const SLIDE_END_FLICK_4 = FLICK_4;
+const SLIDE_END_FLICK_5 = FLICK_5;
 
 /** Six immutable timing profiles, indexed by {@link AssistLevel}. */
 export const ASSIST_TIMING_TABLES: readonly AssistTimingTable[] = Object.freeze([
-  timingTable(NORMAL_0, FLICK_0, SLIDE_END_0, EASY_0, TRACE_0),
-  timingTable(NORMAL_1, FLICK_1, SLIDE_END_1, EASY_1, TRACE_1),
-  timingTable(NORMAL_2, FLICK_2, SLIDE_END_2, EASY_2, TRACE_2),
-  timingTable(NORMAL_3, FLICK_3, SLIDE_END_3, EASY_3, TRACE_3),
-  timingTable(NORMAL_4, FLICK_4, SLIDE_END_4, EASY_4, TRACE_4),
-  timingTable(NORMAL_5, FLICK_5, SLIDE_END_5, EASY_5, TRACE_5, NORMAL_0),
+  timingTable(NORMAL_0, FLICK_0, SLIDE_END_FLICK_0, SLIDE_END_0, EASY_0, TRACE_0),
+  timingTable(NORMAL_1, FLICK_1, SLIDE_END_FLICK_1, SLIDE_END_1, EASY_1, TRACE_1),
+  timingTable(NORMAL_2, FLICK_2, SLIDE_END_FLICK_2, SLIDE_END_2, EASY_2, TRACE_2),
+  timingTable(NORMAL_3, FLICK_3, SLIDE_END_FLICK_3, SLIDE_END_3, EASY_3, TRACE_3),
+  timingTable(NORMAL_4, FLICK_4, SLIDE_END_FLICK_4, SLIDE_END_4, EASY_4, TRACE_4),
+  timingTable(NORMAL_5, FLICK_5, SLIDE_END_FLICK_5, SLIDE_END_5, EASY_5, TRACE_5),
 ]);
 
 function offset(x: number, y = 9999): AssistJudgementAreaOffset {

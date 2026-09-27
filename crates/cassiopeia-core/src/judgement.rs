@@ -276,8 +276,14 @@ fn judge_windows(windows: &[JudgementWindow], difference: TimeMicros) -> JudgeRe
         if difference.0 < -early || difference.0 > late {
             continue;
         }
+        // Just remains in the raw native timing table for future Gekisou-only
+        // dispatch. Ordinary play currently resolves that row as Perfect.
+        let judgement = match window.judgement {
+            Judgement::Just => Judgement::Perfect,
+            judgement => judgement,
+        };
         return JudgeResult {
-            judgement: window.judgement,
+            judgement,
             timing: timing_for_difference(difference),
         };
     }
@@ -306,7 +312,7 @@ mod tests {
         let profile = JudgementProfile::our_notes_normal();
         assert_eq!(profile.judge(-42).judgement, Judgement::Perfect);
         assert_eq!(profile.judge(42).judgement, Judgement::Perfect);
-        assert_eq!(profile.judge(43).judgement, Judgement::Great);
+        assert_eq!(profile.judge(51).judgement, Judgement::Great);
         assert_eq!(profile.judge(130).judgement, Judgement::Miss);
         assert_eq!(profile.judge(131).timing, JudgeTiming::OutOfTime);
     }
@@ -339,7 +345,7 @@ mod tests {
             Judgement::Perfect
         );
         assert_eq!(
-            judge(NoteJudgementType::Flick, TimeMicros(58_001)).judgement,
+            judge(NoteJudgementType::Flick, TimeMicros(67_001)).judgement,
             Judgement::Great
         );
         assert_eq!(
@@ -372,7 +378,7 @@ mod tests {
     fn easy_and_trace_profiles_have_distinct_exact_results() {
         assert_eq!(
             judge(NoteJudgementType::EasyNormal, TimeMicros(0)).judgement,
-            Judgement::Just
+            Judgement::Perfect
         );
         assert_eq!(
             judge(NoteJudgementType::Trace, TimeMicros(0)).judgement,
@@ -408,12 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn level_five_slide_begin_keeps_its_non_monotonic_profile() {
+    fn slide_begin_profiles_use_the_current_assist_boundaries() {
         assert_eq!(
             judge_with_assist(
                 AssistLevel::Level4,
                 NoteJudgementType::SlideBegin,
-                TimeMicros(109_000)
+                TimeMicros(124_000)
             )
             .judgement,
             Judgement::Good
@@ -422,14 +428,14 @@ mod tests {
             judge_with_assist(
                 AssistLevel::Level5,
                 NoteJudgementType::SlideBegin,
-                TimeMicros(109_000)
+                TimeMicros(129_000)
             )
             .judgement,
-            Judgement::Bad
+            Judgement::Good
         );
         assert_eq!(
             maximum_late_ms_with_assist(AssistLevel::Level5, NoteJudgementType::SlideBegin),
-            130
+            156
         );
     }
 
