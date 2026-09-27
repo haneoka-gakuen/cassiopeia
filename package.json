@@ -57,7 +57,9 @@
     "rust:test": "cargo test --workspace",
     "check": "pnpm typecheck && pnpm build && pnpm test:runtime && pnpm rust:check && pnpm rust:test",
     "prepack": "pnpm run check",
-    "test:native": "cargo test -p haneoka-cassiopeia-native"
+    "test:native": "cargo test -p haneoka-cassiopeia-native",
+    "format": "prettier --write . --ignore-unknown",
+    "format:check": "prettier --check . --ignore-unknown"
   },
   "publishConfig": {
     "access": "public",
@@ -71,6 +73,7 @@
     "@types/node": "^26.1.0",
     "typescript": "^6.0.3",
     "vite": "^7.3.6",
-    "wasm-pack": "0.15.0"
+    "wasm-pack": "0.15.0",
+    "prettier": "3.7.4"
   }
 }
