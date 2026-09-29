@@ -1,4 +1,4 @@
-import {
+import { NoteDirection,
   FeverState,
   JudgementAreaOffsetType,
   JudgeTiming,
@@ -57,6 +57,9 @@ interface ActivePointerState {
 const DEFAULT_POINTER = Symbol("default-pointer");
 const EMPTY_LINE_IDS: readonly number[] = Object.freeze([]);
 const MAX_ACTIVE_POINTERS = 16;
+
+/** cos of the native DirectionFlickAngle cone around the target axis. */
+const DIRECTION_FLICK_COS = Math.cos((45 * Math.PI) / 180);
 
 function integerTimeMs(value: number): number {
   return Number.isFinite(value) ? Math.floor(value) : 0;
@@ -358,6 +361,7 @@ export class ChartSession {
 
       const adjustedTimeMs = this.timeMs + this.judgementOffsetMs;
       this.advanceHeldSlideEnds(adjustedTimeMs);
+      this.advanceHeldTicks(adjustedTimeMs);
       for (let index = this.updateCursor; index < this.playableNotes.length; index++) {
         const note = this.playableNotes[index]!;
         if (note.timeMs >= adjustedTimeMs) break;
@@ -385,9 +389,23 @@ export class ChartSession {
     return result;
   }
 
-  flick(lane: number, _vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
+  flick(lane: number, vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
     this.rememberPointer(this.pointerToken(pointerId), lane);
-    return this.consume(lane, timeMs, isFlick, pointerId);
+    // IsTargetDirectionFlick: a directional flick only accepts swipes within
+    // 45 degrees of its horizontal axis; Normal accepts any direction. A
+    // direction-mismatched swipe selects no unit, so the note keeps waiting.
+    const length = Math.hypot(vector.dx, vector.dy);
+    return this.consume(
+      lane,
+      timeMs,
+      (note) => {
+        if (!isFlick(note)) return false;
+        if (note.direction === NoteDirection.Normal || length === 0) return true;
+        const axis = ((note.direction === NoteDirection.Left ? -vector.dx : vector.dx) / length) as number;
+        return axis >= DIRECTION_FLICK_COS;
+      },
+      pointerId,
+    );
   }
 
   trace(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
@@ -573,6 +591,35 @@ export class ChartSession {
    * is not synthesized on the same update that first received its press or
    * movement; the next update observes the retained lane instead.
    */
+  /**
+   * Trace ticks judge at their own note time while any held (non-fresh)
+   * pointer stays inside the tick's extended lanes (IsJudgementTraceNote in
+   * the Just/After states requires only Press), so a stationary hold follows
+   * a slide without emitting a movement event per tick.
+   */
+  private advanceHeldTicks(adjustedTimeMs: number): void {
+    for (const [pointer, state] of this.activePointers) {
+      if (state.fresh) continue;
+      let candidate: ChartNote | undefined;
+      let candidateDistance = Number.POSITIVE_INFINITY;
+      for (const note of this.playableNotes) {
+        if (!isTrace(note) || this.processed.has(note.id) || this.pendingLastTiming.has(note.id)) continue;
+        const diff = adjustedTimeMs - note.timeMs;
+        if (diff < 0) continue;
+        if (this.candidateDistance(note, diff, state.lane, pointer, isTrace) < 0) continue;
+        const distance = Math.abs(diff);
+        if (distance < candidateDistance) {
+          candidate = note;
+          candidateDistance = distance;
+        }
+      }
+      if (!candidate) continue;
+
+      const result = judge(candidate.judgementType, 0, this.assistLevel);
+      this.apply(candidate, result.judgement, result.timing, 0, candidate.timeMs);
+    }
+  }
+
   private advanceHeldSlideEnds(adjustedTimeMs: number): void {
     for (const [pointer, state] of this.activePointers) {
       if (state.fresh) {
