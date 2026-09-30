@@ -8,6 +8,7 @@ export * from "./core/livePerformance.js";
 export * from "./core/nativeContract.js";
 export * from "./core/scoring.js";
 export * from "./core/session.js";
+export * from "./core/staticChartOverview.js";
 export * from "./core/timing.js";
 export * from "./core/types.js";
 export * from "./plugin.js";
