@@ -1,4 +1,4 @@
-import { NoteDirection,
+import {
   FeverState,
   JudgementAreaOffsetType,
   JudgeTiming,
@@ -57,9 +57,6 @@ interface ActivePointerState {
 const DEFAULT_POINTER = Symbol("default-pointer");
 const EMPTY_LINE_IDS: readonly number[] = Object.freeze([]);
 const MAX_ACTIVE_POINTERS = 16;
-
-/** cos of the native DirectionFlickAngle cone around the target axis. */
-const DIRECTION_FLICK_COS = Math.cos((45 * Math.PI) / 180);
 
 function integerTimeMs(value: number): number {
   return Number.isFinite(value) ? Math.floor(value) : 0;
@@ -123,7 +120,7 @@ function isTrace(note: ChartNote): boolean {
 }
 
 function isTap(note: ChartNote): boolean {
-  return !isFlick(note) && !isRelease(note) && !isTrace(note);
+  return !isFlick(note) && !isRelease(note);
 }
 
 function acceptsAnyInput(_note: ChartNote): boolean {
@@ -300,7 +297,7 @@ export class ChartSession {
   }
 
   /**
-   * Allocation-free rAF variant. The returned object is overwritten by the
+   * Snapshot-reusing rAF variant. The returned object is overwritten by the
    * next reusable update and therefore must not be retained as history.
    */
   updateReusable(timeMs: number): SessionSnapshot {
@@ -360,8 +357,9 @@ export class ChartSession {
       }
 
       const adjustedTimeMs = this.timeMs + this.judgementOffsetMs;
-      this.advanceHeldSlideEnds(adjustedTimeMs);
-      this.advanceHeldTicks(adjustedTimeMs);
+      const heldPointers = this.readyHeldPointers();
+      this.advanceHeldSlideEnds(adjustedTimeMs, heldPointers);
+      this.advanceHeldTicks(adjustedTimeMs, heldPointers);
       for (let index = this.updateCursor; index < this.playableNotes.length; index++) {
         const note = this.playableNotes[index]!;
         if (note.timeMs >= adjustedTimeMs) break;
@@ -381,31 +379,19 @@ export class ChartSession {
 
   release(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
     const pointer = this.pointerToken(pointerId);
-    const result = this.consume(lane, timeMs, isRelease, pointerId);
     // A lifted finger no longer maintains its long-note line even when the
-    // release happened before the end judgment window.
+    // release happened before the end judgment window. Clear it before
+    // notifying listeners so a callback's new press survives this release.
     this.activePointers.delete(pointer);
     this.unbindPointer(pointer);
-    return result;
+    return this.consume(lane, timeMs, (note) => isRelease(note) || isTrace(note), pointerId, true);
   }
 
-  flick(lane: number, vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
+  flick(lane: number, _vector: InputVector, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
     this.rememberPointer(this.pointerToken(pointerId), lane);
-    // IsTargetDirectionFlick: a directional flick only accepts swipes within
-    // 45 degrees of its horizontal axis; Normal accepts any direction. A
-    // direction-mismatched swipe selects no unit, so the note keeps waiting.
-    const length = Math.hypot(vector.dx, vector.dy);
-    return this.consume(
-      lane,
-      timeMs,
-      (note) => {
-        if (!isFlick(note)) return false;
-        if (note.direction === NoteDirection.Normal || length === 0) return true;
-        const axis = ((note.direction === NoteDirection.Left ? -vector.dx : vector.dx) / length) as number;
-        return axis >= DIRECTION_FLICK_COS;
-      },
-      pointerId,
-    );
+    // Native FlickUpdater records the vector but accepts by scalar lane and
+    // timing only. Chart direction remains available to the renderer.
+    return this.consume(lane, timeMs, isFlick, pointerId);
   }
 
   trace(lane: number, timeMs = this.timeMs, pointerId?: number): JudgementEvent | null {
@@ -544,6 +530,7 @@ export class ChartSession {
     inputTimeMs: number,
     predicate: (note: ChartNote) => boolean,
     pointerId?: number,
+    releaseInput = false,
   ): JudgementEvent | null {
     if (this.mode !== "play") return null;
     if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return null;
@@ -566,6 +553,9 @@ export class ChartSession {
       if (diff < -this.maximumEarlyMs) {
         break;
       }
+      // A Press before a Trace reserves that input; its maintained state
+      // judges at the target. PressExit can judge early using the event time.
+      if (isTrace(note) && !releaseInput && diff < 0) continue;
       const distance = this.candidateDistance(note, diff, lane, pointer, predicate);
       if (distance < 0) continue;
       if (distance < candidateDistance) {
@@ -575,31 +565,42 @@ export class ChartSession {
     }
     if (!candidate) return null;
 
-    const diffMs = adjustedTime - candidate.timeMs;
+    const tracePress = isTrace(candidate) && !releaseInput;
+    const diffMs = tracePress ? 0 : adjustedTime - candidate.timeMs;
     const result = judge(candidate.judgementType, diffMs, this.assistLevel);
-    const event = this.apply(candidate, result.judgement, result.timing, diffMs, judgedAtMs);
     const startLineId = this.availableStartLine(candidate, pointer);
-    if (startLineId !== null && result.judgement !== NoteSimulateJudgement.Miss) {
+    // Commit ownership with the judgement before listeners can cancel,
+    // reset, or supply another input. Their newer intent must stay final.
+    if (!releaseInput && startLineId !== null && result.judgement !== NoteSimulateJudgement.Miss) {
       this.bindPointer(pointer, startLineId);
     }
-    if (isLineEnd(candidate)) this.unbindEndingLines(candidate);
-    return event;
+    return this.apply(candidate, result.judgement, result.timing, diffMs, tracePress ? candidate.timeMs : judgedAtMs);
+  }
+
+  /** Capture maintained Press once for every held-note phase in this update. */
+  private readyHeldPointers(): ReadonlyArray<readonly [PointerToken, ActivePointerState]> {
+    const ready: Array<readonly [PointerToken, ActivePointerState]> = [];
+    for (const entry of this.activePointers) {
+      if (entry[1].fresh) entry[1].fresh = false;
+      else ready.push(entry);
+    }
+    return ready;
   }
 
   /**
-   * Applies the maintained Press state used by the native updater. A pointer
-   * is not synthesized on the same update that first received its press or
-   * movement; the next update observes the retained lane instead.
-   */
-  /**
    * Trace ticks judge at their own note time while any held (non-fresh)
-   * pointer stays inside the tick's extended lanes (IsJudgementTraceNote in
-   * the Just/After states requires only Press), so a stationary hold follows
+   * pointer stays inside the tick's extended lanes (IsJudgementTraceNote
+   * accepts maintained Press in Just/After), so a stationary hold follows
    * a slide without emitting a movement event per tick.
    */
-  private advanceHeldTicks(adjustedTimeMs: number): void {
-    for (const [pointer, state] of this.activePointers) {
-      if (state.fresh) continue;
+  private advanceHeldTicks(
+    adjustedTimeMs: number,
+    heldPointers: ReadonlyArray<readonly [PointerToken, ActivePointerState]>,
+  ): void {
+    for (const [pointer, state] of heldPointers) {
+      // Judgement listeners can cancel input or reset the session. A captured
+      // Press belongs only to the pointer state that is still active.
+      if (state.fresh || this.activePointers.get(pointer) !== state) continue;
       let candidate: ChartNote | undefined;
       let candidateDistance = Number.POSITIVE_INFINITY;
       for (const note of this.playableNotes) {
@@ -620,12 +621,12 @@ export class ChartSession {
     }
   }
 
-  private advanceHeldSlideEnds(adjustedTimeMs: number): void {
-    for (const [pointer, state] of this.activePointers) {
-      if (state.fresh) {
-        state.fresh = false;
-        continue;
-      }
+  private advanceHeldSlideEnds(
+    adjustedTimeMs: number,
+    heldPointers: ReadonlyArray<readonly [PointerToken, ActivePointerState]>,
+  ): void {
+    for (const [pointer, state] of heldPointers) {
+      if (state.fresh || this.activePointers.get(pointer) !== state) continue;
       let candidate: ChartNote | undefined;
       let candidateDistance = Number.POSITIVE_INFINITY;
       for (const note of this.playableNotes) {
@@ -643,7 +644,6 @@ export class ChartSession {
 
       const result = judge(candidate.judgementType, 0, this.assistLevel);
       this.apply(candidate, result.judgement, result.timing, 0, candidate.timeMs);
-      this.unbindEndingLines(candidate);
     }
   }
 
@@ -654,6 +654,7 @@ export class ChartSession {
     pointer: PointerToken,
     predicate: (note: ChartNote) => boolean,
   ): number {
+    if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return -1;
     if (this.processed.has(note.id) || this.pendingLastTiming.has(note.id) || !predicate(note)) return -1;
     if (
       diff < -maximumEarlyWindow(note.judgementType, this.assistLevel) ||
@@ -664,10 +665,9 @@ export class ChartSession {
       !isTargetLane(note, lane, nativeJudgementAreaOffsetX(note.judgementAreaOffsetType, note.size, this.assistLevel))
     )
       return -1;
-    // Native field state is global. An active pointer still needs the lane
-    // hitbox and note availability above, but SlideEnd does not get an extra
-    // successful long-head claim requirement at this gate.
-    if (!this.isAvailableToPointer(note, pointer) && !(isRelease(note) && this.activePointers.has(pointer))) return -1;
+    // Trace and tail updaters consume the current lane input. Long-line
+    // presentation ownership is separate from their judgement eligibility.
+    if (!isTrace(note) && !isLineEnd(note) && !this.isAvailableToPointer(note, pointer)) return -1;
     return Math.abs(diff);
   }
 
@@ -720,7 +720,8 @@ export class ChartSession {
   }
 
   private rememberPointer(pointer: PointerToken, lane: number, pressed = false): void {
-    if (!Number.isFinite(lane) || lane < 0 || lane > LANE_COUNT - 1) return;
+    // Leaving the accepted lane margin is still a held pointer. Remember its
+    // current position; candidateDistance rejects it until it re-enters.
     const state = this.activePointers.get(pointer);
     if (state) {
       state.lane = lane;

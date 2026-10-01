@@ -8,16 +8,14 @@ use crate::judgement::{
     judge_with_assist, maximum_early_ms_with_assist, maximum_late_ms_with_assist,
 };
 use crate::runtime::{
-    LanePosition, NoteDirection, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1,
-    RuntimeNoteV1, is_target_lane_with_assist,
+    LanePosition, RuntimeChartError, RuntimeChartV1, RuntimeLineKind, RuntimeLineV1, RuntimeNoteV1,
+    is_target_lane_with_assist,
 };
 use crate::scoring::{
     ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
     life_damage, normalize_score, perfect_ceiling,
 };
 use crate::timing::TimeMicros;
-
-use std::f64::consts::FRAC_1_SQRT_2;
 
 /// Held-note kinds judged by pointer presence at note time.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,7 +376,8 @@ impl RuntimeState {
             .iter()
             .position(|(candidate, _)| *candidate == pointer)
         {
-            self.pointer_states.swap_remove(index);
+            // Preserve the active-finger traversal order shared with the JS Map.
+            self.pointer_states.remove(index);
         }
     }
 
@@ -726,7 +725,7 @@ impl GameplaySession {
             return Ok(None);
         };
 
-        let (difference, result, start_line, line_end) = {
+        let (difference, result, start_line, line_end, judged_at) = {
             let runtime = self.runtime.as_ref().expect("runtime presence was checked");
             let note = &runtime.notes[index].note;
             let difference = adjusted_time
@@ -734,15 +733,22 @@ impl GameplaySession {
                 .checked_sub(note.time.0)
                 .map(TimeMicros)
                 .ok_or(SessionError::TimeOverflow)?;
+            let trace_press = is_trace(note.judgement_type) && input.action != InputAction::Release;
+            let difference = if trace_press {
+                TimeMicros(0)
+            } else {
+                difference
+            };
             (
                 difference,
                 judge_with_assist(self.assist_level, note.judgement_type, difference),
                 runtime.available_start_line(index, pointer),
                 is_line_end(note.operate_type),
+                if trace_press { note.time } else { input.time },
             )
         };
         let event =
-            self.apply_judgement(index, result, difference, input.time, Some(input.sequence))?;
+            self.apply_judgement(index, result, difference, judged_at, Some(input.sequence))?;
         let runtime = self.runtime.as_mut().expect("runtime presence was checked");
         if let Some(line_index) = start_line
             && result.judgement != Judgement::Miss
@@ -860,15 +866,18 @@ impl GameplaySession {
         if self.processed[index]
             || self.pending_last_timing[index]
             || action.is_some_and(|action| !accepts_runtime_input(note, action))
+            || (is_trace(note.judgement_type)
+                && action.is_some_and(|action| action != InputAction::Release)
+                && difference < 0)
             || !is_within_window_with_assist(
                 self.assist_level,
                 note.judgement_type,
                 TimeMicros(difference),
             )
             || !is_target_lane_with_assist(self.assist_level, note, lane)
-            || (!runtime.is_available_to_pointer(index, pointer)
-                && !(note.operate_type == NoteOperateType::SlideEnd
-                    && runtime.has_pointer_state(pointer)))
+            || (!is_trace(note.judgement_type)
+                && !is_line_end(note.operate_type)
+                && !runtime.is_available_to_pointer(index, pointer))
         {
             return None;
         }
@@ -923,13 +932,32 @@ impl GameplaySession {
             self.last_input_sequence = Some(input.sequence);
             return Ok(None);
         }
+        if is_trace(self.notes[index].judgement_type)
+            && input.action != InputAction::Release
+            && difference.0 < 0
+        {
+            self.last_input_sequence = Some(input.sequence);
+            return Ok(None);
+        }
+        let trace_press =
+            is_trace(self.notes[index].judgement_type) && input.action != InputAction::Release;
+        let difference = if trace_press {
+            TimeMicros(0)
+        } else {
+            difference
+        };
         let result = judge_with_assist(
             self.assist_level,
             self.notes[index].judgement_type,
             difference,
         );
+        let judged_at = if trace_press {
+            self.notes[index].time
+        } else {
+            input.time
+        };
         let event =
-            self.apply_judgement(index, result, difference, input.time, Some(input.sequence))?;
+            self.apply_judgement(index, result, difference, judged_at, Some(input.sequence))?;
         self.last_input_sequence = Some(input.sequence);
         Ok(Some(event))
     }
@@ -996,8 +1024,12 @@ impl GameplaySession {
                     .checked_add(self.judgement_offset.0)
                     .map(TimeMicros)
                     .ok_or(SessionError::TimeOverflow)?;
-                events.extend(self.advance_held_slide_ends(adjusted_time)?);
-                events.extend(self.advance_held_ticks(adjusted_time)?);
+                let held_pointers = self
+                    .runtime
+                    .as_mut()
+                    .map_or_else(Vec::new, RuntimeState::ready_held_pointers);
+                events.extend(self.advance_held_slide_ends(adjusted_time, &held_pointers)?);
+                events.extend(self.advance_held_ticks(adjusted_time, &held_pointers)?);
                 for index in self.update_cursor..self.notes.len() {
                     if self.notes[index].time >= adjusted_time {
                         break;
@@ -1028,13 +1060,10 @@ impl GameplaySession {
     fn advance_held_slide_ends(
         &mut self,
         adjusted_time: TimeMicros,
+        pointers: &[(PointerToken, LanePosition)],
     ) -> Result<Vec<JudgementEvent>, SessionError> {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let pointers = runtime.ready_held_pointers();
         let mut events = Vec::new();
-        for (pointer, lane) in pointers {
+        for &(pointer, lane) in pointers {
             let Some(index) = self.select_runtime_held_candidate(
                 lane,
                 adjusted_time,
@@ -1066,19 +1095,16 @@ impl GameplaySession {
     }
 
     /// Trace ticks judge at their own note time while any held pointer stays
-    /// inside the tick's extended lanes (IsJudgementTraceNote in the
-    /// Just/After states requires only Press), so a stationary hold follows
+    /// inside the tick's extended lanes (IsJudgementTraceNote accepts
+    /// maintained Press in Just/After), so a stationary hold follows
     /// a slide without emitting a movement event per tick.
     fn advance_held_ticks(
         &mut self,
         adjusted_time: TimeMicros,
+        pointers: &[(PointerToken, LanePosition)],
     ) -> Result<Vec<JudgementEvent>, SessionError> {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let pointers = runtime.ready_held_pointers();
         let mut events = Vec::new();
-        for (pointer, lane) in pointers {
+        for &(pointer, lane) in pointers {
             let Some(index) =
                 self.select_runtime_held_candidate(lane, adjusted_time, pointer, HeldKind::Trace)?
             else {
@@ -1093,6 +1119,10 @@ impl GameplaySession {
                 )
             };
             let event = self.apply_judgement(index, result, TimeMicros(0), note_time, None)?;
+            self.runtime
+                .as_mut()
+                .expect("runtime presence was checked")
+                .unbind_ending_lines(index);
             events.push(event);
         }
         Ok(events)
@@ -1138,17 +1168,15 @@ impl GameplaySession {
             if difference < 0 {
                 break;
             }
-            // The native maintained field is global; do not add a successful
-            // long-head requirement to this ordinary SlideEnd gate. Trace
-            // ticks keep the pointer's line ownership (IsJudgementTraceNote
-            // pairs with the finger holding the line).
+            // The current lane input supplies Trace and SlideEnd judgement;
+            // presentation ownership does not add a predecessor requirement.
             let kind_matches = match held_kind {
                 HeldKind::SlideEnd => note.operate_type == NoteOperateType::SlideEnd,
                 HeldKind::Trace => {
                     matches!(
                         note.judgement_type,
                         NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
-                    ) && runtime.is_available_to_pointer(index, pointer)
+                    )
                 }
             };
             if !kind_matches
@@ -1361,18 +1389,15 @@ fn accepts_input(note: &GameplayNote, action: InputAction) -> bool {
     match action {
         InputAction::Cancel => false,
         InputAction::Flick { .. } => is_flick(note.operate_type),
-        InputAction::Release => note.operate_type == NoteOperateType::SlideEnd,
+        InputAction::Release => {
+            note.operate_type == NoteOperateType::SlideEnd || is_trace(note.judgement_type)
+        }
         InputAction::Trace => matches!(
             note.judgement_type,
             NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
         ),
         InputAction::Tap => {
-            !is_flick(note.operate_type)
-                && note.operate_type != NoteOperateType::SlideEnd
-                && !matches!(
-                    note.judgement_type,
-                    NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
-                )
+            !is_flick(note.operate_type) && note.operate_type != NoteOperateType::SlideEnd
         }
     }
 }
@@ -1380,23 +1405,27 @@ fn accepts_input(note: &GameplayNote, action: InputAction) -> bool {
 fn accepts_runtime_input(note: &RuntimeNoteV1, action: InputAction) -> bool {
     match action {
         InputAction::Cancel => false,
-        InputAction::Flick { movement } => {
-            is_flick(note.operate_type) && matches_flick_direction(note.direction, movement)
+        // The native acceptance path uses lane and timing; its recorded
+        // movement vector and authored direction do not restrict selection.
+        InputAction::Flick { .. } => is_flick(note.operate_type),
+        InputAction::Release => {
+            note.operate_type == NoteOperateType::SlideEnd || is_trace(note.judgement_type)
         }
-        InputAction::Release => note.operate_type == NoteOperateType::SlideEnd,
         InputAction::Trace => matches!(
             note.judgement_type,
             NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
         ),
         InputAction::Tap => {
-            !is_flick(note.operate_type)
-                && note.operate_type != NoteOperateType::SlideEnd
-                && !matches!(
-                    note.judgement_type,
-                    NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
-                )
+            !is_flick(note.operate_type) && note.operate_type != NoteOperateType::SlideEnd
         }
     }
+}
+
+const fn is_trace(note_type: NoteJudgementType) -> bool {
+    matches!(
+        note_type,
+        NoteJudgementType::Trace | NoteJudgementType::SlideEndTrace
+    )
 }
 
 const fn is_line_end(note_type: NoteOperateType) -> bool {
@@ -1404,25 +1433,6 @@ const fn is_line_end(note_type: NoteOperateType) -> bool {
         note_type,
         NoteOperateType::SlideEnd | NoteOperateType::SlideEndFlick | NoteOperateType::SlideEndTrace
     )
-}
-
-/// IsTargetDirectionFlick: the swipe must stay within 45 degrees of the
-/// note's horizontal axis; Normal accepts any direction. A zero vector cannot
-/// be quantized and is accepted, matching a release-only flick signal.
-fn matches_flick_direction(direction: NoteDirection, movement: InputVector) -> bool {
-    if direction == NoteDirection::Normal {
-        return true;
-    }
-    let length = ((movement.delta_x as f64).powi(2) + (movement.delta_y as f64).powi(2)).sqrt();
-    if length == 0.0 {
-        return true;
-    }
-    let axis = match direction {
-        NoteDirection::Left => -(movement.delta_x as f64),
-        NoteDirection::Right => movement.delta_x as f64,
-        NoteDirection::Normal => return true,
-    } / length;
-    axis >= FRAC_1_SQRT_2
 }
 
 const fn is_flick(note_type: NoteOperateType) -> bool {
@@ -1439,8 +1449,8 @@ const fn is_flick(note_type: NoteOperateType) -> bool {
 mod tests {
     use super::*;
     use crate::runtime::{
-        JudgementAreaOffsetType, LANE_UNITS_PER_LANE, RUNTIME_CHART_FORMAT, RUNTIME_CHART_VERSION,
-        RUNTIME_LANE_COUNT,
+        JudgementAreaOffsetType, LANE_UNITS_PER_LANE, NoteDirection, RUNTIME_CHART_FORMAT,
+        RUNTIME_CHART_VERSION, RUNTIME_LANE_COUNT,
     };
 
     fn note(
@@ -2104,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_flick_direction_selects_by_cone_and_wrong_way_waits() {
+    fn runtime_flick_direction_is_ignored_and_traversal_order_is_stable() {
         let mut left = runtime_note(
             9,
             1_000_000,
@@ -2140,8 +2150,7 @@ mod tests {
             .unwrap();
         assert_eq!(event.note_id, "9");
 
-        // IsTargetDirectionFlick: a rightward swipe never selects the Left
-        // flick; the note keeps waiting instead of being consumed or failed.
+        // An opposite vector still selects the authored Left flick.
         let rightward = InputAction::Flick {
             movement: InputVector {
                 delta_x: 1_000,
@@ -2154,21 +2163,15 @@ mod tests {
             TimeMicros(0),
         )
         .unwrap();
-        let ignored = session
-            .consume_runtime_input(&runtime_input(1, 1_000_000, 10_000_000, None, rightward))
-            .unwrap();
-        assert!(ignored.is_none());
-
-        // The waiting note still accepts a later correctly-directed swipe.
         let accepted = session
-            .consume_runtime_input(&runtime_input(2, 1_050_000, 10_000_000, None, leftward))
+            .consume_runtime_input(&runtime_input(1, 1_000_000, 10_000_000, None, rightward))
             .unwrap()
             .unwrap();
         assert_eq!(accepted.note_id, "9");
     }
 
     #[test]
-    fn runtime_long_line_requires_pointer_ownership_and_release_or_cancel_clears_it() {
+    fn runtime_long_line_accepts_current_fingers_and_release_or_cancel_clears_presentation() {
         let mut start = runtime_note(
             0,
             1_000_000,
@@ -2227,8 +2230,9 @@ mod tests {
                     InputAction::Trace,
                 ))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+        session.reset(TimeMicros(0)).unwrap();
         assert!(
             session
                 .consume_runtime_input(&runtime_input(
@@ -2253,7 +2257,7 @@ mod tests {
                     InputAction::Trace,
                 ))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert!(
             session
@@ -2265,7 +2269,7 @@ mod tests {
                     InputAction::Trace,
                 ))
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         assert!(
             session
@@ -2290,7 +2294,7 @@ mod tests {
                     InputAction::Trace,
                 ))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
 
         session.reset(TimeMicros(0)).unwrap();
@@ -2331,7 +2335,7 @@ mod tests {
         );
         assert!(!session.runtime_line_is_owned(7));
         assert!(
-            !session
+            session
                 .has_runtime_input_candidate(
                     LanePosition(10_000_000),
                     TimeMicros(1_500_000),
