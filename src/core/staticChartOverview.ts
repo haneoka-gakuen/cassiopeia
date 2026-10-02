@@ -3,7 +3,7 @@ import { isPairNoteOperateType, NoteDirection, NoteOperateType } from "./enums.j
 import type { ChartDocument, ChartNote } from "./types.js";
 
 /** Bump when SVG layout, geometry, or font assumptions change. */
-export const STATIC_CHART_OVERVIEW_RENDERER_VERSION = "chart-overview-svg-v1";
+export const STATIC_CHART_OVERVIEW_RENDERER_VERSION = "chart-overview-svg-v2";
 export const STATIC_CHART_OVERVIEW_FONT_STACK =
   '"Roboto Variable", "Noto Sans Variable", "Noto Sans JP Variable", "Noto Sans TC Variable", "Noto Sans SC Variable", "Noto Sans KR Variable", sans-serif';
 
@@ -32,6 +32,7 @@ export interface StaticChartOverviewMeta {
   readonly attribute?: string;
   readonly jacketHref?: string;
   readonly locale?: string;
+  readonly server?: string;
 }
 
 export interface StaticChartOverviewOptions {
@@ -91,10 +92,18 @@ function text(value: string | number): string {
   return escapeXml(String(value));
 }
 
-function truncate(value: string, maxCharacters: number): string {
-  const normalized = value.trim();
-  if (normalized.length <= maxCharacters) return normalized;
-  return `${normalized.slice(0, Math.max(1, maxCharacters - 1))}…`;
+// Conservative glyph advances keep mixed CJK/Latin text inside its allocated row.
+function fitText(value: string, maxWidth: number, fontSize: number): string {
+  const glyphs = Array.from(value.trim());
+  let used = 0;
+  const result: string[] = [];
+  for (const glyph of glyphs) {
+    const advance = (glyph.codePointAt(0)! > 0x2ff ? 1 : /[MW@%]/u.test(glyph) ? 0.95 : 0.65) * fontSize;
+    if (used + advance > maxWidth - fontSize) return `${result.join("")}…`;
+    used += advance;
+    result.push(glyph);
+  }
+  return result.join("");
 }
 
 function difficultyColor(value: string): string {
@@ -141,7 +150,7 @@ export function countStaticChartNoteKinds(chart: ChartDocument): {
 } {
   const result = { tap: 0, flick: 0, slide: 0 };
   for (const note of chart.notes) {
-    if (!note.visible || !note.judged) continue;
+    if (!note.judged) continue;
     const kind = kindOf(note);
     if (kind === "tap") result.tap += 1;
     else if (kind === "flick") result.flick += 1;
@@ -168,7 +177,7 @@ function durationValue(durationMs: number): string {
 function bpmValue(chart: ChartDocument): string {
   const values = chart.bpmChanges.map((change) => change.bpm).filter((value) => value > 0);
   if (!values.length) return "—";
-  const first = Math.round(values[0]!);
+  const first = Math.round(Math.min(...values));
   const maximum = Math.round(Math.max(...values));
   return maximum === first ? String(first) : `${first}–${maximum}`;
 }
@@ -265,7 +274,9 @@ function renderBpmGrid(
       if (time >= end) break;
       const y = yAt(time, panel, panelDuration, height, heightPerSecond);
       const stroke = Number.isInteger(beat) ? "rgba(128,255,255,.2)" : "rgba(255,128,255,.16)";
-      parts.push(`<line x1="${number(left)}" y1="${number(y)}" x2="${number(right)}" y2="${number(y)}" stroke="${stroke}"${Number.isInteger(beat) ? "" : ' stroke-dasharray="2.5"'}/>`);
+      parts.push(
+        `<line x1="${number(left)}" y1="${number(y)}" x2="${number(right)}" y2="${number(y)}" stroke="${stroke}"${Number.isInteger(beat) ? "" : ' stroke-dasharray="2.5"'}/>`,
+      );
     }
   }
   return parts.join("");
@@ -320,12 +331,20 @@ function renderRibbons(
   return parts.join("");
 }
 
-function renderChartStrip(chart: ChartDocument, height: number, panelCount: number, panelWidth: number, laneWidth: number): string {
+function renderChartStrip(
+  chart: ChartDocument,
+  height: number,
+  panelCount: number,
+  panelWidth: number,
+  laneWidth: number,
+): string {
   const stageWidth = laneWidth * 6;
   const heightPerSecond = 150 * (laneWidth / 10);
   const panelDuration = (height / heightPerSecond) * 1000;
   const byTick = new Map<number, ChartNote[]>();
-  const visibleNotes = chart.notes.filter((note) => note.visible && note.judged).sort((a, b) => a.timeMs - b.timeMs || a.id - b.id);
+  const visibleNotes = chart.notes
+    .filter((note) => note.visible && note.judged)
+    .sort((a, b) => a.timeMs - b.timeMs || a.id - b.id);
   for (const note of visibleNotes) {
     if (!isPairNoteOperateType(note.operateType)) continue;
     const group = byTick.get(note.tick) || [];
@@ -349,19 +368,25 @@ function renderChartStrip(chart: ChartDocument, height: number, panelCount: numb
         `<text x="${number(left - 6)}" y="${number(yAt(time, panel, panelDuration, height, heightPerSecond))}" text-anchor="end" dominant-baseline="middle" class="minor">${text(timeLabel)}</text>`,
       );
     }
-    for (let combo = 50; combo < judged.length; combo += 50) {
-      const note = judged[combo];
+    for (let combo = 50; combo <= judged.length; combo += 50) {
+      const note = judged[combo - 1];
       if (note && note.timeMs >= panelStart && note.timeMs < panelEnd)
-        labels.push(`<text x="${number(right + 6)}" y="${number(yAt(note.timeMs, panel, panelDuration, height, heightPerSecond))}" dominant-baseline="middle" class="minor">${combo}</text>`);
+        labels.push(
+          `<text x="${number(right + 6)}" y="${number(yAt(note.timeMs, panel, panelDuration, height, heightPerSecond))}" dominant-baseline="middle" class="minor">${combo}</text>`,
+        );
     }
     for (const change of chart.bpmChanges) {
       if (change.timeMs < panelStart || change.timeMs >= panelEnd || change.bpm <= 0) continue;
       const y = yAt(change.timeMs, panel, panelDuration, height, heightPerSecond);
-      labels.push(`<text x="${number(right + 6)}" y="${number(y)}" dominant-baseline="middle" class="bpm">${Math.round(change.bpm)}</text><line x1="${number(left)}" y1="${number(y)}" x2="${number(right)}" y2="${number(y)}" class="bpm-line"/>`);
+      labels.push(
+        `<text x="${number(right + 6)}" y="${number(y)}" dominant-baseline="middle" class="bpm">${Math.round(change.bpm)}</text><line x1="${number(left)}" y1="${number(y)}" x2="${number(right)}" y2="${number(y)}" class="bpm-line"/>`,
+      );
     }
     for (const event of chart.timeline.skills) {
       if (event.timeMs < panelStart || event.timeMs >= panelEnd) continue;
-      labels.push(`<text x="${number(right + 6)}" y="${number(yAt(event.timeMs, panel, panelDuration, height, heightPerSecond))}" dominant-baseline="middle" class="skill">#${event.index + 1}</text>`);
+      labels.push(
+        `<text x="${number(right + 6)}" y="${number(yAt(event.timeMs, panel, panelDuration, height, heightPerSecond))}" dominant-baseline="middle" class="skill">#${event.index + 1}</text>`,
+      );
     }
     const simultaneousLines = simultaneous
       .filter(({ left: first }) => first.timeMs >= panelStart && first.timeMs < panelEnd)
@@ -373,7 +398,9 @@ function renderChartStrip(chart: ChartDocument, height: number, panelCount: numb
       })
       .join("");
     const notes = visibleNotes
-      .map((note) => renderNote(note, panel, panelStart, panelEnd, panelWidth, laneWidth, height, panelDuration, heightPerSecond))
+      .map((note) =>
+        renderNote(note, panel, panelStart, panelEnd, panelWidth, laneWidth, height, panelDuration, heightPerSecond),
+      )
       .join("");
     panels.push(
       `<g transform="translate(${number(panel * panelWidth)},0)"><rect width="${number(panelWidth)}" height="${number(height)}" fill="#000"/>${renderLane(panelWidth, laneWidth, stageWidth, height, 0)}${renderBpmGrid(chart, panel, panelStart, panelEnd, panelWidth, laneWidth, height, panelDuration, heightPerSecond)}${renderRibbons(chart, panel, panelStart, panelEnd, panelWidth, laneWidth, height, panelDuration, heightPerSecond)}${simultaneousLines}${labels.join("")}${notes}</g>`,
@@ -388,7 +415,10 @@ function renderLogo(x: number, y: number, scale = 1): string {
 
 function renderStats(chart: ChartDocument, x: number, y: number, width: number): string {
   const counts = countStaticChartNoteKinds(chart);
-  const nps = chart.durationMs > 0 ? (chart.notes.filter((note) => note.visible && note.judged).length / (chart.durationMs / 1000)).toFixed(2) : "—";
+  const nps =
+    chart.durationMs > 0
+      ? (chart.notes.filter((note) => note.judged).length / (chart.durationMs / 1000)).toFixed(2)
+      : "—";
   const stats = [
     ["NOTES", statValue(counts.tap + counts.flick + counts.slide)],
     ["TAP", statValue(counts.tap)],
@@ -412,55 +442,65 @@ export function renderStaticChartOverview(
   meta: StaticChartOverviewMeta,
   options: StaticChartOverviewOptions,
 ): StaticChartOverviewResult {
-  const height = Math.round(options.height);
+  const height = options.height;
   if (!Number.isSafeInteger(height) || height < 360 || height > 1_440) {
-    throw new StaticChartOverviewError("invalid_height", "Chart image height must be an integer from 360 to 1440 pixels");
+    throw new StaticChartOverviewError(
+      "invalid_height",
+      "Chart image height must be an integer from 360 to 1440 pixels",
+    );
   }
   const panelDurationAtBaseScale = (height / 150) * 1000;
-  const panelCount = Math.max(1, Math.ceil(Math.max(0, finite(chart.durationMs)) / panelDurationAtBaseScale));
+  const panelCount = Math.max(1, Math.floor(Math.max(0, finite(chart.durationMs)) / panelDurationAtBaseScale) + 1);
   const maxPanels = options.maxPanels ?? 256;
   if (panelCount > maxPanels) {
-    throw new StaticChartOverviewError("render_budget", `Chart overview requires ${panelCount} panels; the budget is ${maxPanels}`);
+    throw new StaticChartOverviewError(
+      "render_budget",
+      `Chart overview requires ${panelCount} panels; the budget is ${maxPanels}`,
+    );
   }
   const basePanelWidth = 130;
-  const panelWidth = Math.max(basePanelWidth, 260 / panelCount);
-  const laneWidth = (panelWidth / basePanelWidth) * 10;
+  const panelWidth = basePanelWidth;
+  const laneWidth = 10;
   const chartWidth = panelCount * panelWidth;
-  const padding = 40;
+  const padding = 32;
   const width = Math.max(840, Math.ceil(chartWidth + padding * 2));
-  const headerHeight = 164;
+  const headerHeight = 172;
   const statsHeight = 68;
   const gap = 18;
   const chartY = padding + headerHeight + gap + statsHeight + gap;
   const outputHeight = Math.ceil(chartY + height + padding);
   const maxPixels = options.maxPixels ?? 12_000_000;
   if (width * outputHeight > maxPixels) {
-    throw new StaticChartOverviewError("render_budget", `Chart overview exceeds the ${maxPixels.toLocaleString("en-US")} pixel budget`);
+    throw new StaticChartOverviewError(
+      "render_budget",
+      `Chart overview exceeds the ${maxPixels.toLocaleString("en-US")} pixel budget`,
+    );
   }
   const accent = difficultyColor(meta.difficultyName);
   const chartX = Math.max(padding, (width - chartWidth) / 2);
-  const title = truncate(meta.title || meta.songId, 42);
-  const band = truncate(meta.bandName || "Band", 28);
+  const title = fitText(meta.title || meta.songId, width - padding * 2 - 120, 32);
+  const band = fitText(meta.bandName || "Band", width - padding * 2 - 120, 20);
   const level = `${meta.difficultyName.toUpperCase()} ${meta.displayLevel}`.trim();
   const textLeft = padding + 120;
   const svgTitle = `${meta.title} · ${meta.difficultyName} ${meta.displayLevel}`;
   const svgDescription = `Chart overview for ${meta.title}, ${meta.bandName}, ${meta.difficultyName} level ${meta.displayLevel}`;
+  const identity = [meta.server?.toUpperCase(), `ID ${meta.songId}`].filter(Boolean).join(" · ");
   const attributeMark = meta.attribute
-    ? `<circle cx="${textLeft + 6}" cy="${padding + 92}" r="5" fill="${attributeColor(meta.attribute)}"/>`
+    ? `<circle cx="${textLeft + Math.max(104, level.length * 8 + 28) + 18}" cy="${padding + 134}" r="5" fill="${attributeColor(meta.attribute)}"/>`
     : "";
   const jacket = meta.jacketHref
-    ? `<image href="${escapeXml(meta.jacketHref)}" x="${padding}" y="${padding}" width="96" height="96" preserveAspectRatio="xMidYMid slice" clip-path="url(#jacket-clip)"/>`
-    : `<rect x="${padding}" y="${padding}" width="96" height="96" rx="16" fill="#1f2730"/><text x="${padding + 48}" y="${padding + 54}" text-anchor="middle" class="jacket-id">${text(meta.songId)}</text>`;
+    ? `<image href="${escapeXml(meta.jacketHref)}" x="${padding}" y="${padding + 56}" width="96" height="96" preserveAspectRatio="xMidYMid slice" clip-path="url(#jacket-clip)"/>`
+    : `<rect x="${padding}" y="${padding + 56}" width="96" height="96" rx="16" fill="#1f2730"/><text x="${padding + 48}" y="${padding + 110}" text-anchor="middle" class="jacket-id">${text(meta.songId)}</text>`;
   const brandRight = width - padding;
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${outputHeight}" viewBox="0 0 ${width} ${outputHeight}" role="img" aria-labelledby="title desc">
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" lang="${text(meta.locale || "en")}" width="${width}" height="${outputHeight}" viewBox="0 0 ${width} ${outputHeight}" role="img" aria-labelledby="title desc">
 <title id="title">${text(svgTitle)}</title>
 <desc id="desc">${text(svgDescription)}</desc>
-<defs><clipPath id="jacket-clip"><rect x="${padding}" y="${padding}" width="96" height="96" rx="16"/></clipPath><linearGradient id="slide-gradient" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#7a49ff" stop-opacity=".86"/><stop offset=".55" stop-color="#4453d9" stop-opacity=".86"/><stop offset="1" stop-color="#5d84fa" stop-opacity=".71"/></linearGradient><linearGradient id="guide-gradient" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#7862ff" stop-opacity=".34"/><stop offset="1" stop-color="#b289ff" stop-opacity=".42"/></linearGradient><style>
+<defs><clipPath id="jacket-clip"><rect x="${padding}" y="${padding + 56}" width="96" height="96" rx="16"/></clipPath><linearGradient id="slide-gradient" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#7a49ff" stop-opacity=".86"/><stop offset=".55" stop-color="#4453d9" stop-opacity=".86"/><stop offset="1" stop-color="#5d84fa" stop-opacity=".71"/></linearGradient><linearGradient id="guide-gradient" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#7862ff" stop-opacity=".34"/><stop offset="1" stop-color="#b289ff" stop-opacity=".42"/></linearGradient><style>
 text{font-family:${STATIC_CHART_OVERVIEW_FONT_STACK};fill:#fff} .title{font-size:32px;font-weight:400;fill:rgba(255,255,255,.94)} .band{font-size:20px;font-weight:500;fill:rgba(255,255,255,.82)} .pill{font-size:14px;font-weight:500;fill:${accent}} .minor{font-size:10px;fill:rgba(255,255,255,.5)} .bpm{font-size:10px;fill:rgba(255,0,255,.65)} .bpm-line{stroke:rgba(255,0,255,.5);stroke-width:1} .skill{font-size:10px;fill:rgba(255,255,0,.7)} .stat-label{font-size:11px;font-weight:500;fill:rgba(255,255,255,.5)} .stat-value{font-size:19px;font-weight:500;fill:rgba(255,255,255,.92)} .jacket-id{font-size:13px;fill:rgba(255,255,255,.55)}
 </style></defs>
 <rect width="${width}" height="${outputHeight}" fill="#000"/>
-${jacket}${renderLogo(brandRight - 168, padding + 2, 1)}<text x="${brandRight - 128}" y="${padding + 18}" font-size="18" font-weight="500">Haneoka</text><text x="${brandRight}" y="${padding + 18}" text-anchor="end" font-size="14" fill="rgba(255,255,255,.55)">haneoka.org</text><text x="${brandRight}" y="${padding + 43}" text-anchor="end" font-size="12" fill="rgba(255,255,255,.45)">Powered by Cassiopeia</text>
-<text x="${textLeft}" y="${padding + 38}" class="title">${text(title)}</text><text x="${textLeft}" y="${padding + 72}" class="band">${text(band)}</text>${attributeMark}<rect x="${textLeft}" y="${padding + 82}" width="${Math.max(104, level.length * 8 + 28)}" height="28" rx="14" fill="${accent}" fill-opacity=".2" stroke="${accent}"/><text x="${textLeft + 14}" y="${padding + 101}" class="pill">${text(level)}</text><text x="${textLeft}" y="${padding + 137}" font-size="12" fill="rgba(255,255,255,.52)">Song ID ${text(meta.songId)}</text>
+${renderLogo(padding, padding, 1)}<text x="${padding + 36}" y="${padding + 18}" font-size="20" font-weight="500">Haneoka</text><text x="${padding + 132}" y="${padding + 18}" font-size="16" fill="rgba(255,255,255,.7)">haneoka.org</text><text x="${brandRight}" y="${padding + 18}" text-anchor="end" font-size="12" fill="rgba(255,255,255,.52)">Powered by Cassiopeia · ${text(identity)}</text>
+${jacket}<text x="${textLeft}" y="${padding + 88}" class="title">${text(title)}</text><text x="${textLeft}" y="${padding + 116}" class="band">${text(band)}</text><rect x="${textLeft}" y="${padding + 120}" width="${Math.max(104, level.length * 8 + 28)}" height="28" rx="14" fill="${accent}" fill-opacity=".2" stroke="${accent}"/><text x="${textLeft + 14}" y="${padding + 139}" class="pill">${text(level)}</text>${attributeMark}
 ${renderStats(chart, padding, padding + headerHeight + gap + 14, width - padding * 2)}
 <g transform="translate(${number(chartX)},${number(chartY)})"><defs><style>.chart-label{font-family:${STATIC_CHART_OVERVIEW_FONT_STACK}}</style></defs>${renderChartStrip(chart, height, panelCount, panelWidth, laneWidth)}</g>
 </svg>`;
@@ -473,6 +513,6 @@ ${renderStats(chart, padding, padding + headerHeight + gap + 14, width - padding
     width,
     height: outputHeight,
     panelCount,
-    noteCount: chart.notes.filter((note) => note.visible && note.judged).length,
+    noteCount: chart.notes.filter((note) => note.judged).length,
   };
 }
