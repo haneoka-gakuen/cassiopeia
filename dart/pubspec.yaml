@@ -9,5 +9,13 @@ dependencies:
 flutter:
   plugin:
     platforms:
+      android:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
       linux:
         ffiPlugin: true

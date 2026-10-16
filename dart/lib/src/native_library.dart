@@ -4,7 +4,7 @@ import 'dart:io';
 /// Host override is authoritative; otherwise use the platform's bundled library.
 DynamicLibrary openCassiopeiaNativeLibrary({String? path}) {
   if (path != null) return DynamicLibrary.open(path);
-  if (Platform.isIOS) return DynamicLibrary.process();
+  if (Platform.isIOS || Platform.isMacOS) return DynamicLibrary.process();
   final executable = File(Platform.resolvedExecutable).parent;
   if (Platform.isLinux) {
     final bundled = File('${executable.path}/lib/libcassiopeia_native.so');
@@ -14,10 +14,6 @@ DynamicLibrary openCassiopeiaNativeLibrary({String? path}) {
   }
   if (Platform.isWindows)
     return DynamicLibrary.open('${executable.path}/cassiopeia_native.dll');
-  if (Platform.isMacOS)
-    return DynamicLibrary.open(
-      '${executable.path}/../Frameworks/libcassiopeia_native.dylib',
-    );
   if (Platform.isAndroid) return DynamicLibrary.open('libcassiopeia_native.so');
   throw UnsupportedError('cassiopeia_native_platform');
 }
