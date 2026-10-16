@@ -1,3 +1,5 @@
+import { resolveAutomaticJudgement, type AutomaticJudgementPolicy } from "./automatic.js";
+import { SessionTimeline } from "./SessionTimeline.js";
 import {
   FeverState,
   JudgementAreaOffsetType,
@@ -22,6 +24,8 @@ import {
   lifeDamage,
   normalizeScore,
   perfectCeiling,
+  perfectCeilingAtNoteTimes,
+  type ScoringComboPolicy,
 } from "./scoring.js";
 import type {
   ChartCallChangeEvent,
@@ -34,12 +38,24 @@ import type {
   SessionLineState,
   SessionNoteState,
   SessionSnapshot,
+  WatchVisualReplayContract,
+  WatchVisualState,
 } from "./types.js";
 
+export interface AutoJudgementContext {
+  readonly observedTimeMs: number;
+  readonly feverState: FeverState;
+  readonly feverSection: ChartFeverSection | null;
+}
+
 export interface SessionOptions {
+  automaticPolicy?: AutomaticJudgementPolicy;
+  scoringComboPolicy?: ScoringComboPolicy;
   mode?: ChartMode;
   judgementOffsetMs?: number;
   assistLevel?: number;
+  /** Pure source policy for automatic judgements; ordinary Watch defaults to Perfect. */
+  autoJudgement?: (note: Readonly<ChartNote>, context: AutoJudgementContext) => NoteSimulateJudgement;
 }
 
 export interface InputVector {
@@ -159,11 +175,12 @@ export class ChartSession {
   private readonly linePointers = new Map<number, PointerToken>();
   /** Current lane for active native fingers; entries are cleared on lift/cancel. */
   private readonly activePointers = new Map<PointerToken, ActivePointerState>();
+  private readonly presentationTimeline: SessionTimeline;
   private readonly ceiling: number;
+  private readonly scoringComboPolicy: ScoringComboPolicy;
+  private scoringGroupTime = Number.NaN;
+  private scoringGroupCombo = 0;
   private readonly reusableSnapshot: SessionSnapshot;
-  private readonly executedSkills: Uint8Array;
-  private readonly skillTimelineIsMonotonic: boolean;
-  private readonly activeFeverSections: number[] = [];
   private judgementOffsetMs: number;
   private contributionSum = 0;
   private score = 0;
@@ -173,23 +190,24 @@ export class ChartSession {
   private maxCombo = 0;
   private life = LIFE_BASE;
   private lastJudgement: JudgementEvent | null = null;
-  private lastSkill: ChartSkillEvent | null = null;
-  private callChange: ChartCallChangeEvent | null = null;
-  private feverState = FeverState.Wait;
-  private feverSection: ChartFeverSection | null = null;
+  private watchVisualState: WatchVisualState | undefined;
   private timeMs = 0;
-  private skillCursor = 0;
-  private feverStartCursor = 0;
-  private callChangeCursor = 0;
   /** First note which has not already been consumed; keeps rAF updates O(new notes). */
   private updateCursor = 0;
   readonly assistLevel: AssistLevel;
+  private readonly autoJudgement: SessionOptions["autoJudgement"];
 
   constructor(
     readonly chart: ChartDocument,
     options: SessionOptions = {},
   ) {
     this.mode = options.mode ?? "watch";
+    this.scoringComboPolicy = options.scoringComboPolicy ?? "sequential";
+    this.requireScoringMode();
+    if (options.autoJudgement && options.automaticPolicy) throw new TypeError("Choose callback or automatic result data");
+    this.autoJudgement = options.autoJudgement ?? (options.automaticPolicy
+      ? (note, context) => resolveAutomaticJudgement(options.automaticPolicy!, note.judgementType, context.observedTimeMs)
+      : undefined);
     this.assistLevel = requireAssistLevel(options.assistLevel ?? DEFAULT_ASSIST_LEVEL);
     this.judgementOffsetMs = integerTimeMs(options.judgementOffsetMs ?? 0);
     this.playableNotes = chart.notes.filter((note) => note.judged);
@@ -244,11 +262,8 @@ export class ChartSession {
       (maximum, note) => Math.max(maximum, maximumLateWindow(note.judgementType, this.assistLevel)),
       0,
     );
-    this.ceiling = perfectCeiling(this.playableNotes.map((note) => note.operateType));
-    this.executedSkills = new Uint8Array(chart.timeline.skills.length);
-    this.skillTimelineIsMonotonic = chart.timeline.skills.every(
-      (event, index, events) => index === 0 || events[index - 1]!.timeMs <= event.timeMs,
-    );
+    this.ceiling = this.scoringComboPolicy === "strict-prior-note-time" ? perfectCeilingAtNoteTimes(this.playableNotes) : perfectCeiling(this.playableNotes.map((note) => note.operateType));
+    this.presentationTimeline = new SessionTimeline(chart.timeline, { skill: event => this.emit("skill", event), fever: event => this.emit("fever", event), callChange: event => this.emit("callChange", event) });
     this.reusableSnapshot = {
       timeMs: 0,
       durationMs: chart.durationMs,
@@ -284,6 +299,7 @@ export class ChartSession {
   }
 
   setMode(mode: ChartMode): void {
+    this.requireScoringMode(mode);
     if (this.mode === mode) return;
     this.mode = mode;
     this.reset(this.timeMs);
@@ -331,7 +347,13 @@ export class ChartSession {
   }
 
   private advance(timeMs: number): void {
+    this.requireScoringMode();
     const nextTimeMs = integerTimeMs(timeMs);
+    if (nextTimeMs > this.timeMs && this.watchVisualState?.sampledTimeMs !== undefined) {
+      // Resume the real visual clock while retaining the reconstructed last
+      // event. The business last event still has reset's transport timestamp.
+      this.watchVisualState = { ...this.watchVisualState, sampledTimeMs: undefined };
+    }
     if (nextTimeMs + 5 < this.timeMs) this.reset(nextTimeMs);
     // Positive BGM offsets create a real pre-roll before chart time zero.
     // Keeping that time negative prevents watch mode from consuming tick-zero
@@ -344,7 +366,7 @@ export class ChartSession {
         const note = this.playableNotes[this.updateCursor]!;
         if (note.timeMs >= this.timeMs) break;
         if (this.processed.has(note.id)) this.updateCursor++;
-        else this.apply(note, NoteSimulateJudgement.Perfect, JudgeTiming.Auto, 0, this.timeMs);
+        else this.apply(note, this.automaticJudgement(note, this.timeMs), JudgeTiming.Auto, 0, this.timeMs);
       }
     } else if (this.mode === "play") {
       // Crossing the late boundary only enters PlayingLast. The next updater
@@ -433,10 +455,22 @@ export class ChartSession {
     this.unbindPointer(pointer);
   }
 
-  reset(timeMs = 0): SessionSnapshot {
+  private requireScoringMode(mode: ChartMode = this.mode): void {
+    if (mode === "play" && this.scoringComboPolicy === "strict-prior-note-time")
+      throw new RangeError("strict-prior scoring requires canonical history; Play is not enabled");
+  }
+
+  reset(timeMs = 0, visualReplay?: WatchVisualReplayContract): SessionSnapshot {
+    this.requireScoringMode();
+    const nextTimeMs = integerTimeMs(timeMs);
+    const visualState = this.mode === "watch" && visualReplay
+      ? this.rebuildWatchVisualState(nextTimeMs, visualReplay)
+      : undefined;
     this.processed.clear();
     this.pendingLastTiming.clear();
     this.contributionSum = 0;
+    this.scoringGroupTime = Number.NaN;
+    this.scoringGroupCombo = 0;
     this.score = 0;
     this.combo = 0;
     this.allPerfect = true;
@@ -444,22 +478,13 @@ export class ChartSession {
     this.maxCombo = 0;
     this.life = LIFE_BASE;
     this.lastJudgement = null;
-    this.lastSkill = null;
-    this.callChange = null;
-    this.feverState = FeverState.Wait;
-    this.feverSection = null;
-    const nextTimeMs = integerTimeMs(timeMs);
+    this.watchVisualState = visualState;
     this.timeMs = nextTimeMs;
     this.updateCursor = 0;
-    this.executedSkills.fill(0);
-    this.skillCursor = 0;
-    this.activeFeverSections.length = 0;
-    this.feverStartCursor = 0;
-    this.callChangeCursor = 0;
     this.pointerLines.clear();
     this.linePointers.clear();
     this.activePointers.clear();
-    if (nextTimeMs > 0) this.rebuildTimeline(nextTimeMs);
+    this.presentationTimeline.reset(nextTimeMs);
     if (this.mode === "watch" && nextTimeMs > 0) {
       // Rebuild watch state without replaying every historical judgement into
       // host UI listeners. A seek has one reset notification; it is not a burst
@@ -467,7 +492,14 @@ export class ChartSession {
       while (this.updateCursor < this.playableNotes.length) {
         const note = this.playableNotes[this.updateCursor]!;
         if (note.timeMs >= this.timeMs) break;
-        this.apply(note, NoteSimulateJudgement.Perfect, JudgeTiming.Auto, 0, this.timeMs, false);
+        const event = this.apply(note, this.automaticJudgement(note, this.historicalWatchTime(note, visualReplay), true), JudgeTiming.Auto, 0, this.timeMs, false);
+        const visualLast = this.watchVisualState?.lastJudgement;
+        if (visualLast?.note.id === note.id) {
+          this.watchVisualState = {
+            ...this.watchVisualState!,
+            lastJudgement: { ...visualLast, scoreDelta: event.scoreDelta },
+          };
+        }
       }
     } else if (this.mode === "play" && nextTimeMs > 0) {
       // A transport seek is not a gameplay miss. Notes whose complete late
@@ -502,6 +534,78 @@ export class ChartSession {
     return this.writeSnapshot({ ...this.reusableSnapshot });
   }
 
+  private rebuildWatchVisualState(timeMs: number, replay: WatchVisualReplayContract): WatchVisualState {
+    if (typeof replay.sourceKey !== "string" || !replay.sourceKey.trim() ||
+        (replay.clockMode !== "fresh-reference" && replay.clockMode !== "canonical-rebuild") ||
+        !Number.isFinite(replay.originSeconds) || !Number.isFinite(replay.stepSeconds) || replay.stepSeconds <= 0 ||
+        !Number.isFinite(replay.inputOffsetMs) || !Array.isArray(replay.tickTimesMs)) {
+      throw new TypeError("Watch visual replay requires an explicit source clock contract");
+    }
+    let previous = -Infinity;
+    let seconds = replay.originSeconds;
+    let sampledTimeMs: number | undefined;
+    for (const tick of replay.tickTimesMs) {
+      const nextSeconds = seconds + replay.stepSeconds;
+      if (!Number.isSafeInteger(tick) || tick < previous || nextSeconds <= seconds ||
+          tick !== Math.trunc(nextSeconds * 1000)) {
+        throw new TypeError("Watch visual replay ticks must match the declared repeated source clock");
+      }
+      seconds = nextSeconds;
+      previous = tick;
+      if (tick <= timeMs) sampledTimeMs = tick;
+    }
+    if (Math.trunc((seconds + replay.stepSeconds) * 1000) <= timeMs) {
+      throw new TypeError("Watch visual replay ticks do not cover the seek target");
+    }
+    let cursor = 0, combo = 0;
+    let lastJudgement: WatchVisualState["lastJudgement"] = null;
+    for (const note of this.playableNotes) {
+      const eligibleAt = note.timeMs + replay.inputOffsetMs;
+      while (cursor < replay.tickTimesMs.length && replay.tickTimesMs[cursor]! < eligibleAt) cursor++;
+      const tick = replay.tickTimesMs[cursor];
+      if (tick === undefined || tick > timeMs) break;
+      combo++;
+      lastJudgement = {
+        note, judgement: this.automaticJudgement(note, tick, true), timing: JudgeTiming.Auto,
+        diffMs: 0, judgedAtMs: tick, combo,
+      };
+    }
+    return {
+      sourceKey: replay.sourceKey, clockMode: replay.clockMode,
+      sampledTimeMs, combo, fullCombo: true, perfectCombo: combo > 0, lastJudgement,
+    };
+  }
+
+  private historicalWatchTime(note: ChartNote, replay?: WatchVisualReplayContract): number {
+    if (replay) {
+      const time = note.timeMs + replay.inputOffsetMs;
+      let low = 0, high = replay.tickTimesMs.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (replay.tickTimesMs[middle]! < time) low = middle + 1;
+        else high = middle;
+      }
+      const tick = replay.tickTimesMs[low];
+      if (tick !== undefined) return tick;
+    }
+    return Math.floor(note.timeMs) + 1;
+  }
+
+  private automaticJudgement(note: ChartNote, observedTimeMs: number, historical = false): NoteSimulateJudgement {
+    if (!this.autoJudgement) return NoteSimulateJudgement.Perfect;
+    let feverState = this.presentationTimeline.feverState, feverSection = this.presentationTimeline.feverSection;
+    if (historical) {
+      feverState = FeverState.Wait;
+      feverSection = null;
+      for (const section of this.chart.timeline.fever) {
+        if (section.startTimeMs > observedTimeMs) break;
+        feverSection = section;
+        feverState = observedTimeMs < section.endTimeMs ? FeverState.Fever : FeverState.End;
+      }
+    }
+    return this.autoJudgement(note, { observedTimeMs, feverState, feverSection });
+  }
+
   private writeSnapshot(target: SessionSnapshot): SessionSnapshot {
     target.timeMs = this.timeMs;
     target.durationMs = this.chart.durationMs;
@@ -516,10 +620,11 @@ export class ChartSession {
     target.processed = this.processed.size;
     target.total = this.playableNotes.length;
     target.lastJudgement = this.lastJudgement;
-    target.lastSkill = this.lastSkill;
-    target.callChange = this.callChange;
-    target.feverState = this.feverState;
-    target.feverSection = this.feverSection;
+    target.watchVisualState = this.watchVisualState;
+    target.lastSkill = this.presentationTimeline.lastSkill;
+    target.callChange = this.presentationTimeline.callChange;
+    target.feverState = this.presentationTimeline.feverState;
+    target.feverSection = this.presentationTimeline.feverSection;
     target.noteState = this.noteState;
     target.lineState = this.lineState;
     return target;
@@ -679,6 +784,11 @@ export class ChartSession {
     judgedAtMs = note.timeMs + diffMs,
     notify = true,
   ): JudgementEvent {
+    this.requireScoringMode();
+    if (this.scoringComboPolicy === "strict-prior-note-time" && note.timeMs !== this.scoringGroupTime) {
+      this.scoringGroupTime = note.timeMs;
+      this.scoringGroupCombo = this.combo;
+    }
     const previousScore = this.score;
     this.pendingLastTiming.delete(note.id);
     this.processed.add(note.id);
@@ -695,7 +805,7 @@ export class ChartSession {
       this.fullCombo = false;
     }
     this.life = Math.max(0, this.life - lifeDamage(judgement));
-    this.contributionSum += contribution(judgement, note.operateType, this.combo);
+    this.contributionSum += contribution(judgement, note.operateType, this.scoringComboPolicy === "strict-prior-note-time" ? this.scoringGroupCombo : this.combo);
     const score = normalizeScore(this.contributionSum, this.ceiling, this.life);
     this.score = score;
     const event: JudgementEvent = {
@@ -711,6 +821,7 @@ export class ChartSession {
       life: this.life,
     };
     this.lastJudgement = event;
+    if (notify) this.watchVisualState = undefined;
     if (notify) this.emit("judgement", event);
     return event;
   }
@@ -746,119 +857,7 @@ export class ChartSession {
    * over both bounds emits Fever now and End on the following update.
    */
   private advanceTimeline(): void {
-    if (this.skillTimelineIsMonotonic) {
-      while (this.skillCursor < this.chart.timeline.skills.length) {
-        const event = this.chart.timeline.skills[this.skillCursor]!;
-        if (event.timeMs > this.timeMs) break;
-        this.executedSkills[this.skillCursor] = 1;
-        this.skillCursor++;
-        this.lastSkill = event;
-        this.emit("skill", event);
-      }
-    } else {
-      // BuildSkillList preserves source order. Keep that observable order for
-      // malformed/non-monotonic inputs even though ordinary scores use the
-      // allocation-free cursor path above.
-      for (let index = 0; index < this.chart.timeline.skills.length; index++) {
-        if (this.executedSkills[index]) continue;
-        const event = this.chart.timeline.skills[index]!;
-        if (event.timeMs > this.timeMs) continue;
-        this.executedSkills[index] = 1;
-        this.lastSkill = event;
-        this.emit("skill", event);
-      }
-    }
-
-    let retainedFeverCount = 0;
-    for (const index of this.activeFeverSections) {
-      const section = this.chart.timeline.fever[index]!;
-      if (section.endTimeMs <= this.timeMs) this.applyFeverTransition(section, FeverState.End);
-      else this.activeFeverSections[retainedFeverCount++] = index;
-    }
-    this.activeFeverSections.length = retainedFeverCount;
-
-    while (this.feverStartCursor < this.chart.timeline.fever.length) {
-      const section = this.chart.timeline.fever[this.feverStartCursor]!;
-      if (section.startTimeMs > this.timeMs) break;
-      this.feverStartCursor++;
-      this.activeFeverSections.push(section.index);
-      this.applyFeverTransition(section, FeverState.Fever);
-    }
-
-    while (this.callChangeCursor < this.chart.timeline.callChanges.length) {
-      const event = this.chart.timeline.callChanges[this.callChangeCursor]!;
-      if (event.timeMs > this.timeMs) break;
-      this.callChangeCursor++;
-      this.callChange = event;
-      this.emit("callChange", event);
-    }
-  }
-
-  private applyFeverTransition(section: ChartFeverSection, state: FeverState.Fever | FeverState.End): void {
-    this.feverState = state;
-    this.feverSection = section;
-    this.emit("fever", {
-      section,
-      state,
-      timeMs: state === FeverState.Fever ? section.startTimeMs : section.endTimeMs,
-    });
-  }
-
-  /** Reconstructs a seek target without replaying historical host callbacks. */
-  private rebuildTimeline(timeMs: number): void {
-    if (this.skillTimelineIsMonotonic) {
-      while (this.skillCursor < this.chart.timeline.skills.length) {
-        const event = this.chart.timeline.skills[this.skillCursor]!;
-        if (event.timeMs > timeMs) break;
-        this.executedSkills[this.skillCursor] = 1;
-        this.skillCursor++;
-        this.lastSkill = event;
-      }
-    } else {
-      for (let index = 0; index < this.chart.timeline.skills.length; index++) {
-        const event = this.chart.timeline.skills[index]!;
-        if (event.timeMs > timeMs) continue;
-        this.executedSkills[index] = 1;
-        this.lastSkill = event;
-      }
-    }
-
-    let latestFeverTime = Number.NEGATIVE_INFINITY;
-    let latestFeverOrder = -1;
-    while (this.feverStartCursor < this.chart.timeline.fever.length) {
-      const section = this.chart.timeline.fever[this.feverStartCursor]!;
-      if (section.startTimeMs > timeMs) break;
-      this.feverStartCursor++;
-      if (section.endTimeMs <= timeMs) {
-        if (
-          section.endTimeMs > latestFeverTime ||
-          (section.endTimeMs === latestFeverTime && section.index * 2 + 1 >= latestFeverOrder)
-        ) {
-          latestFeverTime = section.endTimeMs;
-          latestFeverOrder = section.index * 2 + 1;
-          this.feverState = FeverState.End;
-          this.feverSection = section;
-        }
-      } else {
-        this.activeFeverSections.push(section.index);
-      }
-      if (
-        section.startTimeMs > latestFeverTime ||
-        (section.startTimeMs === latestFeverTime && section.index * 2 >= latestFeverOrder)
-      ) {
-        latestFeverTime = section.startTimeMs;
-        latestFeverOrder = section.index * 2;
-        this.feverState = FeverState.Fever;
-        this.feverSection = section;
-      }
-    }
-
-    while (this.callChangeCursor < this.chart.timeline.callChanges.length) {
-      const event = this.chart.timeline.callChanges[this.callChangeCursor]!;
-      if (event.timeMs > timeMs) break;
-      this.callChangeCursor++;
-      this.callChange = event;
-    }
+    this.presentationTimeline.advance(this.timeMs);
   }
 
   private longLineIdsFor(note: ChartNote): readonly number[] {

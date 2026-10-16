@@ -113,7 +113,7 @@ export class CassiopeiaRuntime {
   }
 }
 
-export type CassiopeiaSessionPort = Pick<ChartSession, keyof ChartSession>;
+export type CassiopeiaSessionPort = Pick<ChartSession, keyof ChartSession> & { dispose?(): void; getWatchHistory?(): readonly import("./core/types.js").JudgementEvent[] };
 
 export const CASSIOPEIA_SESSION = defineCassiopeiaService<{
   create(chart: ChartDocument, options?: SessionOptions): CassiopeiaSessionPort;

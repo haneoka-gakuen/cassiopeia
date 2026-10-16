@@ -45,6 +45,20 @@
     "./plugin": {
       "types": "./dist/plugin.d.ts",
       "import": "./dist/plugin.js"
+    },
+    "./enums": {
+      "types": "./dist/enums-entry.d.ts",
+      "import": "./dist/enums.js",
+      "default": "./dist/enums.js"
+    },
+    "./timing-policy": {
+      "types": "./dist/timing-policy-entry.d.ts",
+      "import": "./dist/timing-policy.js",
+      "default": "./dist/timing-policy.js"
+    },
+    "./wasm-session": {
+      "types": "./dist/wasm-session.d.ts",
+      "import": "./dist/wasm-session.js"
     }
   },
   "scripts": {

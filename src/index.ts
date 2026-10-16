@@ -12,3 +12,4 @@ export * from "./core/staticChartOverview.js";
 export * from "./core/timing.js";
 export * from "./core/types.js";
 export * from "./plugin.js";
+export * from "./core/automatic.js";

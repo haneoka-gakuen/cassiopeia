@@ -198,6 +198,35 @@ export interface SessionLineState {
   isActive(lineId: number): boolean;
 }
 
+export interface WatchVisualReplayContract {
+  /** Caller-owned immutable chart/source epoch identity. */
+  readonly sourceKey: string;
+  /** Forward fresh-grid reconstruction must be labelled canonical explicitly. */
+  readonly clockMode: "fresh-reference" | "canonical-rebuild";
+  readonly originSeconds: number;
+  readonly stepSeconds: number;
+  readonly inputOffsetMs: number;
+  /** Actual repeated-clock integer ticks, cached by the source-specific caller. */
+  readonly tickTimesMs: readonly number[];
+}
+
+export interface WatchVisualJudgement
+  extends Pick<JudgementEvent, "note" | "judgement" | "timing" | "diffMs" | "judgedAtMs" | "combo"> {
+  /** Available only when this visual note also has a real business event. */
+  readonly scoreDelta?: number;
+}
+
+export interface WatchVisualState {
+  readonly sourceKey: string;
+  readonly clockMode: WatchVisualReplayContract["clockMode"];
+  /** Last native tick at or before the requested transport position. */
+  readonly sampledTimeMs?: number;
+  readonly combo: number;
+  readonly fullCombo: boolean;
+  readonly perfectCombo: boolean;
+  readonly lastJudgement: WatchVisualJudgement | null;
+}
+
 export interface SessionSnapshot {
   timeMs: number;
   durationMs: number;
@@ -219,6 +248,8 @@ export interface SessionSnapshot {
   processed: number;
   total: number;
   lastJudgement: JudgementEvent | null;
+  /** Seek-only visual prefix; business counters keep their original contract. */
+  watchVisualState?: WatchVisualState;
   /** Last skill callback reached on the current deterministic timeline. */
   lastSkill: ChartSkillEvent | null;
   /** Last call-rhythm change reached on the current deterministic timeline. */
