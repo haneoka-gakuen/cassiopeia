@@ -1,0 +1,13 @@
+name: cassiopeia_runtime
+description: Portable Cassiopeia session contracts and an optional native FFI adapter.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ^3.13.5
+dependencies:
+  ffi: ^2.2.0
+flutter:
+  plugin:
+    platforms:
+      linux:
+        ffiPlugin: true

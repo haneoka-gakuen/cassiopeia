@@ -29,45 +29,13 @@ use haneoka_cassiopeia_core::{
     CameraIntroductionSequence, CameraProfile, CameraTimelineResource, GameplaySession,
     InputAction, InputVector, JudgementEvent, LanePosition, PerformanceClock, PlaybackRate,
     PlaybackState, RuntimeInputEvent, ScreenMode, ScreenResources, SessionMode, TimeMicros,
-    resolve_screen_mode,
+    WatchSessionLoad, resolve_screen_mode,
 };
 pub use random_range_tape::*;
 use wasm_bindgen::{JsCast, prelude::*};
 
-pub const HOST_ABI_VERSION: i64 = 1;
-pub const EVENT_STRIDE: usize = 12;
-pub const SNAPSHOT_WORDS: usize = 16;
+pub use haneoka_cassiopeia_core::runtime_boundary::*;
 const NO_VALUE: i64 = -1;
-
-pub const EVENT_NOTE_ID: usize = 0;
-pub const EVENT_JUDGEMENT: usize = 1;
-pub const EVENT_TIMING: usize = 2;
-pub const EVENT_DIFFERENCE: usize = 3;
-pub const EVENT_JUDGED_AT: usize = 4;
-pub const EVENT_INPUT_SEQUENCE: usize = 5;
-pub const EVENT_COMBO: usize = 6;
-pub const EVENT_MAX_COMBO: usize = 7;
-pub const EVENT_SCORE: usize = 8;
-pub const EVENT_SCORE_DELTA: usize = 9;
-pub const EVENT_LIFE: usize = 10;
-pub const EVENT_RESERVED: usize = 11;
-
-pub const SNAPSHOT_ABI_VERSION: usize = 0;
-pub const SNAPSHOT_MODE: usize = 1;
-pub const SNAPSHOT_ASSIST_LEVEL: usize = 2;
-pub const SNAPSHOT_TIME: usize = 3;
-pub const SNAPSHOT_JUDGEMENT_OFFSET: usize = 4;
-pub const SNAPSHOT_COMBO: usize = 5;
-pub const SNAPSHOT_PERFECT_COMBO: usize = 6;
-pub const SNAPSHOT_ALL_PERFECT: usize = 7;
-pub const SNAPSHOT_FULL_COMBO: usize = 8;
-pub const SNAPSHOT_MAX_COMBO: usize = 9;
-pub const SNAPSHOT_SCORE: usize = 10;
-pub const SNAPSHOT_LIFE: usize = 11;
-pub const SNAPSHOT_PROCESSED: usize = 12;
-pub const SNAPSHOT_TOTAL: usize = 13;
-pub const SNAPSHOT_LAST_INPUT_SEQUENCE: usize = 14;
-pub const SNAPSHOT_EVENT_COUNT: usize = 15;
 
 pub const CAMERA_FRAME_ABI_VERSION: u32 = 1;
 pub const CAMERA_FRAME_WORDS: usize = 13;
@@ -759,6 +727,7 @@ pub fn resolve_performance_screen_mode(
 #[wasm_bindgen(js_name = CassiopeiaRuntime)]
 pub struct WasmRuntime {
     session: GameplaySession,
+    notes_only: bool,
     numeric_note_ids: BTreeMap<String, u32>,
     event_words: Vec<i64>,
     snapshot_words: [i64; SNAPSHOT_WORDS],
@@ -773,6 +742,15 @@ impl WasmRuntime {
         judgement_offset_micros: i64,
     ) -> Result<WasmRuntime, JsError> {
         Self::from_binary(chart_bytes, mode, judgement_offset_micros).map_err(js_error)
+    }
+
+    /// Loads only actual automatic-judgement fields; interactive Play retains
+    /// the validated RuntimeChartV1 constructor.
+    #[wasm_bindgen(js_name = fromWatchNotes)]
+    pub fn from_watch_notes(json: &str) -> Result<WasmRuntime, JsError> {
+        let load: WatchSessionLoad = serde_json::from_str(json).map_err(js_error)?;
+        let (session, ids) = load.into_session().map_err(js_error)?;
+        Self::from_session(session, ids, true).map_err(js_error)
     }
 
     /// Advances automatic judgements and writes all resulting events contiguously.
@@ -808,10 +786,12 @@ impl WasmRuntime {
     }
 
     pub fn set_mode(&mut self, mode: u8) -> Result<(), JsError> {
+        let mode = session_mode(mode).map_err(js_error)?;
+        if self.notes_only && mode == SessionMode::Play {
+            return Err(js_error("loadNotes cannot switch to Play"));
+        }
         self.event_words.clear();
-        self.session
-            .set_mode(session_mode(mode).map_err(js_error)?)
-            .map_err(js_error)?;
+        self.session.set_mode(mode).map_err(js_error)?;
         self.refresh_snapshot().map_err(js_error)
     }
 
@@ -819,6 +799,61 @@ impl WasmRuntime {
         self.event_words.clear();
         self.session.set_judgement_offset(TimeMicros(offset_micros));
         self.refresh_snapshot().map_err(js_error)
+    }
+
+    /// Host data selects automatic results; game-specific range construction remains outside the kernel.
+    pub fn set_automatic_policy_json(&mut self, json: &str) -> Result<(), JsError> {
+        let policy = serde_json::from_str(json).map_err(js_error)?;
+        self.session.set_automatic_policy(policy).map_err(js_error)
+    }
+
+    /// Events returned by reset are historical projection input, never fresh gameplay emissions.
+    pub fn reset_observed_json(&mut self, time_micros: i64, json: &str) -> Result<u32, JsError> {
+        let observations: BTreeMap<String, TimeMicros> =
+            serde_json::from_str(json).map_err(js_error)?;
+        let events = self
+            .session
+            .reset_observed(TimeMicros(time_micros), &observations)
+            .map_err(js_error)?;
+        self.event_words.clear();
+        self.write_events(events.iter()).map_err(js_error)?;
+        self.refresh_snapshot().map_err(js_error)?;
+        self.event_count()
+    }
+
+    /// Writes a seek-only visual projection into the borrowed buffers. Gameplay
+    /// state is unchanged; read/copy these words before refreshing business state.
+    pub fn project_watch_observed_json(
+        &mut self,
+        time_micros: i64,
+        json: &str,
+    ) -> Result<u32, JsError> {
+        if self.session.mode() != SessionMode::Watch {
+            return Err(js_error("visual projection requires Watch"));
+        }
+        let observations: BTreeMap<String, TimeMicros> =
+            serde_json::from_str(json).map_err(js_error)?;
+        let (snapshot, events) = self
+            .session
+            .project_watch_observed(TimeMicros(time_micros), &observations)
+            .map_err(js_error)?;
+        self.event_words.clear();
+        self.write_events(events.iter()).map_err(js_error)?;
+        write_snapshot_words(&mut self.snapshot_words, snapshot, events.len()).map_err(js_error)?;
+        self.event_count()
+    }
+
+    pub fn set_scoring_combo_policy(&mut self, policy: &str) -> Result<(), JsError> {
+        let policy = match policy {
+            "sequential" => haneoka_cassiopeia_core::ScoringComboPolicy::Sequential,
+            "strict-prior-note-time" => {
+                haneoka_cassiopeia_core::ScoringComboPolicy::StrictPriorNoteTime
+            }
+            _ => return Err(js_error("unknown scoring combo policy")),
+        };
+        self.session
+            .set_scoring_combo_policy(policy)
+            .map_err(js_error)
     }
 
     pub fn has_candidate(
@@ -1018,18 +1053,27 @@ impl WasmRuntime {
             .filter(|note| note.judged)
             .map(|note| (note.id.to_string(), note.id))
             .collect();
-        let playable_count = numeric_note_ids.len();
         let session = GameplaySession::from_runtime_chart(
             chart,
             session_mode(mode)?,
             TimeMicros(judgement_offset_micros),
         )
         .map_err(|error| error.to_string())?;
+        Self::from_session(session, numeric_note_ids, false)
+    }
+
+    fn from_session(
+        session: GameplaySession,
+        numeric_note_ids: BTreeMap<String, u32>,
+        notes_only: bool,
+    ) -> Result<Self, String> {
+        let playable_count = numeric_note_ids.len();
         let event_capacity = playable_count
             .checked_mul(EVENT_STRIDE)
             .ok_or_else(|| "event buffer capacity overflowed".to_owned())?;
         let mut result = Self {
             session,
+            notes_only,
             numeric_note_ids,
             event_words: Vec::with_capacity(event_capacity),
             snapshot_words: [0; SNAPSHOT_WORDS],
@@ -1081,45 +1125,15 @@ impl WasmRuntime {
             .numeric_note_ids
             .get(&event.note_id)
             .ok_or_else(|| format!("runtime event has unknown note ID: {}", event.note_id))?;
-        self.event_words.extend_from_slice(&[
-            i64::from(note_id),
-            event.judgement as i8 as i64,
-            event.timing as i8 as i64,
-            event.difference.0,
-            event.judged_at.0,
-            optional_sequence_word(event.input_sequence)?,
-            i64::from(event.combo),
-            i64::from(event.max_combo),
-            i64::from(event.score),
-            i64::from(event.score_delta),
-            i64::from(event.life),
-            0,
-        ]);
-        Ok(())
+        append_event_words(&mut self.event_words, event, note_id)
     }
 
     fn refresh_snapshot(&mut self) -> Result<(), String> {
-        let snapshot = self.session.fixed_snapshot();
-        self.snapshot_words[SNAPSHOT_ABI_VERSION] = HOST_ABI_VERSION;
-        self.snapshot_words[SNAPSHOT_MODE] = i64::from(mode_code(snapshot.mode));
-        self.snapshot_words[SNAPSHOT_ASSIST_LEVEL] = i64::from(u8::from(snapshot.assist_level));
-        self.snapshot_words[SNAPSHOT_TIME] = snapshot.time.0;
-        self.snapshot_words[SNAPSHOT_JUDGEMENT_OFFSET] = snapshot.judgement_offset.0;
-        self.snapshot_words[SNAPSHOT_COMBO] = i64::from(snapshot.combo);
-        self.snapshot_words[SNAPSHOT_PERFECT_COMBO] = i64::from(snapshot.perfect_combo);
-        self.snapshot_words[SNAPSHOT_ALL_PERFECT] = i64::from(snapshot.all_perfect);
-        self.snapshot_words[SNAPSHOT_FULL_COMBO] = i64::from(snapshot.full_combo);
-        self.snapshot_words[SNAPSHOT_MAX_COMBO] = i64::from(snapshot.max_combo);
-        self.snapshot_words[SNAPSHOT_SCORE] = i64::from(snapshot.score);
-        self.snapshot_words[SNAPSHOT_LIFE] = i64::from(snapshot.life);
-        self.snapshot_words[SNAPSHOT_PROCESSED] = i64::from(snapshot.processed);
-        self.snapshot_words[SNAPSHOT_TOTAL] = i64::from(snapshot.total);
-        self.snapshot_words[SNAPSHOT_LAST_INPUT_SEQUENCE] =
-            optional_sequence_word(snapshot.last_input_sequence)?;
-        self.snapshot_words[SNAPSHOT_EVENT_COUNT] =
-            i64::try_from(self.event_words.len() / EVENT_STRIDE)
-                .map_err(|_| "event count overflowed".to_owned())?;
-        Ok(())
+        write_snapshot_words(
+            &mut self.snapshot_words,
+            self.session.fixed_snapshot(),
+            self.event_words.len() / EVENT_STRIDE,
+        )
     }
 }
 
@@ -1129,14 +1143,6 @@ fn session_mode(value: u8) -> Result<SessionMode, String> {
         1 => Ok(SessionMode::Watch),
         2 => Ok(SessionMode::Play),
         _ => Err(format!("invalid session mode: {value}")),
-    }
-}
-
-const fn mode_code(mode: SessionMode) -> u8 {
-    match mode {
-        SessionMode::Chart => 0,
-        SessionMode::Watch => 1,
-        SessionMode::Play => 2,
     }
 }
 
@@ -1151,16 +1157,6 @@ fn optional_pointer_id(pointer_id: i64) -> Result<Option<u32>, String> {
     u32::try_from(pointer_id)
         .map(Some)
         .map_err(|_| "pointer ID must be -1 or an unsigned 32-bit integer".to_owned())
-}
-
-fn optional_sequence_word(sequence: Option<u64>) -> Result<i64, String> {
-    sequence
-        .map(|value| {
-            i64::try_from(value)
-                .map_err(|_| "input sequence exceeds the signed host ABI".to_owned())
-        })
-        .transpose()
-        .map(|value| value.unwrap_or(NO_VALUE))
 }
 
 fn js_error(error: impl ToString) -> JsError {

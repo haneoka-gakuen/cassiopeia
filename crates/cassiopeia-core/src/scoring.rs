@@ -3,6 +3,15 @@ use std::fmt;
 
 use crate::judgement::Judgement;
 
+/// Contribution samples current sequential combo or canonical-time prior history.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScoringComboPolicy {
+    #[default]
+    Sequential,
+    StrictPriorNoteTime,
+}
+
 pub const LIFE_BASE: u32 = 1_000;
 pub const LIFE_DANGER: u32 = 300;
 pub const MAX_NORMALIZED_SCORE: u32 = 1_000_000;
@@ -149,6 +158,27 @@ pub fn perfect_ceiling(
             let multiplier = BONUS_SCALE + u64::from(combo_bonus_basis_points(combo));
             sum.checked_add(ScoreUnits(FACTOR_SCALE * weight * multiplier))
         })
+}
+
+/// Canonical-time-sorted Perfect results use the same strictly-prior combo as contribution.
+pub fn perfect_ceiling_at_note_times(
+    notes: impl IntoIterator<Item = (crate::TimeMicros, NoteOperateType)>,
+) -> Result<ScoreUnits, ScoreError> {
+    let mut count = 0u32;
+    let mut group: Option<(crate::TimeMicros, u32)> = None;
+    let mut sum = ScoreUnits::ZERO;
+    for (time, kind) in notes {
+        let before = match group {
+            Some((t, combo)) if t == time => combo,
+            _ => {
+                group = Some((time, count));
+                count
+            }
+        };
+        sum = sum.checked_add(contribution(Judgement::Perfect, kind, before))?;
+        count = count.checked_add(1).ok_or(ScoreError::Overflow)?;
+    }
+    Ok(sum)
 }
 
 /// Normalizes accumulated contribution with non-negative `Math.round` rules.

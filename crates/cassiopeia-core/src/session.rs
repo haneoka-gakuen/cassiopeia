@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::assist::AssistLevel;
+use crate::automatic::AutomaticJudgementPolicy;
 use crate::judgement::{
     JudgeResult, JudgeTiming, Judgement, NoteJudgementType, is_within_window_with_assist,
     judge_with_assist, maximum_early_ms_with_assist, maximum_late_ms_with_assist,
@@ -12,8 +13,9 @@ use crate::runtime::{
     is_target_lane_with_assist,
 };
 use crate::scoring::{
-    ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, combo_action, contribution,
-    life_damage, normalize_score, perfect_ceiling,
+    ComboAction, LIFE_BASE, NoteOperateType, ScoreError, ScoreUnits, ScoringComboPolicy,
+    combo_action, contribution, life_damage, normalize_score, perfect_ceiling,
+    perfect_ceiling_at_note_times,
 };
 use crate::timing::TimeMicros;
 
@@ -169,6 +171,9 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionError {
     EmptyNoteId(usize),
+    InvalidAutomaticObservation(String),
+    ScoringPolicyRequiresFreshSession,
+    StrictPriorPlayUnavailable,
     DuplicateNoteId(String),
     UnsortedNotes(usize),
     UnknownNoteId(String),
@@ -183,6 +188,15 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ScoringPolicyRequiresFreshSession => {
+                formatter.write_str("scoring policy requires a fresh session")
+            }
+            Self::StrictPriorPlayUnavailable => formatter
+                .write_str("strict-prior scoring requires canonical history; Play is not enabled"),
+            Self::InvalidAutomaticObservation(id) => write!(
+                formatter,
+                "automatic observation must follow note time: {id}"
+            ),
             Self::EmptyNoteId(index) => write!(formatter, "gameplay note {index} has an empty ID"),
             Self::DuplicateNoteId(id) => write!(formatter, "duplicate gameplay note ID: {id}"),
             Self::UnsortedNotes(index) => {
@@ -522,6 +536,9 @@ pub struct GameplaySession {
     last_judgement: Option<JudgementEvent>,
     last_input_sequence: Option<u64>,
     runtime: Option<RuntimeState>,
+    automatic_policy: AutomaticJudgementPolicy,
+    scoring_combo_policy: ScoringComboPolicy,
+    score_group: Option<(TimeMicros, u32)>,
 }
 
 impl GameplaySession {
@@ -578,6 +595,9 @@ impl GameplaySession {
             last_judgement: None,
             last_input_sequence: None,
             runtime: None,
+            automatic_policy: AutomaticJudgementPolicy::default(),
+            scoring_combo_policy: ScoringComboPolicy::Sequential,
+            score_group: None,
         })
     }
 
@@ -609,6 +629,36 @@ impl GameplaySession {
         Ok(session)
     }
 
+    pub fn set_scoring_combo_policy(
+        &mut self,
+        policy: ScoringComboPolicy,
+    ) -> Result<(), SessionError> {
+        if self.processed_count != 0 || self.time.0 != 0 {
+            return Err(SessionError::ScoringPolicyRequiresFreshSession);
+        }
+        if policy == ScoringComboPolicy::StrictPriorNoteTime && self.mode == SessionMode::Play {
+            return Err(SessionError::StrictPriorPlayUnavailable);
+        }
+        let ceiling = match policy {
+            ScoringComboPolicy::Sequential => {
+                perfect_ceiling(self.notes.iter().map(|n| n.operate_type))?
+            }
+            ScoringComboPolicy::StrictPriorNoteTime => {
+                perfect_ceiling_at_note_times(self.notes.iter().map(|n| (n.time, n.operate_type)))?
+            }
+        };
+        self.ceiling = ceiling;
+        self.scoring_combo_policy = policy;
+        self.score_group = None;
+        Ok(())
+    }
+
+    pub fn set_automatic_policy(&mut self, policy: AutomaticJudgementPolicy) -> Result<(), String> {
+        policy.validate()?;
+        self.automatic_policy = policy;
+        Ok(())
+    }
+
     pub fn mode(&self) -> SessionMode {
         self.mode
     }
@@ -618,6 +668,12 @@ impl GameplaySession {
     }
 
     pub fn set_mode(&mut self, mode: SessionMode) -> Result<SessionSnapshot, SessionError> {
+        if mode == SessionMode::Play
+            && self.scoring_combo_policy == ScoringComboPolicy::StrictPriorNoteTime
+        {
+            return Err(SessionError::StrictPriorPlayUnavailable);
+        }
+
         if self.mode == mode {
             return Ok(self.snapshot());
         }
@@ -982,16 +1038,20 @@ impl GameplaySession {
                         self.update_cursor += 1;
                         continue;
                     }
-                    events.push(self.apply_judgement(
-                        index,
-                        JudgeResult {
-                            judgement: Judgement::Perfect,
-                            timing: JudgeTiming::Auto,
-                        },
-                        TimeMicros(0),
-                        self.time,
-                        None,
-                    )?);
+                    events.push(
+                        self.apply_judgement(
+                            index,
+                            JudgeResult {
+                                judgement: self
+                                    .automatic_policy
+                                    .resolve(self.notes[index].judgement_type, self.time),
+                                timing: JudgeTiming::Auto,
+                            },
+                            TimeMicros(0),
+                            self.time,
+                            None,
+                        )?,
+                    );
                 }
             }
             SessionMode::Play => {
@@ -1205,11 +1265,14 @@ impl GameplaySession {
     pub fn finish(&mut self, time: TimeMicros) -> Result<Vec<JudgementEvent>, SessionError> {
         let terminal_time = time.0.saturating_add(1_000);
         let last_note_time = self.notes.last().map_or(terminal_time, |note| note.time.0);
-        let settle_time = self
-            .time
-            .0
-            .max(terminal_time)
-            .max(last_note_time.saturating_add(2_000_000));
+        let settle_time = if self.mode == SessionMode::Play {
+            self.time
+                .0
+                .max(terminal_time)
+                .max(last_note_time.saturating_add(2_000_000))
+        } else {
+            self.time.0.max(terminal_time)
+        };
         let mut events = self.advance(TimeMicros(settle_time))?;
         if self.pending_last_timing.iter().any(|pending| *pending) {
             events.extend(self.advance(TimeMicros(settle_time))?);
@@ -1217,14 +1280,86 @@ impl GameplaySession {
         Ok(events)
     }
 
+    /// Seek-only visual prefix. Equality at canonical time is allowed here;
+    /// the business session and its strict automatic-admission boundary stay intact.
+    pub fn project_watch_observed(
+        &self,
+        time: TimeMicros,
+        observations: &BTreeMap<String, TimeMicros>,
+    ) -> Result<(FixedSessionSnapshot, Vec<JudgementEvent>), SessionError> {
+        for (id, observed) in observations {
+            let index = self
+                .note_index
+                .get(id)
+                .ok_or_else(|| SessionError::UnknownNoteId(id.clone()))?;
+            if observed.0 < self.notes[*index].time.0 {
+                return Err(SessionError::InvalidAutomaticObservation(id.clone()));
+            }
+        }
+        let mut projection = Self::new_with_assist(
+            self.notes.clone(),
+            SessionMode::Watch,
+            self.judgement_offset,
+            self.assist_level,
+        )?;
+        projection.set_scoring_combo_policy(self.scoring_combo_policy)?;
+        projection.automatic_policy = self.automatic_policy.clone();
+        let mut events = Vec::new();
+        for index in 0..projection.notes.len() {
+            let note = &projection.notes[index];
+            let Some(observed) = observations.get(&note.id).copied() else {
+                continue;
+            };
+            if observed.0 > time.0 || note.time.0 > time.0 {
+                continue;
+            }
+            let result = JudgeResult {
+                judgement: projection
+                    .automatic_policy
+                    .resolve(note.judgement_type, observed),
+                timing: JudgeTiming::Auto,
+            };
+            events.push(projection.apply_judgement(
+                index,
+                result,
+                TimeMicros(0),
+                observed,
+                None,
+            )?);
+        }
+        projection.time = time;
+        Ok((projection.fixed_snapshot(), events))
+    }
+
     /// Clears gameplay state and reconstructs deterministic seek state without
     /// emitting historical input events.
     pub fn reset(&mut self, time: TimeMicros) -> Result<SessionSnapshot, SessionError> {
+        self.reset_observed(time, &BTreeMap::new())?;
+        Ok(self.snapshot())
+    }
+
+    /// Rebuilt events are historical; hosts route them to state projection, not live sound/FX.
+    pub fn reset_observed(
+        &mut self,
+        time: TimeMicros,
+        observations: &BTreeMap<String, TimeMicros>,
+    ) -> Result<Vec<JudgementEvent>, SessionError> {
+        for (id, observed) in observations {
+            let index = self
+                .note_index
+                .get(id)
+                .ok_or_else(|| SessionError::UnknownNoteId(id.clone()))?;
+            if observed.0 <= self.notes[*index].time.0 {
+                return Err(SessionError::InvalidAutomaticObservation(id.clone()));
+            }
+        }
+        let mut rebuilt = Vec::new();
         self.processed.fill(false);
         self.pending_last_timing.fill(false);
         self.processed_count = 0;
         self.update_cursor = 0;
         self.contribution_sum = ScoreUnits::ZERO;
+        self.score_group = None;
         self.combo = 0;
         self.all_perfect = true;
         self.full_combo = true;
@@ -1245,16 +1380,25 @@ impl GameplaySession {
                         && self.notes[self.update_cursor].time < time
                     {
                         let index = self.update_cursor;
-                        self.apply_judgement(
-                            index,
-                            JudgeResult {
-                                judgement: Judgement::Perfect,
-                                timing: JudgeTiming::Auto,
-                            },
-                            TimeMicros(0),
-                            time,
-                            None,
-                        )?;
+                        let observed = observations
+                            .get(&self.notes[index].id)
+                            .copied()
+                            .filter(|t| t.0 <= time.0)
+                            .unwrap_or(TimeMicros(self.notes[index].time.0.saturating_add(1_000)));
+                        rebuilt.push(
+                            self.apply_judgement(
+                                index,
+                                JudgeResult {
+                                    judgement: self
+                                        .automatic_policy
+                                        .resolve(self.notes[index].judgement_type, observed),
+                                    timing: JudgeTiming::Auto,
+                                },
+                                TimeMicros(0),
+                                observed,
+                                None,
+                            )?,
+                        );
                     }
                 }
                 SessionMode::Play => {
@@ -1302,7 +1446,7 @@ impl GameplaySession {
                 SessionMode::Chart => {}
             }
         }
-        Ok(self.snapshot())
+        Ok(rebuilt)
     }
 
     fn validate_sequence(&self, sequence: u64) -> Result<(), SessionError> {
@@ -1340,10 +1484,18 @@ impl GameplaySession {
         };
         let max_combo = self.max_combo.max(combo);
         let life = self.life.saturating_sub(life_damage(result.judgement));
+        let group = match self.score_group {
+            Some((time, prior)) if time == self.notes[index].time => (time, prior),
+            _ => (self.notes[index].time, self.combo),
+        };
+        let score_combo = match self.scoring_combo_policy {
+            ScoringComboPolicy::Sequential => combo,
+            ScoringComboPolicy::StrictPriorNoteTime => group.1,
+        };
         let contribution_sum = self.contribution_sum.checked_add(contribution(
             result.judgement,
             self.notes[index].operate_type,
-            combo,
+            score_combo,
         ))?;
         let score = normalize_score(contribution_sum, self.ceiling)?;
         let event = JudgementEvent {
@@ -1372,6 +1524,7 @@ impl GameplaySession {
         self.max_combo = max_combo;
         self.life = life;
         self.contribution_sum = contribution_sum;
+        self.score_group = Some(group);
         self.score = score;
         self.last_judgement = Some(event.clone());
         self.advance_update_cursor();

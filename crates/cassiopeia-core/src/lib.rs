@@ -7,6 +7,7 @@
 //! judgement primitives, and chart contracts on every platform.
 
 pub mod assist;
+pub mod automatic;
 pub mod camera;
 pub mod camera_chorus;
 pub mod camera_effects;
@@ -16,9 +17,11 @@ pub mod judgement;
 pub mod live;
 pub mod random_range_tape;
 pub mod runtime;
+pub mod runtime_boundary;
 pub mod scoring;
 pub mod session;
 pub mod timing;
+pub mod watch;
 
 pub use assist::{ASSIST_LEVEL_COUNT, AssistLevel, TIMING_WINDOWS_PER_LEVEL};
 pub use camera::{
@@ -73,9 +76,10 @@ pub use runtime::{
 };
 pub use scoring::{
     ComboAction, LIFE_BASE, LIFE_DANGER, MAX_NORMALIZED_SCORE, NoteOperateType, ScoreError,
-    ScoreUnits, breaks_combo, combo_action, combo_bonus_basis_points, contribution,
-    contribution_scale, increments_combo, judgement_factor_milli, life_damage, normalize_score,
-    note_weight_milli, perfect_ceiling, preserves_combo,
+    ScoreUnits, ScoringComboPolicy, breaks_combo, combo_action, combo_bonus_basis_points,
+    contribution, contribution_scale, increments_combo, judgement_factor_milli, life_damage,
+    normalize_score, note_weight_milli, perfect_ceiling, perfect_ceiling_at_note_times,
+    preserves_combo,
 };
 pub use session::{
     FixedSessionSnapshot, GameplayNote, GameplaySession, InputAction, InputEvent, InputVector,
@@ -84,3 +88,4 @@ pub use session::{
 pub use timing::{
     RoundingProfile, TempoEvent, TempoMap, TempoMapError, Tick, TimeMicros, TimeMillis,
 };
+pub use watch::WatchSessionLoad;
