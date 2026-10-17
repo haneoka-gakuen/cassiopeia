@@ -1,10 +1,15 @@
 name: cassiopeia_runtime
-description: Portable Cassiopeia session contracts and an optional native FFI adapter.
+description: Cassiopeia Rust session adapter through the platform C ABI.
 version: 0.1.0
 publish_to: none
 environment:
   sdk: ^3.13.5
 dependencies:
+  cassiopeia_protocol:
+    git:
+      url: https://github.com/haneoka-gakuen/cassiopeia.git
+      ref: 23d8e1262261f656980ebac7dc70d76fd264abd2
+      path: packages/protocol/dart
   ffi: ^2.2.0
 flutter:
   plugin:

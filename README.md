@@ -122,12 +122,35 @@ The Our Notes plugin parses source score JSON into the `ChartDocument` shape;
 the kernel then remains independent of the source game. Renderer and host
 plugins use the same `session` object and never change its judgement policy.
 
+## Dart hosts
+
+The dependency-free `cassiopeia_protocol` package at `packages/protocol/dart`
+owns session values, judgement events and session ports. Game-rule and
+presentation packages import these contracts directly. They can run in any Dart
+host without selecting a native runtime or a Flutter renderer.
+
+`cassiopeia_runtime` at `dart` implements those ports with the Rust C ABI.
+Its existing `cassiopeia_runtime.dart` entry re-exports the same protocol types;
+`native.dart` additionally exposes the native session and library loader.
+The application selects the runtime, renderer, audio clock and resource adapter.
+
+```mermaid
+graph TD
+  Host[Host] --> Rules[Game rules]
+  Host --> Renderer[Renderer]
+  Host --> Native[Native session adapter]
+  Rules --> Protocol[Dart session protocol]
+  Renderer --> Frames[Rendering contracts]
+  Native --> Protocol
+  Native --> Core[Rust kernel C ABI]
+```
+
 ## Native and WASM boundaries
 
 The `@haneoka/cassiopeia/wasm` entry exposes the generated WASM API and
 `@haneoka/cassiopeia/wasm/module` exposes the `.wasm` module bytes. The native
-crate supplies the same kernel contract through C, Android JNI, and Swift
-wrappers. Load one WASM module per application runtime and keep host-owned
+crate supplies the same kernel contract through the platform C ABI.
+Load one WASM module per application runtime and keep host-owned
 audio, GPU, and platform vibration outside the kernel boundary.
 
 ## Lifetime and license
