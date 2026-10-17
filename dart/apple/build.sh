@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 cargo=${CASSIOPEIA_CARGO_EXECUTABLE:-cargo}
 target_dir="$DERIVED_FILE_DIR/cassiopeia-rust"
-artifact_dir="$BUILT_PRODUCTS_DIR/cassiopeia_runtime"
+artifact_dir="$PODS_CONFIGURATION_BUILD_DIR/cassiopeia_runtime"
 mkdir -p "$artifact_dir"
 
 case "$PLATFORM_NAME" in
